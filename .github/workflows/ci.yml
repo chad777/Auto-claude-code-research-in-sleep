@@ -51,8 +51,11 @@ jobs:
       - name: cargo build (workspace)
         run: cargo build --workspace --all-targets
 
-      - name: cargo test (workspace)
-        run: cargo test --workspace
+      - name: cargo test (workspace, serial)
+        # --test-threads=1 prevents cwd race conditions in tests that spawn
+        # subprocesses (e.g. tools::web_search_*, subagent_runtime_*) which
+        # share process-global cwd on ubuntu runners.
+        run: cargo test --workspace -- --test-threads=1
 
   build-macos:
     name: cargo build (macos)
