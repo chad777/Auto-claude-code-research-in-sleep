@@ -2,7 +2,10 @@ use std::io::{self, IsTerminal, Write};
 
 use crossterm::{
     cursor,
-    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    event::{
+        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent,
+        KeyEventKind, KeyModifiers,
+    },
     style::{Color, Print, ResetColor, SetForegroundColor},
     terminal::{self, ClearType},
     QueueableCommand,
@@ -52,12 +55,37 @@ impl LineEditor {
         if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
             return self.read_line_fallback();
         }
+
         terminal::enable_raw_mode()?;
-        let result = self.read_line_raw();
-        terminal::disable_raw_mode()?;
         let mut stdout = io::stdout();
-        writeln!(stdout)?;
-        stdout.flush()?;
+
+        // Enable bracketed paste so multi-line paste arrives as a single
+        // Event::Paste(String) instead of being mis-parsed as a sequence of
+        // KeyCode::Enter submits. Terminals that don't support the sequence
+        // simply return Unsupported and we keep the legacy behavior.
+        let bracketed_paste_enabled =
+            match stdout.queue(EnableBracketedPaste).and_then(|s| s.flush()) {
+                Ok(()) => true,
+                Err(err) if err.kind() == io::ErrorKind::Unsupported => false,
+                Err(err) => {
+                    let _ = terminal::disable_raw_mode();
+                    return Err(err);
+                }
+            };
+
+        let result = self.read_line_raw();
+
+        let paste_disable_result = if bracketed_paste_enabled {
+            stdout.queue(DisableBracketedPaste).and_then(|s| s.flush())
+        } else {
+            Ok(())
+        };
+        let raw_disable_result = terminal::disable_raw_mode();
+        let newline_result = writeln!(stdout).and_then(|()| stdout.flush());
+
+        paste_disable_result?;
+        raw_disable_result?;
+        newline_result?;
         result
     }
 
@@ -78,6 +106,23 @@ impl LineEditor {
             // Handle terminal resize
             if let Event::Resize(..) = ev {
                 self.redraw(&mut stdout, &mut render, &buf, cursor_pos, sel)?;
+                continue;
+            }
+
+            // Bracketed-paste payload: insert the whole pasted block at
+            // cursor_pos as a single edit. Newlines/tabs are flattened to
+            // spaces because this is a single-line editor.
+            if let Event::Paste(text) = ev {
+                let pasted = normalize_paste_text(&text);
+                if !pasted.is_empty() {
+                    let inserted_len = pasted.len();
+                    buf.splice(cursor_pos..cursor_pos, pasted);
+                    cursor_pos += inserted_len;
+                    sel = 0;
+                    history_idx = None;
+                    saved_buf = None;
+                    self.redraw(&mut stdout, &mut render, &buf, cursor_pos, sel)?;
+                }
                 continue;
             }
 
@@ -413,6 +458,30 @@ impl LineEditor {
         }
         Ok(ReadOutcome::Submit(buffer))
     }
+}
+
+/// Flatten a pasted block for a single-line editor.
+///
+/// `\r\n` / `\r` / `\n` / `\t` and other control characters all become a
+/// single space so paste doesn't accidentally submit (newline) or break the
+/// single-row redraw model.
+fn normalize_paste_text(text: &str) -> Vec<char> {
+    let mut out = Vec::with_capacity(text.chars().count());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\r' => {
+                if matches!(chars.peek(), Some('\n')) {
+                    chars.next();
+                }
+                out.push(' ');
+            }
+            '\n' | '\t' => out.push(' '),
+            ch if ch.is_control() => out.push(' '),
+            ch => out.push(ch),
+        }
+    }
+    out
 }
 
 // ── Multi-line redraw helpers ────────────────────────────────────────────────
@@ -766,6 +835,15 @@ mod tests {
     fn clip_truncates_long_strings() {
         assert_eq!(clip("hello world", 5), "hell…");
         assert_eq!(clip("short", 10), "short");
+    }
+
+    #[test]
+    fn normalize_paste_text_flattens_newlines_and_tabs() {
+        let normalized: String =
+            super::normalize_paste_text("one\ntwo\r\nthree\rfour\tfive\x01end")
+                .into_iter()
+                .collect();
+        assert_eq!(normalized, "one two three four five end");
     }
 
     #[test]
