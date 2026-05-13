@@ -297,7 +297,7 @@ pub fn run_interactive_setup() -> io::Result<ArisConfig> {
     // ── Step 1+2: Executor provider + key + model ──
     println!("\x1b[1m[1/3] Executor (main LLM)\x1b[0m");
     println!("  1. Anthropic   (claude-opus / sonnet / haiku)");
-    println!("  2. OpenAI      (gpt-5.4)");
+    println!("  2. OpenAI      (gpt-5.5)");
     println!("  3. Gemini      (gemini-2.5-pro)");
     println!("  4. GLM         (GLM-5)");
     println!("  5. MiniMax     (MiniMax-M2.7)");
@@ -328,13 +328,13 @@ pub fn run_interactive_setup() -> io::Result<ArisConfig> {
 
     // (provider, key_env, key_label, base_url, default_model)
     let exec_info: (&str, &str, &str, Option<&str>, &str) = match exec_choice {
-        "2" => ("openai", "EXECUTOR_API_KEY", "OpenAI API key", Some("https://api.openai.com/v1"), "gpt-5.4"),
+        "2" => ("openai", "EXECUTOR_API_KEY", "OpenAI API key", Some("https://api.openai.com/v1"), "gpt-5.5"),
         "3" => ("openai", "EXECUTOR_API_KEY", "Gemini API key", Some("https://generativelanguage.googleapis.com/v1beta/openai"), "gemini-2.5-pro"),
         "4" => ("openai", "EXECUTOR_API_KEY", "GLM API key", Some("https://open.bigmodel.cn/api/paas/v4"), "GLM-5"),
         "5" => ("openai", "EXECUTOR_API_KEY", "MiniMax API key", Some("https://api.minimax.chat/v1"), "MiniMax-M2.7"),
         "6" => ("openai", "EXECUTOR_API_KEY", "Kimi API key", Some("https://api.moonshot.cn/v1"), "kimi-k2.5"),
         "7" => ("anthropic-compat", "ANTHROPIC_AUTH_TOKEN", "DeepSeek API key", Some("https://api.deepseek.com/anthropic"), "deepseek-v4-pro"),
-        _ => ("anthropic", "ANTHROPIC_API_KEY", "Anthropic API key", None, "claude-opus-4-6"),
+        _ => ("anthropic", "ANTHROPIC_API_KEY", "Anthropic API key", None, "claude-opus-4-7"),
     };
 
     // Preserve an explicit `anthropic-compat` choice across re-runs of `/setup`.
@@ -410,7 +410,7 @@ pub fn run_interactive_setup() -> io::Result<ArisConfig> {
 
     // ── Step 4: Reviewer ──
     println!("\n\x1b[1m[2/3] Reviewer (for LlmReview tool)\x1b[0m");
-    println!("  1. OpenAI          (gpt-5.4)");
+    println!("  1. OpenAI          (gpt-5.5)");
     println!("  2. Gemini          (gemini-2.5-pro)");
     println!("  3. GLM             (GLM-5)");
     println!("  4. MiniMax         (MiniMax-M2.7)");
@@ -435,7 +435,7 @@ pub fn run_interactive_setup() -> io::Result<ArisConfig> {
 
     // (provider_name, key_env_var, key_label, default_model)
     let reviewer_info: Option<(&str, &str, &str, &str)> = match reviewer_choice {
-        "1" => Some(("openai", "OPENAI_API_KEY", "OpenAI API key", "gpt-5.4")),
+        "1" => Some(("openai", "OPENAI_API_KEY", "OpenAI API key", "gpt-5.5")),
         "2" => Some(("gemini", "GEMINI_API_KEY", "Gemini API key", "gemini-2.5-pro")),
         "3" => Some(("glm", "GLM_API_KEY", "GLM API key", "GLM-5")),
         "4" => Some(("minimax", "MINIMAX_API_KEY", "MiniMax API key", "MiniMax-M2.7")),

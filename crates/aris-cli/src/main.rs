@@ -38,7 +38,7 @@ use runtime::{
 use serde_json::json;
 use tools::{execute_tool, mvp_tool_specs, ToolSpec};
 
-const DEFAULT_MODEL: &str = "claude-opus-4-6";
+const DEFAULT_MODEL: &str = "claude-opus-4-7";
 fn max_tokens_for_model(model: &str) -> u32 {
     if model.contains("opus") {
         32_000
@@ -434,7 +434,7 @@ fn resolve_model_alias(model: &str) -> &str {
         return model;
     }
     match model {
-        "opus" => "claude-opus-4-6",
+        "opus" => "claude-opus-4-7",
         "sonnet" => "claude-sonnet-4-6",
         "haiku" => "claude-haiku-4-5-20251001",
         _ => model,
@@ -1214,7 +1214,7 @@ impl LiveCli {
                 if std::env::var("GEMINI_API_KEY").is_ok() {
                     "gemini-2.5-pro".to_string()
                 } else {
-                    "gpt-5.4".to_string()
+                    "gpt-5.5".to_string()
                 }
             });
         std::env::set_var("ARIS_REVIEWER_MODEL", &reviewer_model);
@@ -1318,14 +1318,14 @@ impl LiveCli {
         // 1: 7sp + "A     R     I     S" (19) + 8sp             = 34
         // 2: 6sp + "Auto Research in Sleep" (22) + 6sp        = 34
         // 3: 4sp + "adversarial | multi-agent" (25) + 5sp     = 34
-        // 4: 6sp + "Claude x GPT-5.4 xhigh" (22) + 6sp       = 34
+        // 4: 6sp + "Claude x GPT-5.5 xhigh" (22) + 6sp       = 34
         // 5: same as 0                                        = 34
         let center = [
             "\x1b[2m  ──────────────────────────────  \x1b[0m",
             "\x1b[1;38;5;45m       A     R     I     S        \x1b[0m",
             "\x1b[38;5;45m      Auto Research in Sleep      \x1b[0m",
             "\x1b[2m    adversarial | multi-agent     \x1b[0m",
-            "      \x1b[38;5;45mClaude\x1b[0m x \x1b[38;5;71mGPT-5.4 xhigh\x1b[0m      ",
+            "      \x1b[38;5;45mClaude\x1b[0m x \x1b[38;5;71mGPT-5.5 xhigh\x1b[0m      ",
             "\x1b[2m  ──────────────────────────────  \x1b[0m",
         ];
 
@@ -1640,7 +1640,8 @@ impl LiveCli {
                 let items: Vec<input::SelectItem> = if is_openai {
                     // OpenAI-compat mode: show common models
                     vec![
-                        ("gpt-5.4", "OpenAI · Best intelligence at scale"),
+                        ("gpt-5.5", "OpenAI · Best intelligence at scale (xhigh reasoning)"),
+                        ("gpt-5.4", "OpenAI · Previous flagship"),
                         ("gpt-5.4-mini", "OpenAI · Strong mini model"),
                         ("gpt-5.4-nano", "OpenAI · Cheapest, high-volume"),
                         ("gemini-2.5-pro", "Google · Most capable Gemini"),
@@ -1659,7 +1660,7 @@ impl LiveCli {
                 } else {
                     // Anthropic mode
                     vec![
-                        ("claude-opus-4-6", "Opus 4.6 · Most capable for complex work"),
+                        ("claude-opus-4-7", "Opus 4.7 · Most capable for complex work"),
                         ("claude-sonnet-4-6", "Sonnet 4.6 · Best for everyday tasks"),
                         ("claude-haiku-4-5-20251001", "Haiku 4.5 · Fastest for quick answers"),
                     ]
@@ -1777,10 +1778,11 @@ impl LiveCli {
                 }
                 if has_openai {
                     for (name, desc) in [
-                        ("gpt-5.4", "OpenAI · Best intelligence for reviews"),
+                        ("gpt-5.5", "OpenAI · Best intelligence for reviews (xhigh reasoning)"),
+                        ("gpt-5.4", "OpenAI · Previous flagship"),
                         ("gpt-5.4-mini", "OpenAI · Strong and affordable"),
                         ("gpt-5.4-nano", "OpenAI · Cheapest, high-volume"),
-                        ("gpt-4o", "OpenAI · Previous gen, stable"),
+                        ("gpt-4o", "OpenAI · Older gen, stable"),
                     ] {
                         items.push(input::SelectItem {
                             label: name.to_string(),
@@ -3194,7 +3196,7 @@ fn build_system_prompt(model_id: Option<&str>) -> Result<Vec<String>, Box<dyn st
     // ARIS identity: tell the model exactly who it is to prevent hallucination.
     let model_name = model_id.unwrap_or("unknown");
     let friendly_name = match model_name {
-        "claude-opus-4-6" => "Claude Opus 4.6",
+        "claude-opus-4-7" => "Claude Opus 4.7",
         "claude-sonnet-4-6" => "Claude Sonnet 4.6",
         "claude-haiku-4-5-20251001" => "Claude Haiku 4.5",
         other => other,
@@ -4862,7 +4864,7 @@ mod tests {
             parse_args(&args).expect("args should parse"),
             CliAction::Prompt {
                 prompt: "explain this".to_string(),
-                model: "claude-opus-4-6".to_string(),
+                model: "claude-opus-4-7".to_string(),
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
                 permission_mode: PermissionMode::DangerFullAccess,
@@ -4872,7 +4874,7 @@ mod tests {
 
     #[test]
     fn resolves_known_model_aliases() {
-        assert_eq!(resolve_model_alias("opus"), "claude-opus-4-6");
+        assert_eq!(resolve_model_alias("opus"), "claude-opus-4-7");
         assert_eq!(resolve_model_alias("sonnet"), "claude-sonnet-4-6");
         assert_eq!(resolve_model_alias("haiku"), "claude-haiku-4-5-20251001");
         assert_eq!(resolve_model_alias("claude-opus"), "claude-opus");
@@ -5393,7 +5395,7 @@ mod tests {
             MessageResponse {
                 id: "msg-1".to_string(),
                 kind: "message".to_string(),
-                model: "claude-opus-4-6".to_string(),
+                model: "claude-opus-4-7".to_string(),
                 role: "assistant".to_string(),
                 content: vec![OutputContentBlock::ToolUse {
                     id: "tool-1".to_string(),
@@ -5428,7 +5430,7 @@ mod tests {
             MessageResponse {
                 id: "msg-2".to_string(),
                 kind: "message".to_string(),
-                model: "claude-opus-4-6".to_string(),
+                model: "claude-opus-4-7".to_string(),
                 role: "assistant".to_string(),
                 content: vec![OutputContentBlock::ToolUse {
                     id: "tool-2".to_string(),

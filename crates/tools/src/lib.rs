@@ -240,7 +240,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                     },
                     "model": {
                         "type": "string",
-                        "description": "Optional model override. Prefer omitting this — ARIS will use the user's configured reviewer (ARIS_REVIEWER_MODEL). Only specify a model if you have a specific reason and know the corresponding API key is set. Examples: gpt-5.4, gemini-2.5-pro, GLM-5, MiniMax-M2.7, kimi-k2.5, claude-sonnet-4-6. If the specified model's API key is missing, ARIS falls back to the configured reviewer."
+                        "description": "Optional model override. Prefer omitting this — ARIS will use the user's configured reviewer (ARIS_REVIEWER_MODEL). Only specify a model if you have a specific reason and know the corresponding API key is set. Examples: gpt-5.5, gemini-2.5-pro, GLM-5, MiniMax-M2.7, kimi-k2.5, claude-sonnet-4-6. If the specified model's API key is missing, ARIS falls back to the configured reviewer."
                     }
                 },
                 "required": ["prompt"],
@@ -1595,7 +1595,7 @@ pub fn render_skill_discovery_section() -> Option<String> {
     Some(lines.join("\n"))
 }
 
-const DEFAULT_AGENT_MODEL: &str = "claude-opus-4-6";
+const DEFAULT_AGENT_MODEL: &str = "claude-opus-4-7";
 const DEFAULT_AGENT_SYSTEM_DATE: &str = "2026-03-31";
 const DEFAULT_AGENT_MAX_ITERATIONS: usize = 32;
 
@@ -3188,7 +3188,7 @@ struct LlmReviewInput {
 /// Route a model name to its OpenAI-compatible reviewer endpoint and API key
 /// env var. Returns (key_env, default_base_url, provider_tag).
 /// The provider_tag lets us compare against `ARIS_REVIEWER_PROVIDER` to detect
-/// mismatches (e.g. executor requested `gpt-5.4` but user configured `kimi`).
+/// mismatches (e.g. executor requested `gpt-5.5` but user configured `kimi`).
 fn route_openai_compat_model(model: &str) -> (&'static str, &'static str, &'static str) {
     if model.contains("gemini") {
         ("GEMINI_API_KEY", "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions", "gemini")
@@ -3229,7 +3229,7 @@ fn env_non_empty(name: &str) -> bool {
 /// Provider consistency is derived from `configured_model` itself — we do NOT
 /// read `ARIS_REVIEWER_PROVIDER` because `/reviewer <model>` updates the model
 /// env var but leaves the provider env var stale, which would block legitimate
-/// overrides (e.g. `/reviewer gpt-5.4` after `/setup Gemini`).
+/// overrides (e.g. `/reviewer gpt-5.5` after `/setup Gemini`).
 fn resolve_reviewer_model<'a>(
     input_model: Option<&'a str>,
     configured_model: &'a str,
@@ -3255,7 +3255,7 @@ fn resolve_reviewer_model<'a>(
 
 fn run_llm_review(input: LlmReviewInput) -> Result<String, String> {
     let env_reviewer_model = std::env::var("ARIS_REVIEWER_MODEL").ok().filter(|s| !s.is_empty());
-    let configured_model = env_reviewer_model.as_deref().unwrap_or("gpt-5.4");
+    let configured_model = env_reviewer_model.as_deref().unwrap_or("gpt-5.5");
 
     // Check for user-configured reviewer provider and base URL
     let reviewer_provider = std::env::var("ARIS_REVIEWER_PROVIDER").ok().filter(|s| !s.is_empty());
@@ -4914,7 +4914,7 @@ printf 'pwsh:%s' "$1"
 
     #[test]
     fn route_openai_compat_model_picks_provider_from_name() {
-        assert_eq!(route_openai_compat_model("gpt-5.4").0, "OPENAI_API_KEY");
+        assert_eq!(route_openai_compat_model("gpt-5.5").0, "OPENAI_API_KEY");
         assert_eq!(route_openai_compat_model("gemini-2.5-pro").0, "GEMINI_API_KEY");
         assert_eq!(route_openai_compat_model("GLM-5").0, "GLM_API_KEY");
         assert_eq!(route_openai_compat_model("MiniMax-M2.7").0, "MINIMAX_API_KEY");
@@ -4971,20 +4971,20 @@ printf 'pwsh:%s' "$1"
     fn resolve_reviewer_model_honors_matching_override() {
         let _g = env_lock_reviewer().lock().unwrap();
         let _snap = ReviewerEnvSnapshot::capture_and_clear();
-        // Configured reviewer is OpenAI (gpt-5.4); executor asks for gpt-5.4-mini.
+        // Configured reviewer is OpenAI (gpt-5.5); executor asks for gpt-5.5-mini.
         std::env::set_var("OPENAI_API_KEY", "sk-openai");
-        let model = resolve_reviewer_model(Some("gpt-5.4-mini"), "gpt-5.4");
+        let model = resolve_reviewer_model(Some("gpt-5.5-mini"), "gpt-5.5");
         assert_eq!(
-            model, "gpt-5.4-mini",
+            model, "gpt-5.5-mini",
             "same-provider override should be honored when the key is set"
         );
     }
 
     #[test]
     fn resolve_reviewer_model_after_slash_reviewer_switch() {
-        // Regression test: `/setup` Gemini → `/reviewer gpt-5.4` updates
+        // Regression test: `/setup` Gemini → `/reviewer gpt-5.5` updates
         // ARIS_REVIEWER_MODEL but leaves ARIS_REVIEWER_PROVIDER stale as "gemini".
-        // Executor now asks for gpt-5.4-mini — this MUST be honored since the
+        // Executor now asks for gpt-5.5-mini — this MUST be honored since the
         // user's real intent (per ARIS_REVIEWER_MODEL) is OpenAI.
         let _g = env_lock_reviewer().lock().unwrap();
         let _snap = ReviewerEnvSnapshot::capture_and_clear();
@@ -4992,9 +4992,9 @@ printf 'pwsh:%s' "$1"
         // Stale provider env var from earlier /setup — deliberately wrong.
         std::env::set_var("ARIS_REVIEWER_PROVIDER", "gemini");
 
-        let model = resolve_reviewer_model(Some("gpt-5.4-mini"), "gpt-5.4");
+        let model = resolve_reviewer_model(Some("gpt-5.5-mini"), "gpt-5.5");
         assert_eq!(
-            model, "gpt-5.4-mini",
+            model, "gpt-5.5-mini",
             "provider consistency must come from configured_model, not stale ARIS_REVIEWER_PROVIDER"
         );
 
