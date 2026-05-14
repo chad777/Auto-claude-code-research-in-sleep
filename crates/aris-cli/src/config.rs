@@ -385,6 +385,13 @@ pub fn run_interactive_setup() -> io::Result<ArisConfig> {
             config.executor_base_url = None;
         }
         config.executor_api_key = None;
+        // Clear stale model on menu switch. For built-in providers the next
+        // line overwrites this with `exec_info.4` anyway, but for the Custom
+        // option this matters: otherwise switching from OpenAI/Gemini → Custom
+        // would carry forward `gpt-5.5` / `gemini-2.5-pro` as the "current"
+        // custom model, and the post-fetch fallback prompt (which only fires
+        // when executor_model is empty) would be skipped.
+        config.executor_model = None;
     }
 
     // Ask for API key
@@ -483,8 +490,8 @@ pub fn run_interactive_setup() -> io::Result<ArisConfig> {
     println!("  5. Kimi            (kimi-k2.5)");
     println!("  6. Anthropic Proxy (claude via proxy)");
     println!("  7. DeepSeek        (deepseek-chat)");
-    println!("  8. Custom          (OpenAI-compatible endpoint)");
-    println!("  9. Skip (no reviewer)");
+    println!("  8. Skip (no reviewer)");
+    println!("  9. Custom          (OpenAI-compatible endpoint)");
     let default_reviewer = match config.reviewer_provider.as_deref() {
         Some("openai") => "1",
         Some("gemini") => "2",
@@ -493,9 +500,9 @@ pub fn run_interactive_setup() -> io::Result<ArisConfig> {
         Some("kimi") => "5",
         Some("anthropic-compat") => "6",
         Some("deepseek") => "7",
-        Some("custom") => "8",
+        Some("custom") => "9",
         None => "1",
-        _ => "9",
+        _ => "8",
     };
     let reviewer_choice_raw = prompt_with_default("  Choose [1-9]", default_reviewer)?;
     let reviewer_choice = reviewer_choice_raw.trim();
@@ -510,7 +517,7 @@ pub fn run_interactive_setup() -> io::Result<ArisConfig> {
         "5" => Some(("kimi", "KIMI_API_KEY", "Kimi API key", "kimi-k2.5")),
         "6" => Some(("anthropic-compat", "ARIS_REVIEWER_AUTH_TOKEN", "Reviewer auth token", "claude-sonnet-4-6")),
         "7" => Some(("deepseek", "ARIS_REVIEWER_AUTH_TOKEN", "DeepSeek API key", "deepseek-v4-pro")),
-        "8" => Some(("custom", "ARIS_REVIEWER_AUTH_TOKEN", "API key", "")),
+        "9" => Some(("custom", "ARIS_REVIEWER_AUTH_TOKEN", "API key", "")),
         _ => None,
     };
 
@@ -524,6 +531,9 @@ pub fn run_interactive_setup() -> io::Result<ArisConfig> {
         if switched_reviewer {
             config.reviewer_api_key = None;
             config.reviewer_base_url = None;
+            // Same reasoning as the executor switch above: clear stale model so
+            // the Custom-reviewer fetch-failure fallback prompt actually fires.
+            config.reviewer_model = None;
         }
 
         // Ask for API key

@@ -105,7 +105,16 @@ pub fn fetch_openai_models(base_url: &str, api_key: &str) -> Result<Vec<OpenAIMo
     let runtime = tokio::runtime::Runtime::new()
         .map_err(|error| format!("Failed to start async runtime: {error}"))?;
     runtime.block_on(async move {
-        let response = Client::new()
+        // Bounded timeouts so a bad base URL / TLS stall / half-open connection
+        // doesn't hang `/setup` or `/model` indefinitely. 10s connect + 20s
+        // total covers slow Chinese proxies without making the interactive
+        // wizard feel frozen.
+        let client = Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(20))
+            .build()
+            .map_err(|error| format!("Failed to build HTTP client: {error}"))?;
+        let response = client
             .get(models_url(&base_url))
             .bearer_auth(api_key)
             .send()
