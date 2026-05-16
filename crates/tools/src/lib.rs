@@ -1326,9 +1326,12 @@ fn execute_skill(input: SkillInput) -> Result<SkillOutput, String> {
     Err(format!("unknown skill: {requested}"))
 }
 
-/// Extract bundled helper files (.py/.sh) for a skill to the skill's working directory.
-/// E.g., for skill "research-wiki", extracts "research-wiki/research_wiki.py" to
-/// `<cwd>/research-wiki/research_wiki.py`.
+/// Extract bundled helper files for a skill to the skill's working directory (cwd).
+///
+/// v0.4.8 transitional: BUNDLED_RESOURCES key namespace migrated to
+/// `tools/<rel>` / `skills/<name>/<rel>` / `shared-references/<rel>`.
+/// This function still extracts to cwd; the full cache-dir migration lands in a
+/// follow-up step (T5 cache module + T6 SkillOutput.helper_report).
 fn extract_bundled_helpers(skill_name: &str) {
     // Always extract shared-references/ on any skill invocation
     let shared_prefix = "shared-references/";
@@ -1337,21 +1340,21 @@ fn extract_bundled_helpers(skill_name: &str) {
             let target_dir = std::path::PathBuf::from("shared-references");
             let target_path = target_dir.join(filename);
             if !target_path.exists() {
-                let _ = std::fs::create_dir_all(&target_dir);
+                let _ = std::fs::create_dir_all(target_path.parent().unwrap_or(&target_dir));
                 let _ = std::fs::write(&target_path, content);
             }
         }
     }
-    // Extract skill-specific helpers
-    let prefix = format!("{skill_name}/");
+    // Extract skill-local helpers. Key shape: "skills/<skill_name>/<rel>".
+    let skill_prefix = format!("skills/{skill_name}/");
     for (key, content) in runtime::BUNDLED_RESOURCES {
-        if let Some(filename) = key.strip_prefix(&prefix) {
-            // Write to <cwd>/<skill_name>/<filename>
+        if let Some(rel) = key.strip_prefix(&skill_prefix) {
+            // Write to <cwd>/<skill_name>/<rel>, preserving subdirs (e.g. templates/).
             let target_dir = std::path::PathBuf::from(skill_name);
-            let target_path = target_dir.join(filename);
-            // Only extract if not already present (don't overwrite user edits)
+            let target_path = target_dir.join(rel);
             if !target_path.exists() {
-                let _ = std::fs::create_dir_all(&target_dir);
+                let _ =
+                    std::fs::create_dir_all(target_path.parent().unwrap_or(&target_dir));
                 let _ = std::fs::write(&target_path, content);
             }
         }
