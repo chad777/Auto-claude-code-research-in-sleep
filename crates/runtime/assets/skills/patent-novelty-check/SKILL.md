@@ -13,7 +13,7 @@ Adapted from `/novelty-check` for patent legal standards. Research novelty is NO
 
 ## Constants
 
-- `REVIEWER_MODEL = gpt-5.4` — Model used via Codex MCP for cross-model examiner verification
+- `REVIEWER_MODEL = gpt-5.5` — Model used via Codex MCP for cross-model examiner verification
 - `NOVELTY_STANDARD = patent` — Always use legal patentability standard, not research contribution standard
 
 ## Inputs
@@ -24,8 +24,8 @@ Adapted from `/novelty-check` for patent legal standards. Research novelty is NO
 
 ## Shared References
 
-Load `shared-references/patent-writing-principles.md` for novelty/non-obviousness standards.
-Load `shared-references/patent-format-us.md` for 102/103 analysis framework.
+Load `../shared-references/patent-writing-principles.md` for novelty/non-obviousness standards.
+Load `../shared-references/patent-format-us.md` for 102/103 analysis framework.
 
 ## Workflow
 

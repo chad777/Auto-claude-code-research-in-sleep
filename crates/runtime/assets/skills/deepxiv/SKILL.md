@@ -23,7 +23,11 @@ Use DeepXiv when you want to avoid loading full papers too early.
 
 ## Constants
 
-- **FETCH_SCRIPT** — `tools/deepxiv_fetch.py` relative to the current project. If unavailable, fall back to the raw `deepxiv` CLI.
+- **DEEPXIV_FETCHER** — canonical name `deepxiv_fetch.py`, resolved per
+  [`shared-references/integration-contract.md`](../shared-references/integration-contract.md) §2
+  (Policy D1 — primary + fallback cascade). If unresolved (canonical
+  chain exhausted), fall back to the raw `deepxiv` CLI (documented per
+  command below).
 - **MAX_RESULTS = 10** — Default number of results to return.
 
 > Overrides (append to arguments):
@@ -63,42 +67,40 @@ Parse `$ARGUMENTS` for:
 
 If the main argument looks like an arXiv ID and no explicit mode is given, default to `- brief`.
 
-### Step 2: Locate the Adapter (Policy D1 — primary cascade)
+### Step 2: Locate the Adapter
 
-Resolve `deepxiv_fetch.py` via the standard fallback chain
-(`shared-references/integration-contract.md` §1). Below uses `$DX` as
-the resolved path:
+Resolve `$DEEPXIV_FETCHER` via the canonical strict-safe chain (see
+[`shared-references/integration-contract.md`](../shared-references/integration-contract.md) §2).
+Policy D1 cascade: the resolved adapter is preferred; if unresolved
+(canonical chain exhausted), fall back to raw `deepxiv` CLI commands
+documented in Step 3.
 
 ```bash
-DX=""
-# Order per integration-contract.md §1: Layer 2 > Layer 3 > Layer 4 > legacy
-# (Layer 1 = active_skill_dir is exposed via the runtime preamble as a
-# literal path, not via env var; bundled skills have no Layer 1.)
-# Layer 2: user-customised aris install (takes precedence over cache so the
-# user can override individual helpers without re-bundling)
-[ -n "${HOME:-}" ] && [ -f "$HOME/.config/aris/tools/deepxiv_fetch.py" ] && DX="$HOME/.config/aris/tools/deepxiv_fetch.py"
-# Layer 3: aris-code v0.4.8+ bundled cache
-[ -z "$DX" ] && [ -n "${ARIS_CACHE_DIR:-}" ] && [ -f "$ARIS_CACHE_DIR/tools/deepxiv_fetch.py" ] && DX="$ARIS_CACHE_DIR/tools/deepxiv_fetch.py"
-# Layer 4: project workspace
-[ -z "$DX" ] && [ -f "tools/deepxiv_fetch.py" ] && DX="tools/deepxiv_fetch.py"
-# Legacy: ~/.claude/skills/ layout
-[ -z "$DX" ] && [ -n "${HOME:-}" ] && DX=$(find "$HOME/.claude/skills/deepxiv/" -name "deepxiv_fetch.py" 2>/dev/null | head -1)
+cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)" || exit 1
+if [ -z "${ARIS_REPO:-}" ] && [ -f .aris/installed-skills.txt ]; then
+    ARIS_REPO=$(awk -F'\t' '$1=="repo_root"{print $2; exit}' .aris/installed-skills.txt 2>/dev/null) || true
+fi
+DEEPXIV_FETCHER=".aris/tools/deepxiv_fetch.py"
+[ -f "$DEEPXIV_FETCHER" ] || DEEPXIV_FETCHER="tools/deepxiv_fetch.py"
+[ -f "$DEEPXIV_FETCHER" ] || { [ -n "${ARIS_REPO:-}" ] && DEEPXIV_FETCHER="$ARIS_REPO/tools/deepxiv_fetch.py"; }
+[ -f "$DEEPXIV_FETCHER" ] || DEEPXIV_FETCHER=""
 
-if [ -n "$DX" ]; then
-  python3 "$DX" --help
+# Smoke test (optional — adapter resolution shown to user). The cascade
+# in Step 3 below branches purely on `[ -n "$DEEPXIV_FETCHER" ]`; a
+# resolved-but-non-functional adapter is not currently auto-demoted.
+if [ -n "$DEEPXIV_FETCHER" ]; then
+  echo "DeepXiv adapter resolved at: $DEEPXIV_FETCHER" >&2
+else
+  echo "DeepXiv adapter unresolved (canonical chain exhausted); raw deepxiv CLI fallback will be used." >&2
 fi
 ```
-
-If `$DX` is empty, the SKILL still proceeds via raw `deepxiv` CLI commands as a primary cascade fallback.
 
 ### Step 3: Execute the Minimal Command
 
 **Search papers**
 
 ```bash
-if [ -n "$DX" ]; then
-  python3 "$DX" search "QUERY" --max MAX_RESULTS
-fi
+python3 "$DEEPXIV_FETCHER" search "QUERY" --max MAX_RESULTS
 ```
 
 Fallback:
@@ -110,9 +112,7 @@ deepxiv search "QUERY" --limit MAX_RESULTS --format json
 **Brief summary**
 
 ```bash
-if [ -n "$DX" ]; then
-  python3 "$DX" paper-brief ARXIV_ID
-fi
+python3 "$DEEPXIV_FETCHER" paper-brief ARXIV_ID
 ```
 
 Fallback:
@@ -124,7 +124,7 @@ deepxiv paper ARXIV_ID --brief --format json
 **Section map**
 
 ```bash
-if [ -n "$DX" ]; then python3 "$DX" paper-head ARXIV_ID; fi
+python3 "$DEEPXIV_FETCHER" paper-head ARXIV_ID
 ```
 
 Fallback:
@@ -136,7 +136,7 @@ deepxiv paper ARXIV_ID --head --format json
 **Specific section**
 
 ```bash
-if [ -n "$DX" ]; then python3 "$DX" paper-section ARXIV_ID "SECTION_NAME"; fi
+python3 "$DEEPXIV_FETCHER" paper-section ARXIV_ID "SECTION_NAME"
 ```
 
 Fallback:
@@ -148,7 +148,7 @@ deepxiv paper ARXIV_ID --section "SECTION_NAME" --format json
 **Trending**
 
 ```bash
-if [ -n "$DX" ]; then python3 "$DX" trending --days 7 --max MAX_RESULTS; fi
+python3 "$DEEPXIV_FETCHER" trending --days 7 --max MAX_RESULTS
 ```
 
 Fallback:
@@ -160,7 +160,7 @@ deepxiv trending --days 7 --limit MAX_RESULTS --output json
 **Web search**
 
 ```bash
-if [ -n "$DX" ]; then python3 "$DX" wsearch "QUERY"; fi
+python3 "$DEEPXIV_FETCHER" wsearch "QUERY"
 ```
 
 Fallback:
@@ -172,7 +172,7 @@ deepxiv wsearch "QUERY" --output json
 **Semantic Scholar metadata**
 
 ```bash
-if [ -n "$DX" ]; then python3 "$DX" sc "SEMANTIC_SCHOLAR_ID"; fi
+python3 "$DEEPXIV_FETCHER" sc "SEMANTIC_SCHOLAR_ID"
 ```
 
 Fallback:
@@ -210,6 +210,42 @@ Use this progression:
 5. full paper only if necessary
 
 Do not jump to full-paper reads when a brief or one section answers the question.
+
+### Step 6: Update Research Wiki (if active)
+
+**Required when `research-wiki/` exists in the project**; skip silently
+otherwise. When the wiki dir exists, resolve `$WIKI_SCRIPT` per the
+canonical chain at
+[`shared-references/wiki-helper-resolution.md`](../shared-references/wiki-helper-resolution.md)
+(Variant B — warn-and-skip). Ingest papers that were meaningfully
+read (brief / head / section / full) during this invocation — mere
+`search` hits without a depth read do not need ingestion:
+
+```bash
+if [ -d research-wiki/ ]; then
+  cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)" || exit 1
+  ARIS_REPO="${ARIS_REPO:-$(awk -F'\t' '$1=="repo_root"{print $2; exit}' .aris/installed-skills.txt 2>/dev/null)}"
+  WIKI_SCRIPT=".aris/tools/research_wiki.py"
+  [ -f "$WIKI_SCRIPT" ] || WIKI_SCRIPT="tools/research_wiki.py"
+  [ -f "$WIKI_SCRIPT" ] || { [ -n "${ARIS_REPO:-}" ] && WIKI_SCRIPT="$ARIS_REPO/tools/research_wiki.py"; }
+  [ -f "$WIKI_SCRIPT" ] || {
+    echo "WARN: research_wiki.py not found; depth-read summary delivered, wiki ingest skipped. Fix: bash tools/install_aris.sh, export ARIS_REPO, or cp <ARIS-repo>/tools/research_wiki.py tools/." >&2
+    WIKI_SCRIPT=""
+  }
+  if [ -n "$WIKI_SCRIPT" ]; then
+    for each arxiv_id the user asked this skill to read in depth:
+        python3 "$WIKI_SCRIPT" ingest_paper research-wiki/ \
+            --arxiv-id "<arxiv_id>"
+  fi
+fi
+```
+
+The helper handles metadata / slug / dedup / page / index / log in one
+call — **do not handwrite `papers/<slug>.md`**. See
+[`shared-references/integration-contract.md`](../shared-references/integration-contract.md).
+Backfill missed ingests with
+`python3 "$WIKI_SCRIPT" sync research-wiki/ --arxiv-ids <id1>,<id2>,...`
+after resolving `$WIKI_SCRIPT` as above.
 
 ## Key Rules
 

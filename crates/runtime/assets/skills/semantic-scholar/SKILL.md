@@ -23,7 +23,11 @@ This skill is the **published venue** counterpart to `/arxiv`:
 ## Constants
 
 - **MAX_RESULTS = 10** — Default number of search results.
-- **FETCH_SCRIPT** — `tools/semantic_scholar_fetch.py` relative to the project root. Fall back to inline Python if not found.
+- **S2_FETCHER** — canonical name `semantic_scholar_fetch.py`, resolved per
+  [`shared-references/integration-contract.md`](../shared-references/integration-contract.md) §2
+  (Policy D1 — primary + fallback cascade). If unresolved (canonical
+  chain exhausted), fall back to the inline Python alternative
+  documented in Step 2.
 - **DEFAULT_FILTERS** — For general research queries, apply these by default to reduce noise:
   - `--fields-of-study "Computer Science,Engineering"`
   - `--publication-types JournalArticle,Conference`
@@ -60,23 +64,24 @@ If the argument matches a DOI pattern (`10.XXXX/...`), a Semantic Scholar ID (40
 
 ### Step 2: Search Papers
 
-Locate the fetch script via the standard fallback chain
-(`shared-references/integration-contract.md` §1). Policy D1 — primary
-cascade: if the script is missing in every layer, fall through to the
-inline-Python fallback documented later in this file (line ~92).
+Resolve `$S2_FETCHER` via the canonical strict-safe chain (see
+[`shared-references/integration-contract.md`](../shared-references/integration-contract.md) §2):
 
 ```bash
-SCRIPT=""
-[ -n "${HOME:-}" ] && [ -f "$HOME/.config/aris/tools/semantic_scholar_fetch.py" ] && SCRIPT="$HOME/.config/aris/tools/semantic_scholar_fetch.py"
-[ -z "$SCRIPT" ] && [ -n "${ARIS_CACHE_DIR:-}" ] && [ -f "$ARIS_CACHE_DIR/tools/semantic_scholar_fetch.py" ] && SCRIPT="$ARIS_CACHE_DIR/tools/semantic_scholar_fetch.py"
-[ -z "$SCRIPT" ] && [ -f "tools/semantic_scholar_fetch.py" ] && SCRIPT="tools/semantic_scholar_fetch.py"
-[ -z "$SCRIPT" ] && [ -n "${HOME:-}" ] && SCRIPT=$(find "$HOME/.claude/skills/semantic-scholar/" -name "semantic_scholar_fetch.py" 2>/dev/null | head -1)
+cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)" || exit 1
+if [ -z "${ARIS_REPO:-}" ] && [ -f .aris/installed-skills.txt ]; then
+    ARIS_REPO=$(awk -F'\t' '$1=="repo_root"{print $2; exit}' .aris/installed-skills.txt 2>/dev/null) || true
+fi
+S2_FETCHER=".aris/tools/semantic_scholar_fetch.py"
+[ -f "$S2_FETCHER" ] || S2_FETCHER="tools/semantic_scholar_fetch.py"
+[ -f "$S2_FETCHER" ] || { [ -n "${ARIS_REPO:-}" ] && S2_FETCHER="$ARIS_REPO/tools/semantic_scholar_fetch.py"; }
+[ -f "$S2_FETCHER" ] || S2_FETCHER=""
 ```
 
 **Standard search** (default — relevance-ranked):
 
 ```bash
-python3 "$SCRIPT" search "QUERY" --max MAX_RESULTS \
+python3 "$S2_FETCHER" search "QUERY" --max MAX_RESULTS \
   --fields-of-study "Computer Science,Engineering" \
   --publication-types JournalArticle,Conference
 ```
@@ -84,13 +89,13 @@ python3 "$SCRIPT" search "QUERY" --max MAX_RESULTS \
 **Bulk search** (when `- sort:` is specified, or MAX_RESULTS > 100):
 
 ```bash
-python3 "$SCRIPT" search-bulk "QUERY" --max MAX_RESULTS \
+python3 "$S2_FETCHER" search-bulk "QUERY" --max MAX_RESULTS \
   --sort citationCount:desc \
   --fields-of-study "Computer Science" \
   --year "2020-"
 ```
 
-If `semantic_scholar_fetch.py` is not found, fall back to inline Python using `urllib` against `https://api.semanticscholar.org/graph/v1/paper/search`.
+If `$S2_FETCHER` is empty (Policy D1 cascade), fall back to inline Python using `urllib` against `https://api.semanticscholar.org/graph/v1/paper/search`.
 
 **Recommended filter combos** (from testing):
 
@@ -108,7 +113,7 @@ If `semantic_scholar_fetch.py` is not found, fall back to inline Python using `u
 When a single paper ID is requested:
 
 ```bash
-python3 "$SCRIPT" paper "PAPER_ID"
+python3 "$S2_FETCHER" paper "PAPER_ID"
 ```
 
 Where PAPER_ID can be:
@@ -157,13 +162,53 @@ For each paper (or top 5 if many results):
 - **Also on arXiv**: [ArXiv ID if exists, else "No"]
 ```
 
-### Step 7: Final Output
+### Step 7: Update Research Wiki (if active)
+
+**Required when `research-wiki/` exists in the project**; skip silently
+otherwise. When the wiki dir exists, resolve `$WIKI_SCRIPT` per the
+canonical chain at
+[`shared-references/wiki-helper-resolution.md`](../shared-references/wiki-helper-resolution.md)
+(Variant B — warn-and-skip). For results with an `externalIds.ArXiv`
+field, use `--arxiv-id`; for venue-only papers (no arXiv mirror —
+common for IEEE/ACM), fall back to manual metadata:
+
+```bash
+if [ -d research-wiki/ ]; then
+  cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)" || exit 1
+  ARIS_REPO="${ARIS_REPO:-$(awk -F'\t' '$1=="repo_root"{print $2; exit}' .aris/installed-skills.txt 2>/dev/null)}"
+  WIKI_SCRIPT=".aris/tools/research_wiki.py"
+  [ -f "$WIKI_SCRIPT" ] || WIKI_SCRIPT="tools/research_wiki.py"
+  [ -f "$WIKI_SCRIPT" ] || { [ -n "${ARIS_REPO:-}" ] && WIKI_SCRIPT="$ARIS_REPO/tools/research_wiki.py"; }
+  [ -f "$WIKI_SCRIPT" ] || {
+    echo "WARN: research_wiki.py not found; semantic-scholar results delivered, wiki ingest skipped. Fix: bash tools/install_aris.sh, export ARIS_REPO, or cp <ARIS-repo>/tools/research_wiki.py tools/." >&2
+    WIKI_SCRIPT=""
+  }
+  [ -n "$WIKI_SCRIPT" ] && for each paper in results:
+        if paper.externalIds.ArXiv:
+            python3 "$WIKI_SCRIPT" ingest_paper research-wiki/ \
+                --arxiv-id "<ArXiv>"
+        else:
+            python3 "$WIKI_SCRIPT" ingest_paper research-wiki/ \
+                --title "<title>" --authors "<authors joined by , >" \
+                --year <year> --venue "<venue>" \
+                [--external-id-doi "<externalIds.DOI>"]
+fi
+```
+
+The helper handles slug / dedup / page / index / log — **do not
+handwrite `papers/<slug>.md`**. See
+[`shared-references/integration-contract.md`](../shared-references/integration-contract.md).
+Backfill with `/research-wiki sync --arxiv-ids <id1>,<id2>,...` for
+arXiv-available papers.
+
+### Step 8: Final Output
 
 Summarize what was done:
 
 - `Found N published papers for "query"`
 - `Filters applied: [publication types, fields, year range, etc.]`
 - `N papers are venue-only (not on arXiv)`
+- `Wiki-ingested N papers` (if `research-wiki/` was present)
 
 Suggest follow-up skills:
 

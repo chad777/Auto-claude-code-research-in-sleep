@@ -13,7 +13,7 @@ This is the most critical skill in the patent pipeline. Claims define the legal 
 
 ## Constants
 
-- `REVIEWER_MODEL = gpt-5.4` — External examiner for claim quality review
+- `REVIEWER_MODEL = gpt-5.5` — External examiner for claim quality review
 - `MAX_CLAIM_REVISION_ROUNDS = 3` — Maximum revision iterations
 - `CLAIM_STYLE = "auto"` — `US` (Jepson or open), `EP` (two-part mandatory), `CN` (two-part), `auto` (detect from jurisdiction)
 - `MIN_INDEPENDENT_CLAIMS = 2` — Typically method + system. For utility model (实用新型): apparatus/device only, NO method claims.
@@ -29,10 +29,10 @@ This is the most critical skill in the patent pipeline. Claims define the legal 
 
 ## Shared References
 
-Load `shared-references/patent-writing-principles.md` for claim drafting principles, antecedent basis rules, and common pitfalls.
-Load `shared-references/patent-format-cn.md` for CN claim format (其特征在于).
-Load `shared-references/patent-format-us.md` for US claim format (comprising, means-plus-function).
-Load `shared-references/patent-format-ep.md` for EP two-part form (characterised in that).
+Load `../shared-references/patent-writing-principles.md` for claim drafting principles, antecedent basis rules, and common pitfalls.
+Load `../shared-references/patent-format-cn.md` for CN claim format (其特征在于).
+Load `../shared-references/patent-format-us.md` for US claim format (comprising, means-plus-function).
+Load `../shared-references/patent-format-ep.md` for EP two-part form (characterised in that).
 
 ## Workflow
 

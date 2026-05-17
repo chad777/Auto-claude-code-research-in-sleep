@@ -24,7 +24,10 @@ Use Exa when you need results beyond academic databases, or when you want conten
 
 ## Constants
 
-- **FETCH_SCRIPT** — `tools/exa_search.py` relative to the current project.
+- **EXA_FETCHER** — canonical name `exa_search.py`, resolved per
+  [`shared-references/integration-contract.md`](../shared-references/integration-contract.md) §2
+  (Policy D1 — standalone `/exa-search` has no documented fallback,
+  so unresolved helper terminates with an explicit error).
 - **MAX_RESULTS = 10** — Default number of results to return.
 
 > Overrides (append to arguments):
@@ -71,39 +74,41 @@ Parse `$ARGUMENTS` for:
 - **end date**: ISO 8601 date — only results before this
 - **location**: Two-letter ISO country code
 
-### Step 2: Locate Script (Policy A — gate)
+### Step 2: Locate Script
 
-Resolve via the standard fallback chain (`shared-references/integration-contract.md` §1). Missing helper aborts this skill because there is no graceful alternative search backend within /exa-search.
+Resolve `$EXA_FETCHER` via the canonical strict-safe chain (see
+[`shared-references/integration-contract.md`](../shared-references/integration-contract.md) §2).
+Policy D1 cascade: there is no native inline fallback for Exa
+(retrieval requires the `exa-py` SDK + API key, which lives in the
+fetcher), so unresolved helper means the SKILL cannot produce its
+primary output — fail with explicit remediation.
 
 ```bash
-SCRIPT=""
-# Layer 2: user-customised
-[ -n "${HOME:-}" ] && [ -f "$HOME/.config/aris/tools/exa_search.py" ] && SCRIPT="$HOME/.config/aris/tools/exa_search.py"
-# Layer 3: aris-code bundled cache (v0.4.8+)
-[ -z "$SCRIPT" ] && [ -n "${ARIS_CACHE_DIR:-}" ] && [ -f "$ARIS_CACHE_DIR/tools/exa_search.py" ] && SCRIPT="$ARIS_CACHE_DIR/tools/exa_search.py"
-# Layer 4: project workspace
-[ -z "$SCRIPT" ] && [ -f "tools/exa_search.py" ] && SCRIPT="tools/exa_search.py"
-# Legacy: ~/.claude/skills/
-[ -z "$SCRIPT" ] && [ -n "${HOME:-}" ] && SCRIPT=$(find "$HOME/.claude/skills/exa-search/" -name "exa_search.py" 2>/dev/null | head -1)
+cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)" || exit 1
+if [ -z "${ARIS_REPO:-}" ] && [ -f .aris/installed-skills.txt ]; then
+    ARIS_REPO=$(awk -F'\t' '$1=="repo_root"{print $2; exit}' .aris/installed-skills.txt 2>/dev/null) || true
+fi
+EXA_FETCHER=".aris/tools/exa_search.py"
+[ -f "$EXA_FETCHER" ] || EXA_FETCHER="tools/exa_search.py"
+[ -f "$EXA_FETCHER" ] || { [ -n "${ARIS_REPO:-}" ] && EXA_FETCHER="$ARIS_REPO/tools/exa_search.py"; }
+[ -f "$EXA_FETCHER" ] || {
+  echo "ERROR: exa_search.py not resolved at .aris/tools/, tools/, or \$ARIS_REPO/tools/." >&2
+  echo "       Fix: rerun bash tools/install_aris.sh, export ARIS_REPO, or copy the helper to tools/." >&2
+  echo "       Also ensure 'exa-py' is installed: pip install exa-py" >&2
+  exit 1
+}
 ```
-
-If `$SCRIPT` is empty after the chain, tell the user:
-```
-exa_search.py not found in any fallback layer ($ARIS_CACHE_DIR/tools/, ~/.config/aris/tools/, tools/, ~/.claude/skills/exa-search/).
-Ensure exa-py is installed: pip install exa-py
-```
-Then abort this skill (Policy A — gate).
 
 ### Step 3: Execute Search
 
 **Standard search:**
 ```bash
-python3 "$SCRIPT" search "QUERY" --max 10 --content highlights
+python3 "$EXA_FETCHER" search "QUERY" --max 10 --content highlights
 ```
 
 **With filters:**
 ```bash
-python3 "$SCRIPT" search "QUERY" --max 10 \
+python3 "$EXA_FETCHER" search "QUERY" --max 10 \
   --category "research paper" \
   --start-date 2025-01-01 \
   --content text --max-chars 8000
@@ -111,12 +116,12 @@ python3 "$SCRIPT" search "QUERY" --max 10 \
 
 **Find similar pages:**
 ```bash
-python3 "$SCRIPT" find-similar "URL" --max 5 --content highlights
+python3 "$EXA_FETCHER" find-similar "URL" --max 5 --content highlights
 ```
 
 **Get content for known URLs:**
 ```bash
-python3 "$SCRIPT" get-contents "URL1" "URL2" --content text
+python3 "$EXA_FETCHER" get-contents "URL1" "URL2" --content text
 ```
 
 ### Step 4: Present Results
@@ -124,8 +129,8 @@ python3 "$SCRIPT" get-contents "URL1" "URL2" --content text
 Format results as a structured table:
 
 ```
-| # | Title | URL | Date | Key Content |
-|---|-------|-----|------|-------------|
+| # | Title | Authors | Venue/Publisher | URL | Date | Key Content |
+|---|-------|---------|-----------------|-----|------|-------------|
 ```
 
 For each result:
@@ -133,6 +138,12 @@ For each result:
 - Show published date if available
 - Show highlights, text excerpt, or summary depending on content mode
 - Flag particularly relevant results
+- **For `category: "research paper"` hits only** — also record authors
+  (from Exa's `author`/`authors` fields, or fallback: parse from the
+  result snippet) and venue/publisher (from `publisher`, `source`, or
+  the domain hosting the paper). These are needed by Step 6's wiki
+  hook; if either is unavailable for a given hit, skip wiki ingest
+  for that one hit and log a note.
 
 ### Step 5: Offer Follow-up
 
@@ -140,6 +151,45 @@ After presenting results, suggest:
 - **Deepen**: "I can fetch full text for any of these results"
 - **Find similar**: "I can find pages similar to any result"
 - **Narrow**: "I can re-search with domain/date/text filters"
+
+### Step 6: Update Research Wiki (if active, research-paper results only)
+
+**Required when `research-wiki/` exists AND the search returned
+results of `category: "research paper"`**; skip silently otherwise.
+General web results (blog posts, docs, news) are **not** ingested —
+the wiki is for papers only.
+
+When the predicates hold, resolve `$WIKI_SCRIPT` per the canonical
+chain at
+[`shared-references/wiki-helper-resolution.md`](../shared-references/wiki-helper-resolution.md)
+(Variant B — warn-and-skip). For each research paper hit, try to
+recover an arXiv ID from the URL (`arxiv.org/abs/<id>`); if present,
+use `--arxiv-id`. Otherwise fall back to manual metadata:
+
+```bash
+if [ -d research-wiki/ ] and query category was "research paper":
+    cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)" || exit 1
+    ARIS_REPO="${ARIS_REPO:-$(awk -F'\t' '$1=="repo_root"{print $2; exit}' .aris/installed-skills.txt 2>/dev/null)}"
+    WIKI_SCRIPT=".aris/tools/research_wiki.py"
+    [ -f "$WIKI_SCRIPT" ] || WIKI_SCRIPT="tools/research_wiki.py"
+    [ -f "$WIKI_SCRIPT" ] || { [ -n "${ARIS_REPO:-}" ] && WIKI_SCRIPT="$ARIS_REPO/tools/research_wiki.py"; }
+    [ -f "$WIKI_SCRIPT" ] || {
+      echo "WARN: research_wiki.py not found; exa-search results delivered, wiki ingest skipped. Fix: bash tools/install_aris.sh, export ARIS_REPO, or cp <ARIS-repo>/tools/research_wiki.py tools/." >&2
+      WIKI_SCRIPT=""
+    }
+    [ -n "$WIKI_SCRIPT" ] && for each research-paper hit in results:
+        if URL matches arxiv.org/abs/<id>:
+            python3 "$WIKI_SCRIPT" ingest_paper research-wiki/ \
+                --arxiv-id "<id>"
+        else:
+            python3 "$WIKI_SCRIPT" ingest_paper research-wiki/ \
+                --title "<title>" --authors "<authors joined by , >" \
+                --year <year> --venue "<venue or publisher>"
+```
+
+The helper handles slug / dedup / page / index / log — **do not
+handwrite `papers/<slug>.md`**. See
+[`shared-references/integration-contract.md`](../shared-references/integration-contract.md).
 
 ## Key Rules
 - Always check that `EXA_API_KEY` is set before searching

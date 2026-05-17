@@ -389,4 +389,172 @@ mod tests {
                 .join("\n")
         );
     }
+
+    /// v0.4.11 — verify the SKILLS_SOURCE_COMMIT file recorded by
+    /// `tools/sync_main_skills.sh` exists and looks like a valid 40-char
+    /// hex SHA.
+    ///
+    /// If `origin/main` resolves (CI w/ `fetch-depth: 0`), also check
+    /// the pin is an ancestor of `origin/main` (warn-only — release
+    /// commits intentionally outpace the source-commit pin by one).
+    ///
+    /// Hard-fails if the file is missing or malformed so the next
+    /// release can't ship a bundle of unknown provenance.
+    #[test]
+    fn skills_source_commit_pin_present_and_well_formed() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("assets")
+            .join("SKILLS_SOURCE_COMMIT");
+        let raw = std::fs::read_to_string(&path).unwrap_or_else(|err| {
+            panic!(
+                "missing {} ({}). Run `bash tools/sync_main_skills.sh` first; \
+                 see idea-stage/v0.4.11/sync_plan.md",
+                path.display(),
+                err
+            )
+        });
+        let commit = raw.trim();
+        assert_eq!(
+            commit.len(),
+            40,
+            "SKILLS_SOURCE_COMMIT must be a 40-char SHA, got {:?} ({} chars)",
+            commit,
+            commit.len()
+        );
+        assert!(
+            commit.chars().all(|c| c.is_ascii_hexdigit()),
+            "SKILLS_SOURCE_COMMIT must be lowercase hex, got {:?}",
+            commit
+        );
+
+        // Best-effort: if git + origin/main is reachable, verify the pin
+        // is an ancestor of origin/main. Skipped silently when the
+        // current shell can't resolve origin/main (local dev, sandbox).
+        let main_check = std::process::Command::new("git")
+            .args(["rev-parse", "--verify", "--quiet", "origin/main"])
+            .output();
+        if let Ok(out) = main_check {
+            if out.status.success() {
+                let main_sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if !main_sha.is_empty() && main_sha != commit {
+                    let ancestor = std::process::Command::new("git")
+                        .args(["merge-base", "--is-ancestor", commit, &main_sha])
+                        .status();
+                    if let Ok(status) = ancestor {
+                        if !status.success() {
+                            eprintln!(
+                                "WARN: SKILLS_SOURCE_COMMIT {} is NOT an ancestor of \
+                                 origin/main {}. The skills bundle may be stale or \
+                                 diverged. Re-run sync_main_skills.sh before releasing.",
+                                commit, main_sha
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// v0.4.11 — extended helper-reference resolver coverage.
+    ///
+    /// Existing `bundle_inventory_skill_md_refs_resolve_to_bundled_resources`
+    /// covers `$ARIS_CACHE_DIR/...` and `python3 tools/...`. Main SKILL.md
+    /// also uses two more resolver layers which were previously uncovered:
+    ///   - `.aris/tools/<helper>` (canonical resolver Layer 1)
+    ///   - `${ARIS_REPO}/tools/<helper>` or `<ARIS_REPO>/tools/<helper>`
+    ///     (resolver Layer 2 — user override / dev mode)
+    #[test]
+    fn skill_md_aris_tools_and_repo_refs_resolve_to_bundled() {
+        use regex::Regex;
+        use std::collections::HashSet;
+
+        let bundled_keys: HashSet<&'static str> =
+            crate::BUNDLED_RESOURCES.iter().map(|(k, _)| *k).collect();
+
+        let aris_tools_re = Regex::new(
+            r#"\.aris/(tools/[a-zA-Z0-9_./-]+\.(?:py|sh|tex|cls|bst|md|toml|yaml|yml|json))"#,
+        )
+        .expect("compile aris_tools_re");
+        let repo_tools_re = Regex::new(
+            r#"(?:\$\{?ARIS_REPO\}?|<ARIS_REPO>)/(tools/[a-zA-Z0-9_./-]+\.(?:py|sh|tex|cls|bst|md|toml|yaml|yml|json))"#,
+        )
+        .expect("compile repo_tools_re");
+
+        let mut missing: Vec<(String, String)> = Vec::new();
+        for (skill_name, content) in crate::BUNDLED_SKILLS {
+            for cap in aris_tools_re.captures_iter(content) {
+                let key = &cap[1];
+                if !bundled_keys.contains(key) {
+                    missing.push((skill_name.to_string(), key.to_string()));
+                }
+            }
+            for cap in repo_tools_re.captures_iter(content) {
+                let key = &cap[1];
+                if !bundled_keys.contains(key) {
+                    missing.push((skill_name.to_string(), key.to_string()));
+                }
+            }
+        }
+
+        assert!(
+            missing.is_empty(),
+            "SKILL.md references {} `.aris/tools/...` or `$ARIS_REPO/tools/...` \
+             key(s) that are NOT in BUNDLED_RESOURCES:\n{}",
+            missing.len(),
+            missing
+                .iter()
+                .map(|(s, k)| format!("  /{s}: {k}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+
+    /// v0.4.11 — cross-skill references in SKILL.md should resolve to
+    /// other bundled skills. Warn-only (not hard fail) because SKILL.md
+    /// may intentionally mention not-yet-bundled or planned skills, and
+    /// we don't want to block emergency hot-fixes when main is mid-
+    /// refactor.
+    ///
+    /// Run with `cargo test ... -- --nocapture` to see warning output.
+    #[test]
+    fn skill_md_cross_skill_references_bundled_warn_only() {
+        use regex::Regex;
+        use std::collections::HashSet;
+
+        let bundled_names: HashSet<&'static str> =
+            crate::BUNDLED_SKILLS.iter().map(|(n, _)| *n).collect();
+
+        let re = Regex::new(
+            r#"(?i)\b(?:Use|See|Via|The|Run|Invoke|Calls?|Runs?|Trigger)\s+`?/([a-z][a-z0-9-]+)`?(?P<after>\.?(?:\s+(?:skill|workflow|pipeline)\b|[\s,;:!?)）]|$))"#,
+        )
+        .expect("compile cross-skill regex");
+
+        let mut unresolved: Vec<(&'static str, String)> = Vec::new();
+        for (skill_name, content) in crate::BUNDLED_SKILLS {
+            for cap in re.captures_iter(content) {
+                let referenced = &cap[1];
+                if !bundled_names.contains(referenced) {
+                    unresolved.push((*skill_name, referenced.to_string()));
+                }
+            }
+        }
+
+        if !unresolved.is_empty() {
+            let mut seen: HashSet<(&'static str, String)> = HashSet::new();
+            let mut summary: Vec<String> = Vec::new();
+            for (s, r) in &unresolved {
+                let key = (*s, r.clone());
+                if seen.insert(key) {
+                    summary.push(format!("  /{}: -> /{}", s, r));
+                }
+            }
+            eprintln!(
+                "WARN: {} cross-skill reference(s) point to non-bundled \
+                 skill(s). This is allowed (roadmap mentions, mid-refactor), \
+                 but verify each before release:\n{}",
+                summary.len(),
+                summary.join("\n")
+            );
+        }
+    }
 }

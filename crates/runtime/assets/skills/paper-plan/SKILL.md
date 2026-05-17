@@ -1,7 +1,7 @@
 ---
 name: paper-plan
 description: "Generate a structured paper outline from review conclusions and experiment results. Use when user says \"写大纲\", \"paper outline\", \"plan the paper\", \"论文规划\", or wants to create a paper plan before writing."
-argument-hint: [topic-or-narrative-doc]
+argument-hint: "[topic-or-narrative-doc] [— style-ref: <source>]"
 allowed-tools: Bash(*), Read, Write, Edit, Grep, Glob, Agent, WebSearch, WebFetch, mcp__codex__codex, mcp__codex__codex-reply
 ---
 
@@ -11,7 +11,7 @@ Generate a structured, section-by-section paper outline from: **$ARGUMENTS**
 
 ## Constants
 
-- **REVIEWER_MODEL = `gpt-5.4`** — Model used via Codex MCP for outline review. Must be an OpenAI model.
+- **REVIEWER_MODEL = `gpt-5.5`** — Model used via Codex MCP for outline review. Must be an OpenAI model.
 - **TARGET_VENUE = `ICLR`** — Default venue. User can override (e.g., `/paper-plan "topic" — venue: NeurIPS`). Supported: `ICLR`, `NeurIPS`, `ICML`, `CVPR`, `ACL`, `AAAI`, `ACM`, `IEEE_JOURNAL` (IEEE Transactions / Letters), `IEEE_CONF` (IEEE conferences).
 - **MAX_PAGES** — Page limit. For ML conferences: main body to Conclusion end (excluding references, appendix). ICLR=9, NeurIPS=9, ICML=8. **For IEEE venues: references ARE included in page count.** IEEE journal Transactions ≈ 12-14 pages total, Letters ≈ 4-5 pages total; IEEE conference ≈ 5-8 pages total (including references).
 
@@ -31,9 +31,101 @@ If none exist, ask the user to describe the paper's contribution in 3-5 sentence
 
 Keep the existing `insleep` workflow and outputs, but use the shared references below to improve the quality of the story and outline.
 
-- Read `shared-references/writing-principles.md` when framing the one-sentence contribution, Abstract, Introduction, Related Work, or hero figure.
-- Read `shared-references/venue-checklists.md` before freezing the outline for a specific venue.
+- Read `../shared-references/writing-principles.md` when framing the one-sentence contribution, Abstract, Introduction, Related Work, or hero figure.
+- Read `../shared-references/venue-checklists.md` before freezing the outline for a specific venue.
 - Only load these references when needed; do not paste their full contents into the working draft.
+
+## Optional: Style reference (`— style-ref: <source>`, opt-in)
+
+Lets the user steer the **structural** layout of the outline (section ordering, subsection density, theorem-environment density, figure budget, citation style) toward a reference paper. **Default OFF — when the user does not pass `— style-ref`, do nothing differently from before.**
+
+Only when `— style-ref: <source>` appears in `$ARGUMENTS`, run the helper FIRST, before drafting the outline:
+
+```bash
+# Resolve $STYLE_HELPER via the canonical strict-safe chain (see
+# shared-references/integration-contract.md §2). Policy A — gate:
+# unresolved helper means --style-ref cannot be satisfied, so abort.
+cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)" || exit 1
+if [ -z "${ARIS_REPO:-}" ] && [ -f .aris/installed-skills.txt ]; then
+    ARIS_REPO=$(awk -F'\t' '$1=="repo_root"{print $2; exit}' .aris/installed-skills.txt 2>/dev/null) || true
+fi
+STYLE_HELPER=".aris/tools/extract_paper_style.py"
+[ -f "$STYLE_HELPER" ] || STYLE_HELPER="tools/extract_paper_style.py"
+[ -f "$STYLE_HELPER" ] || { [ -n "${ARIS_REPO:-}" ] && STYLE_HELPER="$ARIS_REPO/tools/extract_paper_style.py"; }
+[ -f "$STYLE_HELPER" ] || {
+  echo "ERROR: extract_paper_style.py not resolved at .aris/tools/, tools/, or \$ARIS_REPO/tools/." >&2
+  echo "       Fix: rerun bash tools/install_aris.sh, export ARIS_REPO, or copy the helper to tools/." >&2
+  echo "       --style-ref cannot be satisfied; aborting." >&2
+  exit 1
+}
+STYLE_STATUS=0
+CACHE=$(python3 "$STYLE_HELPER" --source "<source>") || STYLE_STATUS=$?
+case "$STYLE_STATUS" in
+  0) ;;                                       # use $CACHE/style_profile.md as structural guidance
+  2) echo "warning: style-ref skipped (missing optional dep)" >&2 ;;
+  3) echo "error: --style-ref source failed; aborting outline" >&2 ; exit 1 ;;
+  *) echo "error: helper failed unexpectedly; aborting outline" >&2 ; exit 1 ;;
+esac
+```
+
+Sources accepted: local TeX dir / file, local PDF, arXiv id (`2501.12345` or `arxiv:2501.12345`), http(s) URL. Overleaf URLs and project IDs are rejected — clone via `/overleaf-sync setup <id>` first and pass the local clone path.
+
+**Strict rules** (full contract in `tools/extract_paper_style.py` docstring):
+
+- Use `style_profile.md` as **structural** guidance only when proposing the outline's section list, subsection counts, theorem density, figure budget.
+- **Never copy prose, claims, examples, section names verbatim, or terminology** from anything reachable through the cache. The user's narrative is the only source of substance.
+- **Never pass `— style-ref` (or the cache contents) to reviewer / auditor sub-agents.** Cross-model review independence (`../shared-references/reviewer-independence.md`) requires reviewers see only the artifact and the user's prompt.
+
+### Gap Report (`GAP_REPORT.md`, auto-emitted when style-ref is on)
+
+When `— style-ref:` succeeded AND any of `figures/`, `results/`, `data/`, `tables/`, `sec/`, `NARRATIVE_REPORT.md`, `CLAIMS_FROM_RESULTS.md` exists in the project, **also** emit a gap report before drafting the outline. The gap report maps the exemplar's section topology + density requirements (from `style_profile.md`) against the user's actual assets, surfacing structural slots where the user has **no evidence to fill**. It is the contract by which `/paper-write` decides when to emit `<!-- DATA_NEEDED -->` markers instead of fabricating content.
+
+Procedure:
+
+1. Read `$CACHE/style_profile.md` for exemplar's section list + per-section feature counts (figures, theorems, tables, citations, sentences per section).
+2. Inventory user assets: `figures/*` filenames, `results/*` evidence files, `sec/*.tex` existing prose, `NARRATIVE_REPORT.md`, `CLAIMS_FROM_RESULTS.md` (if `/result-to-claim` ran), `references.bib` for citation density.
+3. For each section slot the exemplar implies (ablation table, scaling experiment, failure-case analysis, proof block, …), classify as `covered` / `partial` / `missing`.
+4. Emit `<output-dir>/GAP_REPORT.md`:
+
+```markdown
+# GAP_REPORT — exemplar vs user assets
+
+- **Exemplar source:** <source identifier (file path, arXiv ID, URL)>
+- **Generated:** <UTC ISO-8601>
+- **Style profile:** <relative path to style_profile.md>
+
+## Section topology gaps
+
+| Exemplar slot | Exemplar feature | User evidence | Status | Slot ID |
+|---|---|---|---|---|
+| §5 Experiments | ablation table (3 axes × 4 levels) | `results/` has no ablation file | missing | `GAP_S5_ABLATION` |
+| §5.3 Scaling | log-N scaling curve | `figures/scaling.pdf` not found | missing | `GAP_S5_SCALING` |
+| §6 Discussion | failure-case analysis | not present in `NARRATIVE_REPORT.md` | missing | `GAP_S6_FAILURE` |
+| §2 Related | citation density ≥ 60 | `references.bib` has 35 entries | partial | `GAP_S2_CITES` |
+
+## Coverage summary
+
+- covered: N
+- partial: M
+- missing: K
+
+## Used by
+
+- `/paper-write` reads this file and emits `<!-- DATA_NEEDED: <Slot ID> — <one-line description> -->` placeholders for `missing` slots instead of fabricating content.
+- `/paper-claim-audit` can use Slot IDs to flag claims that cite sections with `missing` evidence.
+```
+
+Slot ID format: `GAP_<SECTION>_<FEATURE>`, all-caps, stable across regenerations unless user assets change.
+
+**Rules** (hard):
+
+- **Do not** infer, fill, or hallucinate evidence to "close" gaps. Missing is missing.
+- **Do not** propose specific experiment commands to fill gaps — that is `/experiment-bridge`'s job. Gap Report just surfaces deficits.
+- **Do not** include exemplar prose / claim text / author names / quantitative figures from the exemplar.
+- If `style_profile.md` extraction failed or the user has no project assets, skip Gap Report (no error; just do not emit the file).
+- The gap report is **also subject to reviewer isolation** — never passed to reviewer / auditor sub-agents (same rule as `style_profile.md`).
+
+Original idea: @zhangpelf in [#217](https://github.com/wanshuiyin/Auto-claude-code-research-in-sleep/issues/217).
 
 ## Workflow
 
@@ -64,7 +156,7 @@ Build a **Claims-Evidence Matrix**:
 
 Based on TARGET_VENUE and paper content, classify and select structure.
 
-Before committing to a structure, apply the narrative principle from `shared-references/writing-principles.md`:
+Before committing to a structure, apply the narrative principle from `../shared-references/writing-principles.md`:
 
 - The paper should tell one coherent technical story.
 - By the end of the Introduction, the outline should make the **What**, **Why**, and **So What** explicit.
@@ -211,7 +303,7 @@ Send the complete outline to GPT-5.4 xhigh for feedback:
 
 ```
 mcp__codex__codex:
-  model: gpt-5.4
+  model: gpt-5.5
   config: {"model_reasoning_effort": "xhigh"}
   prompt: |
     Review this paper outline for a [VENUE] submission.
@@ -286,6 +378,6 @@ Outline methodology inspired by [Research-Paper-Writing-Skills](https://github.c
 ## Output Protocols
 
 > Follow these shared protocols for all output files:
-> - **[Output Versioning Protocol](shared-references/output-versioning.md)** — write timestamped file first, then copy to fixed name
-> - **[Output Manifest Protocol](shared-references/output-manifest.md)** — log every output to MANIFEST.md
-> - **[Output Language Protocol](shared-references/output-language.md)** — respect the project's language setting
+> - **[Output Versioning Protocol](../shared-references/output-versioning.md)** — write timestamped file first, then copy to fixed name
+> - **[Output Manifest Protocol](../shared-references/output-manifest.md)** — log every output to MANIFEST.md
+> - **[Output Language Protocol](../shared-references/output-language.md)** — respect the project's language setting

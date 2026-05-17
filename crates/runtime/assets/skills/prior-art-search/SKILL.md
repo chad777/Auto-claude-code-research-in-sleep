@@ -27,7 +27,7 @@ Read the invention description from:
 
 ## Shared References
 
-Load `shared-references/prior-art-databases.md` for search strategy templates and IPC/CPC classification guidance.
+Load `../shared-references/prior-art-databases.md` for search strategy templates and IPC/CPC classification guidance.
 
 ## Workflow
 

@@ -13,7 +13,7 @@ Adapted from the refinement pattern in `/research-refine` for patent invention d
 
 ## Constants
 
-- `REVIEWER_MODEL = gpt-5.4` — External reviewer for invention decomposition validation
+- `REVIEWER_MODEL = gpt-5.5` — External reviewer for invention decomposition validation
 - `MAX_REFINEMENT_ROUNDS = 3` — Maximum structuring iterations
 
 ## Inputs
@@ -25,7 +25,7 @@ Adapted from the refinement pattern in `/research-refine` for patent invention d
 
 ## Shared References
 
-Load `shared-references/patent-writing-principles.md` for the Problem-Solution-Advantage framework and claimable subject matter guidelines.
+Load `../shared-references/patent-writing-principles.md` for the Problem-Solution-Advantage framework and claimable subject matter guidelines.
 
 ## Workflow
 

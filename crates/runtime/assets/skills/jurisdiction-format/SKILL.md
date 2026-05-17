@@ -27,9 +27,9 @@ Analogous to `/paper-compile` but for patent document formatting instead of LaTe
 
 ## Shared References
 
-Load `shared-references/patent-format-cn.md` for CNIPA document structure and formatting rules.
-Load `shared-references/patent-format-us.md` for USPTO document structure.
-Load `shared-references/patent-format-ep.md` for EPO document structure.
+Load `../shared-references/patent-format-cn.md` for CNIPA document structure and formatting rules.
+Load `../shared-references/patent-format-us.md` for USPTO document structure.
+Load `../shared-references/patent-format-ep.md` for EPO document structure.
 
 ## Workflow
 

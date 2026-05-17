@@ -87,10 +87,6 @@ and a **local Codex app-server MCP bridge** as the raster renderer.
   if [ -n "${CLAUDE_SKILL_DIR:-}" ] && [ -f "$CLAUDE_SKILL_DIR/scripts/paper_illustration_image2.py" ]; then
     IMAGE2_HELPER="$CLAUDE_SKILL_DIR/scripts/paper_illustration_image2.py"
   fi
-  # Layer 0b (ARIS-Code v0.4.8+): bundled cache, skill-local scripts/ namespace.
-  if [ -z "$IMAGE2_HELPER" ] && [ -n "${ARIS_CACHE_DIR:-}" ] && [ -f "$ARIS_CACHE_DIR/skills/paper-illustration-image2/scripts/paper_illustration_image2.py" ]; then
-    IMAGE2_HELPER="$ARIS_CACHE_DIR/skills/paper-illustration-image2/scripts/paper_illustration_image2.py"
-  fi
   # Layers 1-3: shared-runtime chain via shim at tools/paper_illustration_image2.py.
   if [ -z "$IMAGE2_HELPER" ]; then
     cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)" || exit 1
@@ -103,8 +99,8 @@ and a **local Codex app-server MCP bridge** as the raster renderer.
     [ -f "$IMAGE2_HELPER" ] || IMAGE2_HELPER=""
   fi
   [ -z "$IMAGE2_HELPER" ] && {
-    echo "ERROR: paper_illustration_image2.py not resolved (layer 0: \$CLAUDE_SKILL_DIR/scripts/; layer 0b: \$ARIS_CACHE_DIR/skills/paper-illustration-image2/scripts/; layers 1-3: .aris/tools/, tools/, \$ARIS_REPO/tools/)." >&2
-    echo "       /paper-illustration-image2 cannot proceed. Fix: rerun the aris-code binary (Layer 0b auto-extracts on startup), or rerun bash tools/install_aris.sh, or copy the canonical script from \$ARIS_REPO/skills/paper-illustration-image2/scripts/." >&2
+    echo "ERROR: paper_illustration_image2.py not resolved (layer 0: \$CLAUDE_SKILL_DIR/scripts/; layers 1-3: .aris/tools/, tools/, \$ARIS_REPO/tools/)." >&2
+    echo "       /paper-illustration-image2 cannot proceed. Fix: rerun bash tools/install_aris.sh, or copy the canonical script from \$ARIS_REPO/skills/paper-illustration-image2/scripts/." >&2
     exit 1
   }
   ```

@@ -1,7 +1,7 @@
 ---
 name: paper-write
 description: "Draft LaTeX paper section by section from an outline. Use when user says \"写论文\", \"write paper\", \"draft LaTeX\", \"开始写\", or wants to generate LaTeX content from a paper plan."
-argument-hint: [venue-or-section]
+argument-hint: "[venue-or-section] [— style-ref: <source>]"
 allowed-tools: Bash(*), Read, Write, Edit, Grep, Glob, Agent, WebSearch, WebFetch, mcp__codex__codex, mcp__codex__codex-reply
 ---
 
@@ -11,7 +11,7 @@ Draft a LaTeX paper based on: **$ARGUMENTS**
 
 ## Constants
 
-- **REVIEWER_MODEL = `gpt-5.4`** — Model used via Codex MCP for section review. Must be an OpenAI model.
+- **REVIEWER_MODEL = `gpt-5.5`** — Model used via Codex MCP for section review. Must be an OpenAI model.
 - **TARGET_VENUE = `ICLR`** — Default venue. Supported: `ICLR`, `NeurIPS`, `ICML`, `CVPR` (also ICCV/ECCV), `ACL` (also EMNLP/NAACL), `AAAI`, `ACM` (ACM MM, SIGIR, KDD, CHI, etc.), `IEEE_JOURNAL` (IEEE Transactions / Letters, e.g., T-PAMI, JSAC, TWC, TCOM, TSP, TIP), `IEEE_CONF` (IEEE conferences, e.g., ICC, GLOBECOM, INFOCOM, ICASSP). Determines style file and formatting.
 - **ANONYMOUS = true** — If true, use anonymous author block. Set `false` for camera-ready. Note: most IEEE venues do NOT use anonymous submission — set `false` for IEEE.
 - **MAX_PAGES = 9** — Main body page limit. For ML conferences: counts from first page to end of Conclusion section, references and appendix NOT counted. **For IEEE venues: references ARE counted toward the page limit.** Typical limits: IEEE journal = no strict limit (but 12-14 pages typical for Transactions, 4-5 for Letters), IEEE conference = 5-8 pages including references.
@@ -31,11 +31,73 @@ If no PAPER_PLAN.md exists, ask the user to run `/paper-plan` first or provide a
 
 Keep the existing `insleep` workflow, file layout, and defaults. Use the shared references below only when they improve writing quality:
 
-- Read `shared-references/writing-principles.md` before drafting the Abstract, Introduction, Related Work, or when prose feels generic.
-- Read `shared-references/venue-checklists.md` during the final write-up and submission-readiness pass.
-- Read `shared-references/citation-discipline.md` only when the built-in DBLP/CrossRef workflow is insufficient.
+- Read `../shared-references/writing-principles.md` before drafting the Abstract, Introduction, Related Work, or when prose feels generic.
+- Read `../shared-references/venue-checklists.md` during the final write-up and submission-readiness pass.
+- Read `../shared-references/citation-discipline.md` only when the built-in DBLP/CrossRef workflow is insufficient.
 
 These references are support material, not extra workflow phases.
+
+## Optional: Style reference (`— style-ref: <source>`, opt-in)
+
+Lets the user steer **structural** style (section ordering, theorem density, sentence cadence, figure density, bibliography style) toward a reference paper. **Default OFF — when the user does not pass `— style-ref`, do nothing differently from before.**
+
+Only when `— style-ref: <source>` appears in `$ARGUMENTS`, run the helper FIRST, before drafting:
+
+```bash
+# Resolve $STYLE_HELPER via the canonical strict-safe chain (see
+# shared-references/integration-contract.md §2). Policy A — gate:
+# unresolved helper means --style-ref cannot be satisfied, so abort.
+cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)" || exit 1
+if [ -z "${ARIS_REPO:-}" ] && [ -f .aris/installed-skills.txt ]; then
+    ARIS_REPO=$(awk -F'\t' '$1=="repo_root"{print $2; exit}' .aris/installed-skills.txt 2>/dev/null) || true
+fi
+STYLE_HELPER=".aris/tools/extract_paper_style.py"
+[ -f "$STYLE_HELPER" ] || STYLE_HELPER="tools/extract_paper_style.py"
+[ -f "$STYLE_HELPER" ] || { [ -n "${ARIS_REPO:-}" ] && STYLE_HELPER="$ARIS_REPO/tools/extract_paper_style.py"; }
+[ -f "$STYLE_HELPER" ] || {
+  echo "ERROR: extract_paper_style.py not resolved at .aris/tools/, tools/, or \$ARIS_REPO/tools/." >&2
+  echo "       Fix: rerun bash tools/install_aris.sh, export ARIS_REPO, or copy the helper to tools/." >&2
+  echo "       --style-ref cannot be satisfied; aborting." >&2
+  exit 1
+}
+STYLE_STATUS=0
+CACHE=$(python3 "$STYLE_HELPER" --source "<source>") || STYLE_STATUS=$?
+case "$STYLE_STATUS" in
+  0) ;;                                       # use $CACHE/style_profile.md as structural guidance
+  2) echo "warning: style-ref skipped (missing optional dep)" >&2 ;;
+  3) echo "error: --style-ref source failed; aborting draft" >&2 ; exit 1 ;;
+  *) echo "error: helper failed unexpectedly; aborting draft" >&2 ; exit 1 ;;
+esac
+```
+
+Sources accepted: local TeX dir / file, local PDF, arXiv id (`2501.12345` or `arxiv:2501.12345`), http(s) URL. Overleaf URLs and project IDs are rejected — clone via `/overleaf-sync setup <id>` first and pass the local clone path.
+
+**Strict rules** (full contract in `tools/extract_paper_style.py` docstring):
+
+- Use `style_profile.md` as **structural** guidance only. Match section count, section ordering tendency, theorem-environment density, caption-length distribution, sentence cadence, math display ratio, citation style.
+- **Never copy prose, claims, examples, or terminology** from anything reachable through the cache. The profile is intentionally aggregate; if you need substance, use the user's own outline.
+- **Never pass `— style-ref` (or the cache contents) to reviewer / auditor sub-agents.** Cross-model review independence (`../shared-references/reviewer-independence.md`) requires reviewers see only the artifact and the user's prompt, not the author's stylistic context.
+
+### `<!-- DATA_NEEDED -->` markers (when `GAP_REPORT.md` exists)
+
+If `/paper-plan` ran with `— style-ref:` it will have emitted `GAP_REPORT.md` alongside `PAPER_PLAN.md`. This file lists structural slots (ablation tables, scaling experiments, failure-case analyses, …) the exemplar implies but the user has **no evidence to fill**.
+
+When `GAP_REPORT.md` is present and a section slot is classified as `status: missing`:
+
+1. **Do not fabricate numerical results, figure references, or qualitative claims** to fill that slot.
+2. Emit an HTML-comment placeholder at the exact location the missing content would go:
+
+   ```latex
+   <!-- DATA_NEEDED: GAP_S5_ABLATION — ablation table comparing X across the 3 axes implied by exemplar -->
+   ```
+
+3. Slot ID and one-line description come straight from `GAP_REPORT.md`. **Never invent Slot IDs.** Never reword the description to be more confident than the report.
+4. The marker is intentionally an HTML comment so it is invisible in the rendered PDF but **searchable via `grep -r "DATA_NEEDED" sec/`** for human triage / `/experiment-bridge` follow-up.
+5. For `status: partial`, write what the user has and emit `<!-- DATA_NEEDED: <Slot ID> — <what specifically is short> -->` at the gap point in the same paragraph (do not split the section).
+
+**Carve-out from "no placeholder" rule.** The default `/paper-write` discipline (no placeholders such as "see supplementary" or "TBD") still applies for everything **except** GAP_REPORT-listed missing slots. The marker is the principled way to surface genuine evidence deficits without compromising claim integrity.
+
+Original idea: @zhangpelf in [#217](https://github.com/wanshuiyin/Auto-claude-code-research-in-sleep/issues/217).
 
 ## Templates
 
@@ -142,7 +204,7 @@ Process sections in order. For each section:
 
 1. **Read the plan** — what claims, evidence, citations belong here
 2. **Read NARRATIVE_REPORT.md** — extract relevant content, findings, and quantitative results
-3. **Draft content** — write complete LaTeX (not placeholders)
+3. **Draft content** — write complete LaTeX (no fabricated placeholders). **Exception:** if `GAP_REPORT.md` exists and the section has slots with `status: missing`, emit `<!-- DATA_NEEDED: <Slot ID> — <description> -->` at those points instead of inventing data — see the DATA_NEEDED markers subsection above.
 4. **Insert figures/tables** — use snippets from `figures/latex_includes.tex`
 5. **Add citations** — for ML conferences (ICLR/NeurIPS/ICML/CVPR/ACL/AAAI): use `\citep{}` / `\citet{}` (natbib). **For IEEE venues**: use `\cite{}` (numeric style via `cite` package). Never mix natbib and cite commands.
 
@@ -151,7 +213,7 @@ Before drafting the front matter, re-read the one-sentence contribution from `PA
 #### Section-Specific Guidelines
 
 **§0 Abstract:**
-- Use the 5-part flow from `shared-references/writing-principles.md`: what, why hard, how, evidence, strongest result
+- Use the 5-part flow from `../shared-references/writing-principles.md`: what, why hard, how, evidence, strongest result
 - Must be self-contained (understandable without reading the paper)
 - Start with the paper's specific contribution, not generic field-level background
 - Include one concrete quantitative result
@@ -237,7 +299,7 @@ If no standalone full-proof source exists:
 - If the appendix needs different wording, add an explicit notation bridge instead of silently renaming concepts
 - Resolve all mismatches before Step 4
 
-**Empirical motivation:** in our April 2026 NeurIPS run, the default behavior generated `"see supplementary proof document"` placeholders in the appendix. We had to manually pull 1264 lines of full proofs from a standalone `proof_dllm_full.tex` file. Without this pass, theory papers ship with sketch-only appendices that fail at theory venues.
+**Empirical motivation:** in a real theory-paper run, the default behavior generated `"see supplementary proof document"` placeholders in the appendix. The author had to manually pull hundreds of lines of full proofs from a standalone proofs file (e.g. `proof_full.tex`). Without this pass, theory papers ship with sketch-only appendices that fail at theory venues.
 
 ### Step 4: Build Bibliography
 
@@ -276,7 +338,7 @@ If both DBLP and CrossRef return nothing, mark the entry with `% [VERIFY]` comme
 
 **Why this matters:** LLM-generated BibTeX frequently hallucinates venue names, page numbers, or even co-authors. DBLP and CrossRef return publisher-verified metadata. Upstream skills (`/research-lit`, `/novelty-check`) may mention papers from LLM memory — this fetch chain is the gate that prevents hallucinated citations from entering the final `.bib`.
 
-If the DBLP/CrossRef flow is not enough, load `shared-references/citation-discipline.md` for stricter fallback rules before adding placeholders.
+If the DBLP/CrossRef flow is not enough, load `../shared-references/citation-discipline.md` for stricter fallback rules before adding placeholders.
 
 **Automated bib cleaning** — use this Python pattern to extract only cited entries:
 
@@ -382,7 +444,7 @@ If `VERIFY` or `MISMATCH` is printed, do not invent metadata:
 
 **Citation reachability rule:** an entry is dead if its key does not appear in any `\cite...{}` command in `paper/main.tex` or any `paper/sections/*.tex` file.
 
-**Empirical motivation:** in our April 2026 NeurIPS run, 3 dead bib entries (`bresler2015`, `sedd2024`, `wainwright2008`) sat in `references.bib` for 5+ improvement rounds, and a `codd2025` entry had `year = {2026}` (key/year mismatch). Neither was flagged by the existing automated cleaning.
+**Empirical motivation:** in a real submission run, several dead bib entries sat in `references.bib` for many improvement rounds, and at least one entry had a key/year mismatch. Neither was flagged by the existing automated cleaning.
 
 **Citation verification rules (from claude-scholar + Imbad0202):**
 1. Every BibTeX entry must have: author, title, year, venue/journal
@@ -458,7 +520,7 @@ Send the complete draft to GPT-5.4 xhigh:
 
 ```
 mcp__codex__codex:
-  model: gpt-5.4
+  model: gpt-5.5
   config: {"model_reasoning_effort": "xhigh"}
   prompt: |
     Review this [VENUE] paper draft (main body, excluding appendix).
@@ -507,7 +569,7 @@ Before declaring done:
 - [ ] references.bib contains ONLY cited entries (no bloat)
 - [ ] **No stale section files** — every .tex in `sections/` is `\input`ed by `main.tex`
 - [ ] **Section files match main.tex** — file numbering and `\input` paths are consistent
-- [ ] Venue-specific required sections/checklists satisfied (read `shared-references/venue-checklists.md` if needed)
+- [ ] Venue-specific required sections/checklists satisfied (read `../shared-references/venue-checklists.md` if needed)
 - [ ] A skim reader can recover the main claim from the title, abstract, introduction, and Figure 1/captions
 
 ## Key Rules
@@ -528,9 +590,9 @@ Before declaring done:
 
 ## Writing Quality Reference
 
-- `shared-references/writing-principles.md` — story framing, abstract/introduction patterns, sentence-level clarity, reviewer reading order
-- `shared-references/venue-checklists.md` — ICLR/NeurIPS/ICML/IEEE submission requirements to check before declaring done
-- `shared-references/citation-discipline.md` — stricter fallback for ambiguous citations
+- `../shared-references/writing-principles.md` — story framing, abstract/introduction patterns, sentence-level clarity, reviewer reading order
+- `../shared-references/venue-checklists.md` — ICLR/NeurIPS/ICML/IEEE submission requirements to check before declaring done
+- `../shared-references/citation-discipline.md` — stricter fallback for ambiguous citations
 
 Keep using the reverse-outline test and anti-inflation polish from the main workflow above; the shared references are there to improve quality without adding a new phase.
 

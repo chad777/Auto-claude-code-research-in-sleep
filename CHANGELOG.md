@@ -1,5 +1,131 @@
 # ARIS-Code Changelog
 
+## v0.4.11 (2026-05-18)
+
+The skills bundle refresh / research workflow sync release. The binary
+runtime behaviour is essentially unchanged from v0.4.10 — what shipped
+new is the **embedded skills set** catching up to the current state of
+the `main` skills branch. Closes the gap that built up during the
+v0.4.5 → v0.4.10 maintenance cycle (only ~6 of 56 main commits in
+`skills/` had been cherry-picked into the bundle).
+
+### 📦 Bundle inventory
+
+**Embedded skills**: 65 → 74 user-facing skills (+10 new, refreshed
+46 existing SKILL.md files). New skills:
+
+- `/citation-audit` — fourth-layer bibliography audit (existence +
+  metadata + cited-context coverage)
+- `/experiment-queue` — SSH job queue for multi-seed / multi-config
+  experiments with OOM-aware retry, stale-screen cleanup, wave
+  transitions
+- `/gemini-search` — Gemini-backed broad literature discovery
+- `/kill-argument` — two-thread adversarial review (reject memo →
+  defence → unresolved critical issues)
+- `/openalex` — OpenAlex API source for open citation graph + funding
+- `/overleaf-sync` — two-way sync between local paper directory and
+  an Overleaf project via the Git bridge (token-safe via Keychain)
+- `/paper-talk` — end-to-end conference talk pipeline (outline →
+  Beamer + PPTX → per-page polish → assurance)
+- `/qzcli` — manage Qizhi (启智) platform GPU jobs (kubectl-style)
+- `/resubmit-pipeline` — W5 workflow: text-only paper resubmit to a
+  different venue under hard constraints + kill-argument gate
+- `/slides-polish` — per-page Codex review + targeted python-pptx /
+  Beamer fixes for academic talk slides
+
+**Embedded helpers**: 34 → 49 helper resources. tools/ goes 9 → 18:
+the 9 baseline helpers are *refreshed* (notably `research_wiki.py`
+grew 315 → 767 lines with the canonical `ingest_paper` API) and 9
+new helpers ship for the new skills:
+
+- `extract_paper_style.py` — used by 7 paper-series skills when
+  `— style-ref: <source>` is passed
+- `figure_renderer.py` — used by `/figure-spec`
+- `paper_illustration_image2.py` — used by `/paper-illustration-image2`
+- `overleaf_setup.sh` + `overleaf_audit.sh` — `/overleaf-sync`
+  Premium-feature integration
+- `verify_wiki_coverage.sh` — wiki coverage helper
+- `watchdog.py` — `/experiment-queue` watchdog
+- `experiment_queue/build_manifest.py` +
+  `experiment_queue/queue_manager.py` — `/experiment-queue`
+  orchestration
+
+`shared-references/` gains `assurance-contract.md` and
+`wiki-helper-resolution.md`; the existing 5 shared references all
+refreshed.
+
+### 🔧 Sync infrastructure (new)
+
+- `tools/sync_main_skills.sh` — automated rsync from `origin/main`
+  with symlink pre-flight, deterministic codex-mirror prune,
+  full-helper whitelist, source-commit SHA pinning.
+- `crates/runtime/assets/SKILLS_SOURCE_COMMIT` — records the main
+  commit that this bundle was rsync'd from, so drift between
+  releases can be tracked.
+- New CI drift tests in `crates/runtime/src/cache.rs`:
+  - `skills_source_commit_pin_present_and_well_formed` — hard-fails
+    if the source-commit file is missing or malformed; best-effort
+    ancestor check when `origin/main` is resolvable.
+  - `skill_md_aris_tools_and_repo_refs_resolve_to_bundled` —
+    extends existing inventory test to `.aris/tools/<helper>` and
+    `${ARIS_REPO}/tools/<helper>` resolver patterns (codex
+    round-3 caught these were uncovered).
+  - `skill_md_cross_skill_references_bundled_warn_only` —
+    warn-only scan for inter-skill `/<name>` references; run with
+    `-- --nocapture` to see the warnings.
+
+### 🔧 Gemini alias correction
+
+`research-lit/SKILL.md` Gemini MCP call now passes
+`model: 'auto-gemini-3'` instead of the historical `gemini-2.5-pro`
+(silently routed through OAuth-personal capacity exhaustion since
+gemini-3 GA). The 5 references in `paper-illustration/SKILL.md`
+are direct REST URLs (`generativelanguage.googleapis.com/...`)
+where `auto-gemini-3` is not a server-side model ID, so those
+stay on the explicit `gemini-3-pro-preview` / `gemini-3-pro-image-preview`.
+
+### ⚠️ What did NOT change in v0.4.11
+
+- **No CLI runtime / API client changes.** v0.4.10 audit's 4 P1
+  follow-ups (Anthropic stream retry coverage, o-series reasoning
+  effort, OpenAI `stream_options` proxy fallback, per-server MCP
+  timeout) are still pending — pushed to v0.4.12.
+- **No reviewer default change.** `gpt-5.5` has been the CLI
+  default since v0.4.5 (commit `87e1088`); main's `d43d77a`
+  brought `skills/` docs in line with that, so the bundle now
+  consistently shows `REVIEWER_MODEL = gpt-5.5` in SKILL.md
+  examples. Users who pin `ARIS_REVIEWER_MODEL=gpt-5.4` continue
+  to override unchanged.
+- **No `meta_opt/` hook bundling.** `tools/meta_opt/log_event.sh`
+  and `check_ready.sh` are SessionEnd hooks that need a deploy
+  mechanism, not on-demand extraction. Deferred to v0.4.12
+  alongside a CLI hook-install path.
+- **No skills-codex mirror in binary.** The 3 `skills-codex*/`
+  directories in main are for the Codex CLI agent install path,
+  not user-facing skills. `build.rs` already excludes them and
+  `sync_main_skills.sh` prunes them post-rsync.
+
+### 📐 Cross-model review
+
+Codex MCP (gpt-5.5 xhigh) reviewed every step:
+- round-1 (plan): REQUEST CHANGES (8 findings)
+- round-2 (plan v2): APPROVE WITH NITS (7 nits)
+- round-3 (plan + sync_script + drift_tests drafts): NO-GO
+  (5 blocking findings — missing baseline helper refresh,
+  incomplete drift coverage, fetch race, draft notation,
+  stale paths)
+- round-3.5 (after fixes): GO with 4 watch-outs (all addressed)
+
+Three drift-test cross-skill warnings remain (informational, warn-only
+test). They are not bundle misses:
+
+- `/experiment-bridge -> /codex` — refers to the `mcp__codex__codex`
+  MCP tool name, not an ARIS skill (regex false positive).
+- `/paper-compile -> /codex` — same.
+- `/kill-argument -> /peer-review` — `/peer-review` is a planned
+  v0.5.0+ skill, intentionally referenced in the rebuttal pipeline
+  before it ships.
+
 ## v0.4.10 (2026-05-17)
 
 The stream + MCP reliability release. Closes three classes of stalls

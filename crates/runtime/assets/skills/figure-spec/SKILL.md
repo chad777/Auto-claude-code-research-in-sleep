@@ -55,11 +55,6 @@ FIGURE_RENDERER=""
 if [ -n "${CLAUDE_SKILL_DIR:-}" ] && [ -f "$CLAUDE_SKILL_DIR/scripts/figure_renderer.py" ]; then
   FIGURE_RENDERER="$CLAUDE_SKILL_DIR/scripts/figure_renderer.py"
 fi
-# Layer 0b (ARIS-Code v0.4.8+): bundled cache, skill-local scripts/ namespace.
-# This is the primary path for aris-code single-binary distributions.
-if [ -z "$FIGURE_RENDERER" ] && [ -n "${ARIS_CACHE_DIR:-}" ] && [ -f "$ARIS_CACHE_DIR/skills/figure-spec/scripts/figure_renderer.py" ]; then
-  FIGURE_RENDERER="$ARIS_CACHE_DIR/skills/figure-spec/scripts/figure_renderer.py"
-fi
 # Layers 1-3: shared-runtime chain (legacy compatibility + non-CC hosts).
 if [ -z "$FIGURE_RENDERER" ]; then
   cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)" || exit 1
@@ -72,8 +67,8 @@ if [ -z "$FIGURE_RENDERER" ]; then
   [ -f "$FIGURE_RENDERER" ] || FIGURE_RENDERER=""
 fi
 [ -z "$FIGURE_RENDERER" ] && {
-  echo "ERROR: figure_renderer.py not resolved (layer 0: \$CLAUDE_SKILL_DIR/scripts/; layer 0b: \$ARIS_CACHE_DIR/skills/figure-spec/scripts/; layers 1-3: .aris/tools/, tools/, \$ARIS_REPO/tools/)." >&2
-  echo "       /figure-spec cannot produce SVG output. Fix: rerun the aris-code binary (Layer 0b auto-extracts on startup), or rerun bash tools/install_aris.sh, or copy the helper from \$ARIS_REPO/skills/figure-spec/scripts/." >&2
+  echo "ERROR: figure_renderer.py not resolved (layer 0: \$CLAUDE_SKILL_DIR/scripts/; layers 1-3: .aris/tools/, tools/, \$ARIS_REPO/tools/)." >&2
+  echo "       /figure-spec cannot produce SVG output. Fix: rerun bash tools/install_aris.sh, or copy the helper from \$ARIS_REPO/skills/figure-spec/scripts/." >&2
   exit 1
 }
 ```

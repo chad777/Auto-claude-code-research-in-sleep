@@ -19,7 +19,7 @@ Given a broad research direction from the user, systematically generate, validat
 - **PILOT_TIMEOUT_HOURS = 3** — Hard timeout: kill pilots exceeding 3 hours. Collect partial results if available.
 - **MAX_PILOT_IDEAS = 3** — Pilot at most 3 ideas in parallel. Additional ideas are validated on paper only.
 - **MAX_TOTAL_GPU_HOURS = 8** — Total GPU budget for all pilots combined.
-- **REVIEWER_MODEL = `gpt-5.4`** — Model used via Codex MCP for brainstorming and review. Must be an OpenAI model (e.g., `gpt-5.4`, `o3`, `gpt-4o`).
+- **REVIEWER_MODEL = `gpt-5.5`** — Model used via Codex MCP for brainstorming and review. Must be an OpenAI model (e.g., `gpt-5.5`, `o3`, `gpt-4o`).
 - **REVIEWER_BACKEND = `codex`** — Default: Codex MCP (xhigh). Override with `— reviewer: oracle-pro` for GPT-5.4 Pro via Oracle MCP. See `shared-references/reviewer-routing.md`.
 - **OUTPUT_DIR = `idea-stage/`** — All idea-stage outputs go here. Create the directory if it doesn't exist.
 
@@ -31,6 +31,25 @@ Given a broad research direction from the user, systematically generate, validat
 
 **Skip this phase entirely if `research-wiki/` does not exist.**
 
+If `research-wiki/` exists, resolve the canonical helper using the
+shared resolution chain (see `../research-wiki/SKILL.md` for the
+contract):
+
+```bash
+cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)" || exit 1
+ARIS_REPO="${ARIS_REPO:-$(awk -F'\t' '$1=="repo_root"{print $2; exit}' .aris/installed-skills.txt 2>/dev/null)}"
+WIKI_SCRIPT=".aris/tools/research_wiki.py"
+[ -f "$WIKI_SCRIPT" ] || WIKI_SCRIPT="tools/research_wiki.py"
+[ -f "$WIKI_SCRIPT" ] || { [ -n "${ARIS_REPO:-}" ] && WIKI_SCRIPT="$ARIS_REPO/tools/research_wiki.py"; }
+[ -f "$WIKI_SCRIPT" ] || {
+  echo "WARN: research_wiki.py not found at .aris/tools/, tools/, or \$ARIS_REPO/tools/." >&2
+  echo "      The idea-creation primary output (idea ranking) will still be produced." >&2
+  echo "      Wiki integration (load query_pack, write idea pages, add edges, rebuild query_pack) will be skipped." >&2
+  echo "      Fix: rerun 'bash tools/install_aris.sh', export ARIS_REPO, or 'cp <ARIS-repo>/tools/research_wiki.py tools/'." >&2
+  WIKI_SCRIPT=""
+}
+```
+
 ```
 if research-wiki/query_pack.md exists AND is less than 7 days old:
     Read query_pack.md and use it as initial landscape context:
@@ -39,7 +58,7 @@ if research-wiki/query_pack.md exists AND is less than 7 days old:
     - Treat top papers as known prior work (do not re-search them)
     Still run Phase 1 below for papers from the last 3-6 months (wiki may be stale)
 else if research-wiki/ exists but query_pack.md is stale or missing:
-    python3 "${ARIS_CACHE_DIR:-.}/tools/research_wiki.py" rebuild_query_pack research-wiki/
+    if [ -n "$WIKI_SCRIPT" ]: python3 "$WIKI_SCRIPT" rebuild_query_pack research-wiki/
     Then read query_pack.md as above
 ```
 
@@ -233,6 +252,13 @@ Write a structured report to `idea-stage/IDEA_REPORT.md`:
 
 This is critical for spiral learning — without it, `ideas/` stays empty and re-ideation has no memory.
 
+`$WIKI_SCRIPT` was resolved in Phase 0 above. If Phase 0 did not run
+(no `research-wiki/`), this phase is skipped. If Phase 0 ran but the
+resolution chain failed to find the helper (`$WIKI_SCRIPT` is empty),
+the page-write step still runs (idea pages are plain markdown the
+agent writes directly), but the edge / query-pack / log steps that
+require the helper are skipped with a single warning.
+
 ```
 if research-wiki/ exists:
     for each idea in recommended_ideas + eliminated_ideas:
@@ -245,22 +271,25 @@ if research-wiki/ exists:
            - Include: hypothesis, proposed method, expected outcome
            - If pilot was run: actual outcome, failure notes, reusable components
 
-        2. Add edges:
-           python3 "${ARIS_CACHE_DIR:-.}/tools/research_wiki.py" add_edge research-wiki/ --from "idea:<id>" --to "paper:<slug>" --type inspired_by --evidence "..."
-           python3 "${ARIS_CACHE_DIR:-.}/tools/research_wiki.py" add_edge research-wiki/ --from "idea:<id>" --to "gap:<id>" --type addresses_gap --evidence "..."
+        2. Add edges (only if $WIKI_SCRIPT resolved):
+           [ -n "$WIKI_SCRIPT" ] && python3 "$WIKI_SCRIPT" add_edge research-wiki/ --from "idea:<id>" --to "paper:<slug>" --type inspired_by --evidence "..."
+           [ -n "$WIKI_SCRIPT" ] && python3 "$WIKI_SCRIPT" add_edge research-wiki/ --from "idea:<id>" --to "gap:<id>" --type addresses_gap --evidence "..."
 
-    Rebuild query pack:
-        python3 "${ARIS_CACHE_DIR:-.}/tools/research_wiki.py" rebuild_query_pack research-wiki/
-    Log:
-        python3 "${ARIS_CACHE_DIR:-.}/tools/research_wiki.py" log research-wiki/ "idea-creator wrote N ideas (M recommended, K eliminated)"
+    Rebuild query pack (only if $WIKI_SCRIPT resolved):
+        [ -n "$WIKI_SCRIPT" ] && python3 "$WIKI_SCRIPT" rebuild_query_pack research-wiki/
+    Log (only if $WIKI_SCRIPT resolved):
+        [ -n "$WIKI_SCRIPT" ] && python3 "$WIKI_SCRIPT" log research-wiki/ "idea-creator wrote N ideas (M recommended, K eliminated)"
+
+    if [ -z "$WIKI_SCRIPT" ]:
+        echo "WARN: idea pages were written but edges / query_pack / log were skipped because research_wiki.py is unreachable (see Phase 0 warning above)." >&2
 ```
 
 ## Output Protocols
 
 > Follow these shared protocols for all output files:
-> - **[Output Versioning Protocol](shared-references/output-versioning.md)** — write timestamped file first, then copy to fixed name
-> - **[Output Manifest Protocol](shared-references/output-manifest.md)** — log every output to MANIFEST.md
-> - **[Output Language Protocol](shared-references/output-language.md)** — respect the project's language setting
+> - **[Output Versioning Protocol](../shared-references/output-versioning.md)** — write timestamped file first, then copy to fixed name
+> - **[Output Manifest Protocol](../shared-references/output-manifest.md)** — log every output to MANIFEST.md
+> - **[Output Language Protocol](../shared-references/output-language.md)** — respect the project's language setting
 
 ## Key Rules
 
@@ -274,6 +303,7 @@ if research-wiki/ exists:
 - "Apply X to Y" is the lowest form of research idea. Push for deeper questions.
 - Include eliminated ideas in the report — they save future time by documenting dead ends.
 - **If the user's direction is too broad (e.g., "NLP", "computer vision", "reinforcement learning"), STOP and ask them to narrow it.** A good direction is 1-2 sentences specifying the problem, domain, and constraint — e.g., "factorized gap in discrete diffusion LMs" or "sample efficiency of offline RL with image observations". Without sufficient specificity, generated ideas will be too vague to run experiments on.
+- **Anti-hallucination for cited papers.** When the landscape survey or novelty justification cites specific papers, every cited paper must pass pre-search verification (`verify_papers.py`, canonical name resolved per [`shared-references/integration-contract.md`](../shared-references/integration-contract.md) §2; 3-layer arXiv / CrossRef / S2 fallback inside the helper itself). Policy D1 (primary + degraded-output fallback): if the helper is unresolved **or** its invocation fails, mark candidates `[UNVERIFIED]` and continue rather than dropping or guessing. Never fabricate arXiv IDs, DOIs, or titles from memory. Full protocol in [`shared-references/citation-discipline.md`](../shared-references/citation-discipline.md) § Pre-Search Verification Protocol.
 
 ## Composing with Other Skills
 
@@ -289,4 +319,4 @@ implement                     → write code
 
 ## Review Tracing
 
-After each `mcp__codex__codex` or `mcp__codex__codex-reply` reviewer call, save the trace following `shared-references/review-tracing.md`. Use `tools/save_trace.sh` or write files directly to `.aris/traces/<skill>/<date>_run<NN>/`. Respect the `--- trace:` parameter (default: `full`).
+After each `mcp__codex__codex` or `mcp__codex__codex-reply` reviewer call, save the trace following `shared-references/review-tracing.md` (Policy C — forensic; never silently skip). Use `save_trace.sh` (resolved per the chain in `shared-references/integration-contract.md` §2) or write files directly to `.aris/traces/<skill>/<date>_run<NN>/`. Respect the `--- trace:` parameter (default: `full`).

@@ -123,6 +123,39 @@ If the user only asks for one specific detail, answer it directly — skip the f
 /novelty-check "idea from paper"     - verify novelty against this paper's area
 ```
 
+## Update Research Wiki (if active)
+
+**Required when `research-wiki/` exists in the project**; skip silently
+otherwise. When the wiki dir exists, resolve `$WIKI_SCRIPT` per the
+canonical chain at
+[`shared-references/wiki-helper-resolution.md`](../shared-references/wiki-helper-resolution.md)
+(Variant B — warn-and-skip), then ingest the single paper that was read:
+
+```bash
+if [ -d research-wiki/ ]; then
+  cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)" || exit 1
+  ARIS_REPO="${ARIS_REPO:-$(awk -F'\t' '$1=="repo_root"{print $2; exit}' .aris/installed-skills.txt 2>/dev/null)}"
+  WIKI_SCRIPT=".aris/tools/research_wiki.py"
+  [ -f "$WIKI_SCRIPT" ] || WIKI_SCRIPT="tools/research_wiki.py"
+  [ -f "$WIKI_SCRIPT" ] || { [ -n "${ARIS_REPO:-}" ] && WIKI_SCRIPT="$ARIS_REPO/tools/research_wiki.py"; }
+  [ -f "$WIKI_SCRIPT" ] || {
+    echo "WARN: research_wiki.py not found; paper summary delivered, wiki ingest skipped. Fix: bash tools/install_aris.sh, export ARIS_REPO, or cp <ARIS-repo>/tools/research_wiki.py tools/." >&2
+    WIKI_SCRIPT=""
+  }
+  [ -n "$WIKI_SCRIPT" ] && python3 "$WIKI_SCRIPT" ingest_paper research-wiki/ \
+      --arxiv-id "<paper_arxiv_id>" \
+      [--thesis "<one-line thesis from the Tier 1 overview>"]
+fi
+```
+
+The helper handles metadata fetch, slug, dedup, page creation, index
+rebuild, and log append — **do not handwrite `papers/<slug>.md`**. See
+[`shared-references/integration-contract.md`](../shared-references/integration-contract.md).
+If wiki was not present at read time (or the helper was unreachable),
+the user can backfill via
+`python3 "$WIKI_SCRIPT" sync research-wiki/ --arxiv-ids <id>` after
+resolving `$WIKI_SCRIPT` as above.
+
 ## Key Rules
 
 - **Overview first**: `overview` is the fastest path and must always be tried before deeper tiers. Only escalate when needed.
