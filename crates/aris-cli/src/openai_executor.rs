@@ -17,6 +17,17 @@ use crate::{filter_tool_specs, format_tool_call_start, AllowedToolSet};
 
 const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 
+/// Per-turn reasoning_content size cap (chars; rough proxy for tokens ~4:1).
+/// Captures up to ~8K tokens of thinking per assistant turn before truncating.
+/// Long reasoning traces still go to the model in real-time; only the cache
+/// entry for replay is capped, preventing the request body from ballooning
+/// over many turns.
+const MAX_REASONING_CHARS_PER_TURN: usize = 32_000;
+
+/// Total reasoning_cache size cap (sum of all turns' cached reasoning,
+/// chars). When exceeded, oldest turns are evicted. ~32K tokens.
+const MAX_REASONING_CACHE_TOTAL_CHARS: usize = 128_000;
+
 /// Whether this model accepts an OpenAI-style `reasoning_effort` request field.
 /// Heuristic-only: matches OpenAI reasoning families (o1/o3/o4, gpt-5.5+) and
 /// providers that advertise an explicit thinking/reasoner variant.
@@ -30,6 +41,23 @@ fn supports_reasoning_effort(model: &str) -> bool {
         || m.contains("gpt-5.6")
         || m.contains("reasoner")
         || m.contains("thinking")
+}
+
+/// Whether this model EMITS `reasoning_content` blocks in the response that
+/// we should cache and replay on subsequent turns. Superset of
+/// [`supports_reasoning_effort`] — Kimi/Moonshot emit reasoning_content
+/// without accepting reasoning_effort as a request field (the original
+/// reason this cache exists), so we treat the two capabilities separately.
+/// v0.4.7's hardcoded `supports_reasoning = true` shipped reasoning to
+/// every provider; v0.4.9 gates it.
+#[must_use]
+fn supports_reasoning_content_replay(model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    supports_reasoning_effort(&m)
+        || m.contains("kimi")
+        || m.contains("moonshot")
+        || m.contains("deepseek-r1")
+        || m.contains("-r1")
 }
 
 /// Effort tier sent alongside reasoning-capable models. Reads
@@ -134,11 +162,16 @@ impl ApiClient for OpenAIRuntimeClient {
             Some(request.system_prompt.join("\n\n"))
         };
 
-        let supports_reasoning = true;
+        // Provider-aware reasoning_content capture. v0.4.9 closes Codex
+        // v0.4.7 audit L4: was hardcoded `true` for every model. We use the
+        // separate `supports_reasoning_content_replay` predicate (superset
+        // of reasoning_effort senders) so Kimi/Moonshot/DeepSeek-R1, which
+        // emit reasoning_content but don't accept reasoning_effort as a
+        // request field, still get cached and replayed.
+        let supports_reasoning = supports_reasoning_content_replay(&self.model);
         let messages = convert_messages_openai(
             &request.messages,
             system_prompt.as_deref(),
-            supports_reasoning,
             &self.kimi_reasoning_cache,
         );
 
@@ -492,9 +525,46 @@ on a compatible third-party proxy, or use Claude/another provider as executor an
                 events.push(AssistantEvent::MessageStop);
             }
 
-            // Kimi: save reasoning_content for this turn so we can replay it
+            // Kimi: save reasoning_content for this turn so we can replay it.
+            // v0.4.9 L4: capped at MAX_REASONING_CHARS_PER_TURN per entry +
+            // MAX_REASONING_CACHE_TOTAL_CHARS across all entries (oldest
+            // evicted first) so the request body doesn't balloon over a
+            // long session.
             if supports_reasoning && !current_reasoning.is_empty() {
-                self.kimi_reasoning_cache.insert(current_msg_index, current_reasoning);
+                if current_reasoning.chars().count() > MAX_REASONING_CHARS_PER_TURN {
+                    // UTF-8-safe truncate at char boundary
+                    let byte_idx = current_reasoning
+                        .char_indices()
+                        .nth(MAX_REASONING_CHARS_PER_TURN)
+                        .map(|(i, _)| i)
+                        .unwrap_or(current_reasoning.len());
+                    current_reasoning.truncate(byte_idx);
+                }
+                self.kimi_reasoning_cache
+                    .insert(current_msg_index, current_reasoning);
+
+                // Enforce total-size cap by evicting oldest entries (smallest
+                // msg_idx) until we're back under MAX_REASONING_CACHE_TOTAL_CHARS.
+                while self
+                    .kimi_reasoning_cache
+                    .values()
+                    .map(String::len)
+                    .sum::<usize>()
+                    > MAX_REASONING_CACHE_TOTAL_CHARS
+                {
+                    let Some(oldest_idx) =
+                        self.kimi_reasoning_cache.keys().copied().min()
+                    else {
+                        break;
+                    };
+                    if oldest_idx == current_msg_index {
+                        // Never evict the entry we just inserted; if total cap is
+                        // smaller than a single turn, accept the overflow (the
+                        // per-turn truncate already bounded it).
+                        break;
+                    }
+                    self.kimi_reasoning_cache.remove(&oldest_idx);
+                }
             }
 
             Ok(events)
@@ -523,7 +593,6 @@ fn flush_pending_tools(
 fn convert_messages_openai(
     messages: &[ConversationMessage],
     system_prompt: Option<&str>,
-    supports_reasoning: bool,
     kimi_reasoning_cache: &std::collections::HashMap<usize, String>,
 ) -> Vec<Value> {
     let mut result: Vec<Value> = Vec::new();
@@ -668,7 +737,7 @@ mod tests {
             },
             ConversationMessage::user_text("next question"),
         ];
-        let result = convert_messages_openai(&messages, None, false, &std::collections::HashMap::new());
+        let result = convert_messages_openai(&messages, None, &std::collections::HashMap::new());
         // Should contain only the User message; the System one is skipped.
         assert_eq!(result.len(), 1);
         assert_eq!(result[0]["role"], "user");
@@ -735,7 +804,7 @@ mod tests {
             },
             ConversationMessage::user_text("next question"),
         ];
-        let result = convert_messages_openai(&messages, None, false, &std::collections::HashMap::new());
+        let result = convert_messages_openai(&messages, None, &std::collections::HashMap::new());
         // Both User messages present.
         assert_eq!(result.len(), 2);
         assert_eq!(result[0]["role"], "user");
