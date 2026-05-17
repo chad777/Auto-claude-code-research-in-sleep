@@ -50,10 +50,17 @@ fn max_tokens_for_model(model: &str) -> u32 {
         64_000
     }
 }
-const DEFAULT_DATE: &str = "2026-03-31";
 const DEFAULT_OAUTH_CALLBACK_PORT: u16 = 4545;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const BUILD_TARGET: Option<&str> = option_env!("TARGET");
+/// Compile date injected by build.rs (`date '+%Y-%m-%d'` on Unix; "unknown"
+/// fallback on platforms without date(1)). Replaces the legacy `DEFAULT_DATE`
+/// const that survived v0.4.6's system-prompt-date fix (v0.4.6 only touched
+/// ProjectContext::current_date, not the --version surface).
+const BUILD_DATE: &str = match option_env!("ARIS_BUILD_DATE") {
+    Some(d) if !d.is_empty() => d,
+    _ => "unknown",
+};
 const GIT_SHA: Option<&str> = option_env!("GIT_SHA");
 
 pub(crate) type AllowedToolSet = BTreeSet<String>;
@@ -3259,7 +3266,7 @@ fn render_version_report() -> String {
     let git_sha = GIT_SHA.unwrap_or("unknown");
     let target = BUILD_TARGET.unwrap_or("unknown");
     format!(
-        "ARIS (Auto Research in Sleep)\n  Version          {VERSION}\n  Git SHA          {git_sha}\n  Target           {target}\n  Build date       {DEFAULT_DATE}"
+        "ARIS (Auto Research in Sleep)\n  Version          {VERSION}\n  Git SHA          {git_sha}\n  Target           {target}\n  Build date       {BUILD_DATE}"
     )
 }
 
