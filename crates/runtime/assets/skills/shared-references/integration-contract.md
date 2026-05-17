@@ -31,11 +31,12 @@ following four-layer chain. **First hit wins.** Strict-safe POSIX
 ```bash
 # BUNDLE_KEY is the resource key the SKILL author chose. Examples:
 #   BUNDLE_KEY=tools/arxiv_fetch.py
-#   BUNDLE_KEY=skills/research-wiki/research_wiki.py
+#   BUNDLE_KEY=skills/paper-write/templates/IEEEtran.cls   # skill-local example
 BUNDLE_KEY="tools/foo.py"
 # REL is the legacy in-tree relative path; for shared cross-skill helpers
 # this is the same suffix as BUNDLE_KEY ("tools/foo.py"); for skill-local
-# helpers strip the "skills/<name>/" prefix ("research_wiki.py").
+# helpers strip the "skills/<name>/" prefix (e.g. "templates/IEEEtran.cls"
+# or "scripts/figure_renderer.py").
 REL="${BUNDLE_KEY#skills/*/}"
 
 # Layer 1: active skill dir — when running an exported/customised
@@ -120,7 +121,7 @@ fi
 | `tools/save_trace.sh` | C | forensic; missing = write inline trace fallback |
 | `tools/verify_papers.py` | D1 | falls through to `[UNVERIFIED]` tag |
 | `tools/verify_paper_audits.sh` | A | submission-blocking gate |
-| `skills/research-wiki/research_wiki.py` | B (in callers) / A (in `/research-wiki` itself) | side-effect for `/idea-creator`-style callers; gate for `/research-wiki init` itself |
+| `tools/research_wiki.py` | B (in callers) / A (in `/research-wiki` itself) | side-effect for `/idea-creator`/`/research-lit`/`/result-to-claim` callers; gate for `/research-wiki init` itself. **v0.4.9**: promoted from skill-local `skills/research-wiki/` to shared `tools/` namespace (9+ callers). |
 
 Skills authored after v0.4.8 must declare their helper's policy in
 SKILL.md (one line near the helper invocation) before review.

@@ -153,13 +153,13 @@ if research-wiki/ exists:
     for each claim resolved by this verdict:
         if verdict == "yes":
             Update claim page: status → supported
-            python3 research-wiki/research_wiki.py add_edge research-wiki/ --from "exp:<id>" --to "claim:<cid>" --type supports --evidence "<metric>"
+            python3 "${ARIS_CACHE_DIR:-.}/tools/research_wiki.py" add_edge research-wiki/ --from "exp:<id>" --to "claim:<cid>" --type supports --evidence "<metric>"
         elif verdict == "partial":
             Update claim page: status → partial
-            python3 research-wiki/research_wiki.py add_edge research-wiki/ --from "exp:<id>" --to "claim:<cid>" --type supports --evidence "partial"
+            python3 "${ARIS_CACHE_DIR:-.}/tools/research_wiki.py" add_edge research-wiki/ --from "exp:<id>" --to "claim:<cid>" --type supports --evidence "partial"
         else:
             Update claim page: status → invalidated
-            python3 research-wiki/research_wiki.py add_edge research-wiki/ --from "exp:<id>" --to "claim:<cid>" --type invalidates --evidence "<why>"
+            python3 "${ARIS_CACHE_DIR:-.}/tools/research_wiki.py" add_edge research-wiki/ --from "exp:<id>" --to "claim:<cid>" --type invalidates --evidence "<why>"
 
     # 3. Update idea outcome
     Update research-wiki/ideas/<idea_id>.md:
@@ -168,8 +168,8 @@ if research-wiki/ exists:
       - If positive: fill "Actual Outcome" and "Reusable Components"
 
     # 4. Rebuild + log
-    python3 research-wiki/research_wiki.py rebuild_query_pack research-wiki/
-    python3 research-wiki/research_wiki.py log research-wiki/ "result-to-claim: exp:<id> verdict=<verdict> for idea:<idea_id>"
+    python3 "${ARIS_CACHE_DIR:-.}/tools/research_wiki.py" rebuild_query_pack research-wiki/
+    python3 "${ARIS_CACHE_DIR:-.}/tools/research_wiki.py" log research-wiki/ "result-to-claim: exp:<id> verdict=<verdict> for idea:<idea_id>"
 
     # 5. Re-ideation suggestion
     Count failed/partial ideas since last /idea-creator run.

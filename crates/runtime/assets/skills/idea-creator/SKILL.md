@@ -39,7 +39,7 @@ if research-wiki/query_pack.md exists AND is less than 7 days old:
     - Treat top papers as known prior work (do not re-search them)
     Still run Phase 1 below for papers from the last 3-6 months (wiki may be stale)
 else if research-wiki/ exists but query_pack.md is stale or missing:
-    python3 "${ARIS_CACHE_DIR:-.}/skills/research-wiki/research_wiki.py" rebuild_query_pack research-wiki/
+    python3 "${ARIS_CACHE_DIR:-.}/tools/research_wiki.py" rebuild_query_pack research-wiki/
     Then read query_pack.md as above
 ```
 
@@ -246,13 +246,13 @@ if research-wiki/ exists:
            - If pilot was run: actual outcome, failure notes, reusable components
 
         2. Add edges:
-           python3 "${ARIS_CACHE_DIR:-.}/skills/research-wiki/research_wiki.py" add_edge research-wiki/ --from "idea:<id>" --to "paper:<slug>" --type inspired_by --evidence "..."
-           python3 "${ARIS_CACHE_DIR:-.}/skills/research-wiki/research_wiki.py" add_edge research-wiki/ --from "idea:<id>" --to "gap:<id>" --type addresses_gap --evidence "..."
+           python3 "${ARIS_CACHE_DIR:-.}/tools/research_wiki.py" add_edge research-wiki/ --from "idea:<id>" --to "paper:<slug>" --type inspired_by --evidence "..."
+           python3 "${ARIS_CACHE_DIR:-.}/tools/research_wiki.py" add_edge research-wiki/ --from "idea:<id>" --to "gap:<id>" --type addresses_gap --evidence "..."
 
     Rebuild query pack:
-        python3 "${ARIS_CACHE_DIR:-.}/skills/research-wiki/research_wiki.py" rebuild_query_pack research-wiki/
+        python3 "${ARIS_CACHE_DIR:-.}/tools/research_wiki.py" rebuild_query_pack research-wiki/
     Log:
-        python3 "${ARIS_CACHE_DIR:-.}/skills/research-wiki/research_wiki.py" log research-wiki/ "idea-creator wrote N ideas (M recommended, K eliminated)"
+        python3 "${ARIS_CACHE_DIR:-.}/tools/research_wiki.py" log research-wiki/ "idea-creator wrote N ideas (M recommended, K eliminated)"
 ```
 
 ## Output Protocols

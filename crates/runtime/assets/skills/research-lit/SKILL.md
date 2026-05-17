@@ -306,17 +306,17 @@ If Zotero BibTeX was exported, include a `references.bib` snippet for direct use
 ```
 if research-wiki/ directory exists:
     for each top relevant paper found (up to 8-12):
-        1. Generate slug: python3 research-wiki/research_wiki.py slug "<title>" --author "<last>" --year <year>
+        1. Generate slug: python3 "${ARIS_CACHE_DIR:-.}/tools/research_wiki.py" slug "<title>" --author "<last>" --year <year>
         2. Create page: research-wiki/papers/<slug>.md with structured schema
            (node_id, title, authors, year, venue, tags, one-line thesis, problem/gap,
             method, key results, limitations, reusable ingredients, open questions)
         3. Add edges to graph/edges.jsonl for relationships to existing wiki papers:
-           python3 research-wiki/research_wiki.py add_edge research-wiki/ --from "paper:<slug>" --to "<target>" --type <type> --evidence "<text>"
+           python3 "${ARIS_CACHE_DIR:-.}/tools/research_wiki.py" add_edge research-wiki/ --from "paper:<slug>" --to "<target>" --type <type> --evidence "<text>"
         4. Update gap_map.md if new gaps are identified
     Rebuild query pack:
-        python3 research-wiki/research_wiki.py rebuild_query_pack research-wiki/
+        python3 "${ARIS_CACHE_DIR:-.}/tools/research_wiki.py" rebuild_query_pack research-wiki/
     Log:
-        python3 research-wiki/research_wiki.py log research-wiki/ "research-lit ingested N papers"
+        python3 "${ARIS_CACHE_DIR:-.}/tools/research_wiki.py" log research-wiki/ "research-lit ingested N papers"
 else:
     skip — no wiki, no action, no error
 ```
