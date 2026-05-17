@@ -25,7 +25,9 @@ const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 const MAX_REASONING_CHARS_PER_TURN: usize = 32_000;
 
 /// Total reasoning_cache size cap (sum of all turns' cached reasoning,
-/// chars). When exceeded, oldest turns are evicted. ~32K tokens.
+/// bytes — implementation uses `String::len`). When exceeded, oldest
+/// turns are evicted. ~32K tokens for ASCII; multi-byte chars trim
+/// faster (acceptable conservative bound for non-ASCII reasoning).
 const MAX_REASONING_CACHE_TOTAL_CHARS: usize = 128_000;
 
 /// Whether this model accepts an OpenAI-style `reasoning_effort` request field.
@@ -56,6 +58,7 @@ fn supports_reasoning_content_replay(model: &str) -> bool {
     supports_reasoning_effort(&m)
         || m.contains("kimi")
         || m.contains("moonshot")
+        || m.contains("mimo")
         || m.contains("deepseek-r1")
         || m.contains("-r1")
 }
