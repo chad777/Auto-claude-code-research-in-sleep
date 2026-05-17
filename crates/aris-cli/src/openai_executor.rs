@@ -153,8 +153,47 @@ impl ApiClient for OpenAIRuntimeClient {
         // doesn't silently default to medium. Safe for o1/o3/o4/gpt-5.5/
         // thinking variants; older models would reject this field, hence the
         // explicit allow-list.
-        if supports_reasoning_effort(&self.model) {
+        //
+        // OpenAI gate (v0.4.8): when both `tools` and `reasoning_effort` are
+        // present, gpt-5.5 + the OpenAI /v1/chat/completions endpoint returns
+        // 400 "Function tools with reasoning_effort are not supported …,
+        // please use /v1/responses instead". The CLI executor always sends
+        // tools (enable_tools = true for the agent loop), so for OpenAI's own
+        // gpt-5.5 we strip reasoning_effort and warn. Third-party providers
+        // that ship gpt-5.5-compatible models without this restriction (e.g.
+        // some proxies) opt back in by setting ARIS_FORCE_REASONING_WITH_TOOLS=1.
+        // Proper fix (Responses API support) is tracked for v0.4.9.
+        let on_openai = self.base_url.contains("api.openai.com");
+        let model_lower = self.model.to_ascii_lowercase();
+        let openai_tool_reasoning_block = self.enable_tools
+            && on_openai
+            && (model_lower.contains("gpt-5.5")
+                || model_lower.contains("gpt-5.6")
+                || model_lower.starts_with("o3")
+                || model_lower.starts_with("o4"));
+        let force_with_tools = std::env::var("ARIS_FORCE_REASONING_WITH_TOOLS")
+            .ok()
+            .as_deref()
+            == Some("1");
+        if supports_reasoning_effort(&self.model)
+            && (!openai_tool_reasoning_block || force_with_tools)
+        {
             body["reasoning_effort"] = json!(reasoning_effort());
+        } else if openai_tool_reasoning_block && !force_with_tools {
+            // One-shot warning per process so users understand why their
+            // gpt-5.5 executor is running at default reasoning. Stderr to
+            // avoid polluting stdout JSON parsers.
+            static WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+            WARNED.get_or_init(|| {
+                eprintln!(
+                    "\x1b[33mwarning:\x1b[0m {} as executor on OpenAI does not accept \
+`reasoning_effort` when tools are enabled (OpenAI /v1/chat/completions returns 400). \
+Continuing without reasoning_effort. Set ARIS_FORCE_REASONING_WITH_TOOLS=1 to override \
+on a compatible third-party proxy, or use Claude/another provider as executor and keep \
+{} as reviewer (LlmReview path is unaffected).",
+                    self.model, self.model
+                );
+            });
         }
 
         let url = format!(
