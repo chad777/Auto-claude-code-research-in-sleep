@@ -2,10 +2,42 @@
 
 Long-form interview-prep cheat sheets, written in Markdown and rendered to single-file HTML via the `/render-html` skill (academic-newspaper template, sticky TOC, MathJax + highlight.js, cross-model codex review gate).
 
-| Tutorial | MD source | Rendered HTML | Topics |
+> 📖 **Curated collection**: [github.com/wanshuiyin/ARIS-in-AI-Offer](https://github.com/wanshuiyin/ARIS-in-AI-Offer) — interview-prep cheat sheets organized into 6 categories with bilingual README.
+
+### 🧠 General / Foundations
+
+| Tutorial | MD | HTML | Topics |
 |---|---|---|---|
-| **Attention 面试 Cheat Sheet** | [`attention_tutorial.md`](attention_tutorial.md) | [`attention_tutorial.html`](https://wanshuiyin.github.io/Auto-claude-code-research-in-sleep/tutorials/attention_tutorial.html) | Scaled-dot-product, MHA / MQA / GQA, RoPE / ALiBi, FlashAttention, KV cache, attention in diffusion, NaN-mask trap, 25 高频面试题 |
-| **Flow Matching Quick Reference** | [`flow_matching_tutorial.md`](flow_matching_tutorial.md) | [`flow_matching_tutorial.html`](https://wanshuiyin.github.io/Auto-claude-code-research-in-sleep/tutorials/flow_matching_tutorial.html) | Conditional FM, Rectified Flow / VP / VE paths, training + sampling code, ODE solvers, SD3 / FLUX latent FM, 与 diffusion / score-matching 的桥 |
+| **Attention 面试 Cheat Sheet** | [md](attention_tutorial.md) | [html](https://wanshuiyin.github.io/Auto-claude-code-research-in-sleep/tutorials/attention_tutorial.html) | Scaled-dot-product, MHA / MQA / GQA, RoPE / ALiBi, FlashAttention, KV cache, attention in diffusion, NaN-mask trap |
+
+### 🏛️ LLM Architecture & Systems
+
+| Tutorial | MD | HTML | Topics |
+|---|---|---|---|
+| **Long Context (RoPE / YaRN / NTK / MLA / StreamingLLM)** | [md](long_context_rope_yarn_mla_tutorial.md) | [html](https://wanshuiyin.github.io/Auto-claude-code-research-in-sleep/tutorials/long_context_rope_yarn_mla_tutorial.html) | RoPE rotation, PI/NTK/YaRN/LongRoPE scaling, MLA decoupled RoPE, SWA + StreamingLLM, Ring Attention |
+| **KV Cache + Speculative Decoding** | [md](kv_cache_speculative_decoding_tutorial.md) | [html](https://wanshuiyin.github.io/Auto-claude-code-research-in-sleep/tutorials/kv_cache_speculative_decoding_tutorial.html) | PagedAttention, MQA/GQA/MLA, speculative decoding acceptance prob, Medusa / EAGLE-1/2/3, Lookahead |
+| **Distributed Training** | [md](distributed_training_tutorial.md) | [html](https://wanshuiyin.github.io/Auto-claude-code-research-in-sleep/tutorials/distributed_training_tutorial.html) | DDP / FSDP2 / ZeRO 1/2/3 + ZeRO++ / TP (Megatron) / PP (GPipe, 1F1B, interleaved) / SP / CP / EP / DualPipe / Llama 3 |
+
+### 🌊 Generative Models — Theory & Tokenizers
+
+| Tutorial | MD | HTML | Topics |
+|---|---|---|---|
+| **Flow Matching Quick Reference** | [md](flow_matching_tutorial.md) | [html](https://wanshuiyin.github.io/Auto-claude-code-research-in-sleep/tutorials/flow_matching_tutorial.html) | Conditional FM, Rectified Flow / VP / VE paths, training + sampling code, ODE solvers, SD3 / FLUX latent FM |
+| **Diffusion Foundations (DDPM / Score / DDIM / EDM / CFG)** | [md](diffusion_foundations_tutorial.md) | [html](https://wanshuiyin.github.io/Auto-claude-code-research-in-sleep/tutorials/diffusion_foundations_tutorial.html) | DDPM ELBO + L_simple, score matching + Tweedie, Score SDE + PF-ODE, DDIM, EDM preconditioning + Heun, CFG, Consistency Models + LCM + Turbo |
+
+### 🎨 Generation Systems
+
+| Tutorial | MD | HTML | Topics |
+|---|---|---|---|
+| **Video Generation** | [md](video_generation_tutorial.md) | [html](https://wanshuiyin.github.io/Auto-claude-code-research-in-sleep/tutorials/video_generation_tutorial.html) | 3D Causal VAE · Spacetime Patches · Spatiotemporal Attention · MM-DiT · I2V · VBench · Sora / Hunyuan-Video / Wan |
+
+### 👁️ Multimodal
+
+| Tutorial | MD | HTML | Topics |
+|---|---|---|---|
+| **VLM (CLIP / LLaVA / Qwen-VL / DeepSeek-VL)** | [md](vlm_multimodal_tutorial.md) | [html](https://wanshuiyin.github.io/Auto-claude-code-research-in-sleep/tutorials/vlm_multimodal_tutorial.html) | CLIP InfoNCE derivation, SigLIP, ViT, BLIP-2 Q-Former, Flamingo Perceiver, LLaVA, Qwen2-VL M-RoPE |
+
+> Additional categories (Post-Training & Reasoning · more Generation Systems) being written; full catalog at [ARIS-in-AI-Offer](https://github.com/wanshuiyin/ARIS-in-AI-Offer).
 
 ## How they were produced
 
@@ -21,7 +53,7 @@ The two pilots were drafted by hand and rendered via `/render-html`. Subsequent 
 1. Plans a 12-14 section structure (TL;DR · intuition · formula+derivation · from-scratch PyTorch · variants · 25 高频面试题 L1/L2/L3)
 2. Drafts the MD following the canonical style of the two pilot tutorials (heading conventions, table-pipe escapes, callout-list separation rules — all bugs caught during the pilot reviews are now encoded into the style guide)
 3. Cross-model `codex gpt-5.5 xhigh` review on math / code / interview-answer / citation correctness + personal-info redaction (fresh thread, never `codex-reply`)
-4. Fix-and-loop up to 3 rounds
+4. Fix-and-loop — trajectory-based (no hard cap; stop if same issue recurs or ~6 rounds without convergence)
 5. Renders via `/render-html` (which itself runs a 13-check codex review on the rendered output)
 6. Writes a combined audit trail to `*.review.json`
 7. **Stops — never auto-commits.** The user reviews and pushes manually.
