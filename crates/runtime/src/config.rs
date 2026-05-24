@@ -105,6 +105,13 @@ pub struct McpStdioServerConfig {
     pub command: String,
     pub args: Vec<String>,
     pub env: BTreeMap<String, String>,
+    /// v0.4.13 P1.D: per-server override for the read timeout used by
+    /// `McpStdioProcess::request`. When `Some(secs)`, this takes
+    /// precedence over the global `MCP_REQUEST_TIMEOUT_SECS` env and
+    /// the 300s default. Clamping to 1..=1800 happens at consumption
+    /// time (`mcp_request_timeout` in `mcp_stdio.rs`) so the parse
+    /// stays lossless.
+    pub request_timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -618,6 +625,7 @@ fn parse_mcp_server_config(
             command: expect_string(object, "command", context)?.to_string(),
             args: optional_string_array(object, "args", context)?.unwrap_or_default(),
             env: optional_string_map(object, "env", context)?.unwrap_or_default(),
+            request_timeout_secs: optional_u64(object, "requestTimeoutSecs", context)?,
         })),
         "sse" => Ok(McpServerConfig::Sse(parse_mcp_remote_server_config(
             object, context,
@@ -736,6 +744,29 @@ fn optional_u16(
             };
             let number = u16::try_from(number).map_err(|_| {
                 ConfigError::Parse(format!("{context}: field {key} is out of range"))
+            })?;
+            Ok(Some(number))
+        }
+        None => Ok(None),
+    }
+}
+
+fn optional_u64(
+    object: &BTreeMap<String, JsonValue>,
+    key: &str,
+    context: &str,
+) -> Result<Option<u64>, ConfigError> {
+    match object.get(key) {
+        Some(value) => {
+            let Some(number) = value.as_i64() else {
+                return Err(ConfigError::Parse(format!(
+                    "{context}: field {key} must be an integer"
+                )));
+            };
+            let number = u64::try_from(number).map_err(|_| {
+                ConfigError::Parse(format!(
+                    "{context}: field {key} must be a non-negative integer"
+                ))
             })?;
             Ok(Some(number))
         }
@@ -1030,6 +1061,43 @@ mod tests {
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
 
+    // v0.4.13 regression — issue #238. parse_optional_sandbox_config must
+    // round-trip the `strictMode` field (camelCase per the merged settings
+    // schema) into the new SandboxConfig::strict_mode option, in all three
+    // states: true (hard-lock policy), false (explicit non-strict), and
+    // missing (default permissive / pre-v0.4.12 behaviour). Each state is
+    // exercised in an isolated temp dir to avoid cross-fixture state.
+    #[test]
+    fn parses_sandbox_strict_mode() {
+        fn load_with(local_json: &str) -> crate::sandbox::SandboxConfig {
+            let root = temp_dir();
+            let cwd = root.join("project");
+            let home = root.join("home").join(".claude");
+            fs::create_dir_all(cwd.join(".claude")).expect("project config dir");
+            fs::create_dir_all(&home).expect("home config dir");
+            fs::write(cwd.join(".claude").join("settings.local.json"), local_json)
+                .expect("write local settings");
+            let loaded = ConfigLoader::new(&cwd, &home)
+                .load()
+                .expect("config should load");
+            let sandbox = loaded.sandbox().clone();
+            fs::remove_dir_all(root).expect("cleanup temp dir");
+            sandbox
+        }
+
+        let strict_true = load_with(r#"{"sandbox":{"enabled":true,"strictMode":true}}"#);
+        assert_eq!(strict_true.strict_mode, Some(true));
+        assert!(strict_true.is_strict());
+
+        let strict_false = load_with(r#"{"sandbox":{"enabled":true,"strictMode":false}}"#);
+        assert_eq!(strict_false.strict_mode, Some(false));
+        assert!(!strict_false.is_strict());
+
+        let strict_missing = load_with(r#"{"sandbox":{"enabled":true}}"#);
+        assert_eq!(strict_missing.strict_mode, None);
+        assert!(!strict_missing.is_strict());
+    }
+
     #[test]
     fn parses_typed_mcp_and_oauth_config() {
         let root = temp_dir();
@@ -1191,6 +1259,63 @@ mod tests {
 
         assert_eq!(loaded.hooks().pre_tool_use(), &["echo pre".to_string()]);
         assert_eq!(loaded.hooks().post_tool_use(), &["echo post".to_string()]);
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn parses_per_server_mcp_request_timeout() {
+        // v0.4.13 P1.D: `requestTimeoutSecs` on a stdio MCP server
+        // entry should round-trip into
+        // `McpStdioServerConfig.request_timeout_secs`. Entries
+        // without it must leave the field `None` so the global env /
+        // 300s default still applies.
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claude");
+        fs::create_dir_all(cwd.join(".claude")).expect("project config dir");
+        fs::create_dir_all(&home).expect("home config dir");
+
+        fs::write(
+            home.join("settings.json"),
+            r#"{
+              "mcpServers": {
+                "fast": {
+                  "command": "uvx",
+                  "args": ["fast-mcp"]
+                },
+                "slow-agent": {
+                  "command": "codex",
+                  "args": ["mcp-server"],
+                  "requestTimeoutSecs": 900
+                }
+              }
+            }"#,
+        )
+        .expect("write settings");
+
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should load");
+
+        let fast = loaded.mcp().get("fast").expect("fast server");
+        match &fast.config {
+            McpServerConfig::Stdio(stdio) => {
+                assert_eq!(
+                    stdio.request_timeout_secs, None,
+                    "absent requestTimeoutSecs should round-trip to None"
+                );
+            }
+            other => panic!("expected stdio config, got {other:?}"),
+        }
+
+        let slow = loaded.mcp().get("slow-agent").expect("slow-agent server");
+        match &slow.config {
+            McpServerConfig::Stdio(stdio) => {
+                assert_eq!(stdio.request_timeout_secs, Some(900));
+            }
+            other => panic!("expected stdio config, got {other:?}"),
+        }
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }

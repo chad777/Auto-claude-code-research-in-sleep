@@ -245,6 +245,7 @@ mod tests {
             command: "uvx".to_string(),
             args: vec!["mcp-server".to_string()],
             env: BTreeMap::from([("TOKEN".to_string(), "secret".to_string())]),
+            request_timeout_secs: None,
         });
         assert_eq!(
             mcp_server_signature(&stdio),

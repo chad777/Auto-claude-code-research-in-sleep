@@ -18,6 +18,13 @@ pub struct McpStdioTransport {
     pub command: String,
     pub args: Vec<String>,
     pub env: BTreeMap<String, String>,
+    /// v0.4.13 P1.D: optional per-server override for the MCP request
+    /// read timeout (in seconds). Propagated from
+    /// `McpStdioServerConfig.request_timeout_secs` and consumed by
+    /// `McpStdioProcess::spawn` so each spawned child remembers its own
+    /// timeout. `None` falls through to the global
+    /// `MCP_REQUEST_TIMEOUT_SECS` env / 300s default at request time.
+    pub request_timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,6 +82,7 @@ impl McpClientTransport {
                 command: config.command.clone(),
                 args: config.args.clone(),
                 env: config.env.clone(),
+                request_timeout_secs: config.request_timeout_secs,
             }),
             McpServerConfig::Sse(config) => Self::Sse(McpRemoteTransport {
                 url: config.url.clone(),
@@ -138,6 +146,7 @@ mod tests {
                 command: "uvx".to_string(),
                 args: vec!["mcp-server".to_string()],
                 env: BTreeMap::from([("TOKEN".to_string(), "secret".to_string())]),
+                request_timeout_secs: None,
             }),
         };
 

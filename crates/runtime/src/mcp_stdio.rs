@@ -594,6 +594,13 @@ pub struct McpStdioProcess {
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
+    /// v0.4.13 P1.D: per-server timeout override copied from the
+    /// transport. `None` means fall through to
+    /// `MCP_REQUEST_TIMEOUT_SECS` env / 300s default at request time.
+    /// We store the raw `Option<u64>` rather than a `Duration` so the
+    /// clamp + env-fallback logic stays centralised in
+    /// `mcp_request_timeout`.
+    request_timeout_override_secs: Option<u64>,
 }
 
 impl McpStdioProcess {
@@ -620,6 +627,7 @@ impl McpStdioProcess {
             child,
             stdin,
             stdout: BufReader::new(stdout),
+            request_timeout_override_secs: transport.request_timeout_secs,
         })
     }
 
@@ -749,14 +757,56 @@ impl McpStdioProcess {
         params: Option<TParams>,
     ) -> io::Result<JsonRpcResponse<TResult>> {
         let request = JsonRpcRequest::new(id.clone(), method, params);
-        let timeout = mcp_request_timeout();
+        let timeout = mcp_request_timeout(self.request_timeout_override_secs);
 
-        // Wrap send+read together so a write-side block (e.g. server
-        // alive but not reading stdin, pipe buffer full on a large
-        // request body) also trips the deadline.
+        // Wrap send + (read-until-response) together so a write-side
+        // block (e.g. server alive but not reading stdin, pipe buffer
+        // full on a large request body) also trips the deadline, and
+        // so the deadline still bounds a stream of notifications that
+        // would otherwise keep the read loop alive indefinitely
+        // (v0.4.13 known-limitation fix).
+        //
+        // v0.4.13: the read side is now a loop. JSON-RPC servers may
+        // emit notification frames (no `id`, or `id == null`) such as
+        // `notifications/log` and `notifications/progress` while a
+        // request is in flight. The pre-v0.4.13 behaviour was to
+        // deserialize the first frame directly into
+        // `JsonRpcResponse<TResult>`, which made the call fail
+        // (`id` is mandatory on `JsonRpcResponse`) and we'd kill the
+        // child — root cause of the codex MCP "spurious failures"
+        // known limitation tracked in #151 / #172. We now read a
+        // generic `serde_json::Value` first, skip any frame whose
+        // `id` is missing or null (logging to stderr so the user can
+        // still observe the notification), and only deserialize once
+        // a frame with `id == request.id` arrives. An id mismatch on
+        // a *response* frame remains fatal, exactly as before.
         let send_then_read = async {
             self.send_request(&request).await?;
-            self.read_response::<TResult>().await
+            loop {
+                let payload = self.read_frame().await?;
+                let value: JsonValue = serde_json::from_slice(&payload)
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+                let frame_id = value.as_object().and_then(|object| object.get("id"));
+                match frame_id {
+                    None | Some(JsonValue::Null) => {
+                        // Notification — no id at all, or explicit
+                        // null. Log to stderr (best-effort) and keep
+                        // reading.
+                        let method = value
+                            .as_object()
+                            .and_then(|object| object.get("method"))
+                            .and_then(JsonValue::as_str)
+                            .unwrap_or("?");
+                        eprintln!("aris mcp: notification skipped: method={method}");
+                        continue;
+                    }
+                    Some(_) => {
+                        let response: JsonRpcResponse<TResult> = serde_json::from_value(value)
+                            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+                        return Ok::<JsonRpcResponse<TResult>, io::Error>(response);
+                    }
+                }
+            }
         };
 
         let response: JsonRpcResponse<TResult> = match tokio::time::timeout(timeout, send_then_read)
@@ -774,7 +824,7 @@ impl McpStdioProcess {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     format!(
-                        "MCP server did not respond within {}s (override via MCP_REQUEST_TIMEOUT_SECS env, max 1800s)",
+                        "MCP server did not respond within {}s (override via per-server requestTimeoutSecs or MCP_REQUEST_TIMEOUT_SECS env, max 1800s)",
                         timeout.as_secs()
                     ),
                 ));
@@ -887,9 +937,14 @@ fn encode_frame(payload: &[u8]) -> Vec<u8> {
     framed
 }
 
-/// Resolve the MCP request read timeout from `MCP_REQUEST_TIMEOUT_SECS`
-/// env or fall back to 300s. Value is clamped to 1..=1800s so a bogus
-/// override can't disable the timeout entirely or make it absurdly long.
+/// Resolve the MCP request read timeout. Priority is:
+///   1. per-server `override_secs` (from
+///      `McpStdioServerConfig.request_timeout_secs` — v0.4.13 P1.D),
+///   2. global `MCP_REQUEST_TIMEOUT_SECS` env (set process-wide),
+///   3. 300s default.
+///
+/// Every layer is clamped to 1..=1800s so a bogus value can't disable
+/// the timeout entirely or make it absurdly long.
 ///
 /// Rationale for the 5-minute default: the most common MCP servers
 /// users wire into `aris` are agent-style (codex, oracle, claude). A
@@ -897,10 +952,20 @@ fn encode_frame(payload: &[u8]) -> Vec<u8> {
 /// before the first response byte. The earlier 60s default would have
 /// killed those mid-call. 300s comfortably covers the p95 of observed
 /// agent tool calls while still bounding a runaway server.
-fn mcp_request_timeout() -> std::time::Duration {
+///
+/// Rationale for the per-server override: when a user wires both a
+/// fast MCP (e.g. filesystem) and a slow agent MCP (codex) into the
+/// same session, a single env-level setting trades off responsiveness
+/// on one for safety on the other. Per-server lets each pick the
+/// right ceiling without affecting the others.
+fn mcp_request_timeout(override_secs: Option<u64>) -> std::time::Duration {
     const DEFAULT_SECS: u64 = 300;
     const MIN_SECS: u64 = 1;
     const MAX_SECS: u64 = 1800;
+
+    if let Some(secs) = override_secs {
+        return std::time::Duration::from_secs(secs.clamp(MIN_SECS, MAX_SECS));
+    }
     let secs = std::env::var("MCP_REQUEST_TIMEOUT_SECS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
@@ -941,7 +1006,7 @@ mod tests {
     use crate::mcp_client::McpClientBootstrap;
 
     use super::{
-        spawn_mcp_stdio_process, JsonRpcId, JsonRpcRequest, JsonRpcResponse,
+        mcp_request_timeout, spawn_mcp_stdio_process, JsonRpcId, JsonRpcRequest, JsonRpcResponse,
         McpInitializeClientInfo, McpInitializeParams, McpInitializeResult, McpInitializeServerInfo,
         McpListToolsResult, McpReadResourceParams, McpReadResourceResult, McpServerManager,
         McpServerManagerError, McpStdioProcess, McpTool, McpToolCallParams,
@@ -1253,6 +1318,7 @@ mod tests {
                 command: "/bin/sh".to_string(),
                 args: vec![script_path.to_string_lossy().into_owned()],
                 env: BTreeMap::from([("MCP_TEST_TOKEN".to_string(), "secret-value".to_string())]),
+                request_timeout_secs: None,
             }),
         };
         McpClientBootstrap::from_scoped_config("stdio server", &config)
@@ -1263,6 +1329,7 @@ mod tests {
             command: "python3".to_string(),
             args: vec![script_path.to_string_lossy().into_owned()],
             env: BTreeMap::new(),
+            request_timeout_secs: None,
         }
     }
 
@@ -1288,6 +1355,7 @@ mod tests {
                         log_path.to_string_lossy().into_owned(),
                     ),
                 ]),
+                request_timeout_secs: None,
             }),
         }
     }
@@ -1427,6 +1495,7 @@ mod tests {
                 command: "/bin/sh".to_string(),
                 args: vec![script_path.to_string_lossy().into_owned()],
                 env: BTreeMap::from([("MCP_TEST_TOKEN".to_string(), "direct-secret".to_string())]),
+                request_timeout_secs: None,
             };
             let mut process = McpStdioProcess::spawn(&transport).expect("spawn transport directly");
             let ready = process.read_available().await.expect("read ready");
@@ -1954,6 +2023,7 @@ mod tests {
                     "MCP_LOG_PATH".to_string(),
                     log_path.to_string_lossy().into_owned(),
                 )]),
+                request_timeout_secs: None,
             }),
         }
     }
@@ -2121,5 +2191,333 @@ mod tests {
 
             cleanup_script(&script_path);
         });
+    }
+
+    // ============================================================
+    // v0.4.13 P1.D — per-server MCP timeout precedence.
+    // ============================================================
+
+    /// Mutex serialising tests that mutate `MCP_REQUEST_TIMEOUT_SECS`.
+    /// `mcp_request_timeout` reads the env at every call, so two
+    /// concurrent tests poking the env would race even with
+    /// `--test-threads=1` if the runtime crate ever switched to
+    /// multi-threaded test execution.
+    fn env_lock() -> &'static std::sync::Mutex<()> {
+        use std::sync::OnceLock;
+        static LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    /// Run `body` while `MCP_REQUEST_TIMEOUT_SECS` is set (or
+    /// removed). Always restores the prior env value on exit.
+    fn with_env_timeout<F: FnOnce()>(value: Option<&str>, body: F) {
+        let guard = env_lock().lock().expect("env lock");
+        let prior = std::env::var("MCP_REQUEST_TIMEOUT_SECS").ok();
+        match value {
+            Some(v) => std::env::set_var("MCP_REQUEST_TIMEOUT_SECS", v),
+            None => std::env::remove_var("MCP_REQUEST_TIMEOUT_SECS"),
+        }
+        body();
+        match prior {
+            Some(value) => std::env::set_var("MCP_REQUEST_TIMEOUT_SECS", value),
+            None => std::env::remove_var("MCP_REQUEST_TIMEOUT_SECS"),
+        }
+        drop(guard);
+    }
+
+    #[test]
+    fn per_server_timeout_overrides_global_env() {
+        // Per-server `Some(42)` must beat `MCP_REQUEST_TIMEOUT_SECS=120`.
+        with_env_timeout(Some("120"), || {
+            let timeout = mcp_request_timeout(Some(42));
+            assert_eq!(timeout, std::time::Duration::from_secs(42));
+        });
+    }
+
+    #[test]
+    fn global_env_overrides_default_when_no_per_server() {
+        // No per-server override: env value wins over the 300s default.
+        with_env_timeout(Some("77"), || {
+            let timeout = mcp_request_timeout(None);
+            assert_eq!(timeout, std::time::Duration::from_secs(77));
+        });
+    }
+
+    #[test]
+    fn default_300s_when_no_override() {
+        // Neither per-server nor env: fall back to the 300s default.
+        with_env_timeout(None, || {
+            let timeout = mcp_request_timeout(None);
+            assert_eq!(timeout, std::time::Duration::from_secs(300));
+        });
+    }
+
+    #[test]
+    fn per_server_timeout_clamped_to_1_to_1800s() {
+        // Per-server override below 1s clamps up to 1s, above 1800s
+        // clamps down to 1800s. The env doesn't matter for an
+        // override path, so set it to something orthogonal to verify.
+        with_env_timeout(Some("60"), || {
+            assert_eq!(
+                mcp_request_timeout(Some(0)),
+                std::time::Duration::from_secs(1),
+                "zero override should clamp up to 1s"
+            );
+            assert_eq!(
+                mcp_request_timeout(Some(10_000)),
+                std::time::Duration::from_secs(1800),
+                "huge override should clamp down to 1800s"
+            );
+            assert_eq!(
+                mcp_request_timeout(Some(1800)),
+                std::time::Duration::from_secs(1800),
+                "exactly 1800s should pass through"
+            );
+            assert_eq!(
+                mcp_request_timeout(Some(1)),
+                std::time::Duration::from_secs(1),
+                "exactly 1s should pass through"
+            );
+        });
+    }
+
+    // ============================================================
+    // v0.4.13 — JSON-RPC notifications (id-less frames) are skipped.
+    // Closes the v0.4.10 known limitation tracked in #151 / #172.
+    // ============================================================
+
+    /// MCP server that emits N notification frames followed by a
+    /// well-formed response with the request id. Used by both the
+    /// "one notification" and "many notifications" tests; vary
+    /// `notification_count`.
+    fn write_notifications_then_response_script(notification_count: usize) -> PathBuf {
+        let root = temp_dir();
+        fs::create_dir_all(&root).expect("temp dir");
+        let script_path = root.join(format!("notifications-{notification_count}-mcp.py"));
+        // The number of notifications is baked in via env so the
+        // python source itself stays small and identical.
+        let script = [
+            "#!/usr/bin/env python3",
+            "import json, os, sys",
+            "n = int(os.environ.get('NOTIFICATION_COUNT', '1'))",
+            "header = b''",
+            r"while not header.endswith(b'\r\n\r\n'):",
+            "    chunk = sys.stdin.buffer.read(1)",
+            "    if not chunk:",
+            "        raise SystemExit(1)",
+            "    header += chunk",
+            "length = 0",
+            r"for line in header.decode().split('\r\n'):",
+            r"    if line.lower().startswith('content-length:'):",
+            r"        length = int(line.split(':', 1)[1].strip())",
+            "payload = sys.stdin.buffer.read(length)",
+            "request = json.loads(payload.decode())",
+            "",
+            "def emit(body):",
+            "    encoded = json.dumps(body).encode()",
+            r"    sys.stdout.buffer.write(f'Content-Length: {len(encoded)}\r\n\r\n'.encode() + encoded)",
+            "    sys.stdout.buffer.flush()",
+            "",
+            "# Emit N notifications first.",
+            "for i in range(n):",
+            "    emit({",
+            r"        'jsonrpc': '2.0',",
+            r"        'method': 'notifications/progress',",
+            r"        'params': {'progressToken': i, 'progress': i},",
+            "    })",
+            "",
+            "# Then the real response, correlated by id.",
+            "emit({",
+            r"    'jsonrpc': '2.0',",
+            r"    'id': request['id'],",
+            r"    'result': {",
+            r"        'protocolVersion': request['params']['protocolVersion'],",
+            r"        'capabilities': {},",
+            r"        'serverInfo': {'name': 'notif-then-response', 'version': '0.1.0'}",
+            r"    }",
+            "})",
+            "import time; time.sleep(30)",
+            "",
+        ]
+        .join("\n");
+        fs::write(&script_path, script).expect("write script");
+        make_executable(&script_path);
+        script_path
+    }
+
+    /// Variant: only notifications, no response. Used to verify the
+    /// timeout still bites when the read loop is starved.
+    fn write_only_notifications_script() -> PathBuf {
+        let root = temp_dir();
+        fs::create_dir_all(&root).expect("temp dir");
+        let script_path = root.join("only-notifications-mcp.py");
+        let script = [
+            "#!/usr/bin/env python3",
+            "import json, sys, time",
+            "header = b''",
+            r"while not header.endswith(b'\r\n\r\n'):",
+            "    chunk = sys.stdin.buffer.read(1)",
+            "    if not chunk:",
+            "        raise SystemExit(1)",
+            "    header += chunk",
+            "length = 0",
+            r"for line in header.decode().split('\r\n'):",
+            r"    if line.lower().startswith('content-length:'):",
+            r"        length = int(line.split(':', 1)[1].strip())",
+            "sys.stdin.buffer.read(length)",
+            "",
+            "def emit(body):",
+            "    encoded = json.dumps(body).encode()",
+            r"    sys.stdout.buffer.write(f'Content-Length: {len(encoded)}\r\n\r\n'.encode() + encoded)",
+            "    sys.stdout.buffer.flush()",
+            "",
+            "# Stream notifications indefinitely, never the response.",
+            "# The client should still hit the read timeout because the",
+            "# timeout wraps the entire send+read loop, not a single",
+            "# read_frame call.",
+            "for i in range(1000):",
+            "    emit({",
+            r"        'jsonrpc': '2.0',",
+            r"        'method': 'notifications/log',",
+            r"        'params': {'level': 'info', 'message': f'tick {i}'},",
+            "    })",
+            "    time.sleep(0.05)",
+            "time.sleep(10)",
+            "",
+        ]
+        .join("\n");
+        fs::write(&script_path, script).expect("write script");
+        make_executable(&script_path);
+        script_path
+    }
+
+    #[test]
+    fn notification_then_response_returns_response() {
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let script_path = write_notifications_then_response_script(1);
+            let mut transport = script_transport(&script_path);
+            transport.env.insert("NOTIFICATION_COUNT".to_string(), "1".to_string());
+            let mut process =
+                McpStdioProcess::spawn(&transport).expect("spawn notif-then-response server");
+
+            let response = process
+                .initialize(
+                    JsonRpcId::Number(7),
+                    McpInitializeParams {
+                        protocol_version: "2025-03-26".to_string(),
+                        capabilities: json!({}),
+                        client_info: McpInitializeClientInfo {
+                            name: "runtime-tests".to_string(),
+                            version: "0.1.0".to_string(),
+                        },
+                    },
+                )
+                .await
+                .expect("notification frame should be skipped and response returned");
+
+            assert_eq!(response.id, JsonRpcId::Number(7));
+            let result = response.result.expect("response result");
+            assert_eq!(result.server_info.name, "notif-then-response");
+
+            let _ = process.terminate().await;
+            let _ = process.wait().await;
+            cleanup_script(&script_path);
+        });
+    }
+
+    #[test]
+    fn multiple_notifications_before_response_all_skipped() {
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let script_path = write_notifications_then_response_script(5);
+            let mut transport = script_transport(&script_path);
+            transport.env.insert("NOTIFICATION_COUNT".to_string(), "5".to_string());
+            let mut process =
+                McpStdioProcess::spawn(&transport).expect("spawn many-notifs server");
+
+            let response = process
+                .initialize(
+                    JsonRpcId::Number(11),
+                    McpInitializeParams {
+                        protocol_version: "2025-03-26".to_string(),
+                        capabilities: json!({}),
+                        client_info: McpInitializeClientInfo {
+                            name: "runtime-tests".to_string(),
+                            version: "0.1.0".to_string(),
+                        },
+                    },
+                )
+                .await
+                .expect("five notifications should all be skipped, then response returned");
+
+            assert_eq!(response.id, JsonRpcId::Number(11));
+            assert!(response.result.is_some(), "response should carry a result");
+
+            let _ = process.terminate().await;
+            let _ = process.wait().await;
+            cleanup_script(&script_path);
+        });
+    }
+
+    #[test]
+    fn notification_after_timeout_still_times_out() {
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        // Hold the env-mutation lock around both `set_var` and the
+        // `block_on(...)` to prevent racing with other env-toggling
+        // tests under multi-threaded test execution. We inline the
+        // mutex here rather than using `with_env_timeout` because the
+        // call we're guarding is async.
+        let guard = env_lock().lock().expect("env lock");
+        let prior = std::env::var("MCP_REQUEST_TIMEOUT_SECS").ok();
+        std::env::set_var("MCP_REQUEST_TIMEOUT_SECS", "1");
+
+        runtime.block_on(async {
+            let script_path = write_only_notifications_script();
+            let transport = script_transport(&script_path);
+            let mut process =
+                McpStdioProcess::spawn(&transport).expect("spawn streaming-notifs server");
+
+            let started = std::time::Instant::now();
+            let err = process
+                .initialize(
+                    JsonRpcId::Number(13),
+                    McpInitializeParams {
+                        protocol_version: "2025-03-26".to_string(),
+                        capabilities: json!({}),
+                        client_info: McpInitializeClientInfo {
+                            name: "runtime-tests".to_string(),
+                            version: "0.1.0".to_string(),
+                        },
+                    },
+                )
+                .await
+                .expect_err("server only emits notifications, request should time out");
+            let elapsed = started.elapsed();
+
+            assert_eq!(err.kind(), ErrorKind::TimedOut);
+            assert!(
+                elapsed < std::time::Duration::from_secs(5),
+                "timeout was not honoured by the notification-skip loop: {elapsed:?}"
+            );
+
+            let _ = process.wait().await;
+            cleanup_script(&script_path);
+        });
+
+        match prior {
+            Some(value) => std::env::set_var("MCP_REQUEST_TIMEOUT_SECS", value),
+            None => std::env::remove_var("MCP_REQUEST_TIMEOUT_SECS"),
+        }
+        drop(guard);
     }
 }
