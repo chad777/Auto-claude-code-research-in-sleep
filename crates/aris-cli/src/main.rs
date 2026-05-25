@@ -5023,7 +5023,7 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     )?;
     writeln!(
         out,
-        "  DeepSeek:  EXECUTOR_PROVIDER=anthropic-compat EXECUTOR_BASE_URL=https://api.deepseek.com/anthropic EXECUTOR_API_KEY=xxx aris --model deepseek-v4-pro"
+        "  DeepSeek:  Run `aris setup` (option 6: Anthropic-compat) → base URL https://api.deepseek.com/anthropic"
     )?;
     writeln!(
         out,
@@ -5243,6 +5243,23 @@ fn run_doctor() -> Result<(), Box<dyn std::error::Error>> {
         }
     } else {
         println!("NOT CONFIGURED (no ~/.claude.json)");
+    }
+
+    // Check 6 (v0.4.14 M1/M2): MCP dispatch experimental warning.
+    // Surfaces only when mcpServers are actually configured so users
+    // who don't use MCP aren't bothered.
+    let mcp_server_count = runtime::ConfigLoader::default_for(&cwd)
+        .load()
+        .map(|rc| rc.mcp().servers().len())
+        .unwrap_or(0);
+    if mcp_server_count > 0 {
+        println!();
+        println!(
+            "\x1b[33m⚠  MCP servers configured ({mcp_server_count}) but currently only stdio test/diagnostics.\x1b[0m"
+        );
+        println!(
+            "\x1b[33m   Full tool dispatch into LLM context lands in v0.4.16. (See README MCP section.)\x1b[0m"
+        );
     }
 
     println!();

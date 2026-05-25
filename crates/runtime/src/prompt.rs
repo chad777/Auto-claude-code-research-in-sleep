@@ -545,7 +545,165 @@ fn parse_simple_description(content: &str) -> Option<String> {
     None
 }
 
+/// Top-level config keys whose values are safe to surface to the LLM
+/// (still recursively redacted, in case a nested object contains secrets).
+const CONFIG_WHITELIST_FIELDS: &[&str] = &[
+    "model",
+    "permissionMode",
+    "theme",
+    "outputStyle",
+    "permissions",
+    "sandbox",
+];
+
+/// Case-insensitive substring patterns whose matching keys have their
+/// values replaced with `[REDACTED]` recursively.
+const SENSITIVE_KEY_PATTERNS: &[&str] = &[
+    "apikey",
+    "api_key",
+    "token",
+    "secret",
+    "password",
+    "passwd",
+    "authorization",
+    "headers",
+    "env",
+];
+
+/// Case-insensitive suffix patterns whose matching keys have their
+/// values replaced with `[REDACTED]` recursively.
+const SENSITIVE_KEY_SUFFIXES: &[&str] = &["_key", "_secret", "_token"];
+
+fn is_sensitive_key(key: &str) -> bool {
+    let lower = key.to_lowercase();
+    if SENSITIVE_KEY_PATTERNS
+        .iter()
+        .any(|pat| lower.contains(pat))
+    {
+        return true;
+    }
+    SENSITIVE_KEY_SUFFIXES
+        .iter()
+        .any(|suf| lower.ends_with(suf))
+}
+
+/// Recursively redact a JSON value: any object key matching the sensitive
+/// key list collapses its entire subtree to `"[REDACTED]"`.
+fn redact_sensitive_recursively(value: &crate::json::JsonValue) -> crate::json::JsonValue {
+    use crate::json::JsonValue;
+    match value {
+        JsonValue::Object(entries) => {
+            let mut out = std::collections::BTreeMap::new();
+            for (key, sub) in entries {
+                if is_sensitive_key(key) {
+                    out.insert(key.clone(), JsonValue::String("[REDACTED]".to_string()));
+                } else {
+                    out.insert(key.clone(), redact_sensitive_recursively(sub));
+                }
+            }
+            JsonValue::Object(out)
+        }
+        JsonValue::Array(items) => {
+            JsonValue::Array(items.iter().map(redact_sensitive_recursively).collect())
+        }
+        other => other.clone(),
+    }
+}
+
+/// Render a non-whitelisted top-level field as a structural indicator
+/// (e.g. `<object: 5 keys>`) so the user/agent sees presence but no values.
+fn type_indicator(value: &crate::json::JsonValue) -> String {
+    use crate::json::JsonValue;
+    match value {
+        JsonValue::Null => "<null>".to_string(),
+        JsonValue::Bool(_) => "<bool>".to_string(),
+        JsonValue::Number(_) => "<number>".to_string(),
+        JsonValue::String(s) => format!("<string: {} chars>", s.chars().count()),
+        JsonValue::Array(items) => format!("<array: {} items>", items.len()),
+        JsonValue::Object(entries) => format!("<object: {} keys>", entries.len()),
+    }
+}
+
+/// Render the `mcpServers` summary: only server name + transport +
+/// command/url. Headers, env, args are never rendered.
+fn render_mcp_servers_summary(value: &crate::json::JsonValue) -> Vec<String> {
+    use crate::json::JsonValue;
+    let mut lines = Vec::new();
+    let Some(servers) = value.as_object() else {
+        lines.push("mcpServers: <unrecognized shape, redacted>".to_string());
+        return lines;
+    };
+    if servers.is_empty() {
+        lines.push("mcpServers: <empty>".to_string());
+        return lines;
+    }
+    lines.push(format!("mcpServers ({} configured):", servers.len()));
+    for (name, server) in servers {
+        let mut parts: Vec<String> = vec![format!("\"{}\"", name)];
+        if let Some(obj) = server.as_object() {
+            if let Some(JsonValue::String(t)) = obj.get("type") {
+                parts.push(format!("type={}", t));
+            } else if let Some(JsonValue::String(transport)) = obj.get("transport") {
+                parts.push(format!("transport={}", transport));
+            }
+            if let Some(JsonValue::String(cmd)) = obj.get("command") {
+                parts.push(format!("command={:?}", cmd));
+            }
+            if let Some(JsonValue::String(url)) = obj.get("url") {
+                parts.push(format!("url={:?}", url));
+            }
+        }
+        lines.push(format!("    - {}", parts.join(" ")));
+    }
+    lines
+}
+
+/// Render the `hooks` summary: only event name + truncated command prefix.
+/// `env` and any other auxiliary fields are dropped.
+fn render_hooks_summary(value: &crate::json::JsonValue) -> Vec<String> {
+    use crate::json::JsonValue;
+    let mut lines = Vec::new();
+    let Some(events) = value.as_object() else {
+        lines.push("hooks: <unrecognized shape, redacted>".to_string());
+        return lines;
+    };
+    if events.is_empty() {
+        lines.push("hooks: <empty>".to_string());
+        return lines;
+    }
+    lines.push(format!("hooks ({} events):", events.len()));
+    for (event, matchers) in events {
+        let mut commands_rendered = 0usize;
+        if let Some(matcher_array) = matchers.as_array() {
+            for matcher in matcher_array {
+                let Some(matcher_obj) = matcher.as_object() else { continue };
+                if let Some(hook_list) = matcher_obj.get("hooks").and_then(JsonValue::as_array) {
+                    for hook in hook_list {
+                        if let Some(hook_obj) = hook.as_object() {
+                            if let Some(JsonValue::String(cmd)) = hook_obj.get("command") {
+                                let prefix: String = cmd.chars().take(50).collect();
+                                let ellipsis = if cmd.chars().count() > 50 { "..." } else { "" };
+                                lines.push(format!(
+                                    "    - {event}: command={:?}{}",
+                                    prefix, ellipsis
+                                ));
+                                commands_rendered += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if commands_rendered == 0 {
+            lines.push(format!("    - {event}: <no command entries>"));
+        }
+    }
+    lines
+}
+
 fn render_config_section(config: &RuntimeConfig) -> String {
+    use crate::json::JsonValue;
+
     let mut lines = vec!["# Runtime config".to_string()];
     if config.loaded_entries().is_empty() {
         lines.extend(prepend_bullets(vec![
@@ -562,7 +720,60 @@ fn render_config_section(config: &RuntimeConfig) -> String {
             .collect(),
     ));
     lines.push(String::new());
-    lines.push(config.as_json().render());
+
+    // Note: settings.json values are NEVER dumped raw into the system
+    // prompt — secrets in env/headers/apiKey/etc would leak to the LLM
+    // provider. Whitelisted fields are recursively redacted; non-
+    // whitelisted fields collapse to type indicators; MCP servers and
+    // hooks get safe structural summaries.
+    let merged = config.merged();
+    let mut whitelisted_pairs: Vec<String> = Vec::new();
+    let mut structural_pairs: Vec<String> = Vec::new();
+    let mut mcp_summary_lines: Vec<String> = Vec::new();
+    let mut hook_summary_lines: Vec<String> = Vec::new();
+
+    for (key, value) in merged {
+        if key == "mcpServers" {
+            mcp_summary_lines = render_mcp_servers_summary(value);
+            continue;
+        }
+        if key == "hooks" {
+            hook_summary_lines = render_hooks_summary(value);
+            continue;
+        }
+        if CONFIG_WHITELIST_FIELDS.iter().any(|w| w == key) {
+            let redacted = redact_sensitive_recursively(value);
+            whitelisted_pairs.push(format!(
+                "{}: {}",
+                JsonValue::String(key.clone()).render(),
+                redacted.render()
+            ));
+        } else if is_sensitive_key(key) {
+            structural_pairs.push(format!("{}: \"[REDACTED]\"", key));
+        } else {
+            structural_pairs.push(format!("{}: {}", key, type_indicator(value)));
+        }
+    }
+
+    if !whitelisted_pairs.is_empty() {
+        lines.push("Settings (whitelisted, recursively redacted):".to_string());
+        for pair in whitelisted_pairs {
+            lines.push(format!("    {pair}"));
+        }
+    }
+    if !structural_pairs.is_empty() {
+        lines.push("Other settings (structure only, values withheld):".to_string());
+        for pair in structural_pairs {
+            lines.push(format!("    {pair}"));
+        }
+    }
+    if !mcp_summary_lines.is_empty() {
+        lines.extend(mcp_summary_lines);
+    }
+    if !hook_summary_lines.is_empty() {
+        lines.extend(hook_summary_lines);
+    }
+
     lines.join("\n")
 }
 
@@ -621,8 +832,9 @@ fn get_actions_section() -> String {
 mod tests {
     use super::{
         collapse_blank_lines, display_context_path, normalize_instruction_content,
-        render_instruction_content, render_instruction_files, truncate_instruction_content,
-        ContextFile, ProjectContext, SystemPromptBuilder, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
+        render_config_section, render_instruction_content, render_instruction_files,
+        truncate_instruction_content, ContextFile, ProjectContext, SystemPromptBuilder,
+        SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
     };
     use crate::config::ConfigLoader;
     use std::fs;
@@ -907,5 +1119,132 @@ mod tests {
         assert!(rendered.contains("# Claude instructions"));
         assert!(rendered.contains("scope: /tmp/project"));
         assert!(rendered.contains("Project rules"));
+    }
+
+    #[test]
+    fn render_config_section_redacts_sensitive_fields() {
+        // Build a settings.json with three different secret locations:
+        //   1. Top-level `env` map (hook/agent env)
+        //   2. `mcpServers.github.headers.Authorization` (Bearer token)
+        //   3. `hooks.SessionEnd[].hooks[].env` (per-hook env)
+        // plus a top-level `apiKey` and one whitelisted field (`model`).
+        let root = temp_dir();
+        fs::create_dir_all(root.join(".claude")).expect("claude dir");
+        let settings = r#"{
+            "model": "claude-opus-4-7",
+            "permissionMode": "acceptEdits",
+            "apiKey": "sk-fake-toplevel-abc",
+            "env": {"SECRET_KEY": "abc123", "OPENAI_API_KEY": "sk-leak"},
+            "mcpServers": {
+                "github": {
+                    "type": "http",
+                    "command": "npx",
+                    "url": "https://api.github.com/mcp",
+                    "headers": {"Authorization": "Bearer xyz-secret"}
+                }
+            },
+            "hooks": {
+                "SessionEnd": [
+                    {
+                        "matcher": ".*",
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": "echo done",
+                                "env": {"OPENAI_KEY": "sk-xxx-hook"}
+                            }
+                        ]
+                    }
+                ]
+            }
+        }"#;
+        fs::write(root.join(".claude").join("settings.json"), settings)
+            .expect("write settings");
+
+        let _guard = env_lock();
+        let original_home = std::env::var("HOME").ok();
+        let original_claude_home = std::env::var("CLAUDE_CONFIG_HOME").ok();
+        std::env::set_var("HOME", &root);
+        std::env::set_var("CLAUDE_CONFIG_HOME", root.join("missing-home"));
+
+        let config = ConfigLoader::new(&root, root.join("missing-home"))
+            .load()
+            .expect("config should load");
+        let rendered = render_config_section(&config);
+
+        if let Some(value) = original_home {
+            std::env::set_var("HOME", value);
+        } else {
+            std::env::remove_var("HOME");
+        }
+        if let Some(value) = original_claude_home {
+            std::env::set_var("CLAUDE_CONFIG_HOME", value);
+        } else {
+            std::env::remove_var("CLAUDE_CONFIG_HOME");
+        }
+
+        // No raw secrets must appear anywhere.
+        assert!(
+            !rendered.contains("abc123"),
+            "raw SECRET_KEY leaked: {rendered}"
+        );
+        assert!(
+            !rendered.contains("sk-leak"),
+            "raw OPENAI_API_KEY leaked: {rendered}"
+        );
+        assert!(
+            !rendered.contains("Bearer xyz-secret"),
+            "raw Authorization Bearer leaked: {rendered}"
+        );
+        assert!(
+            !rendered.contains("xyz-secret"),
+            "raw bearer suffix leaked: {rendered}"
+        );
+        assert!(
+            !rendered.contains("sk-xxx-hook"),
+            "raw hook env secret leaked: {rendered}"
+        );
+        assert!(
+            !rendered.contains("sk-fake-toplevel-abc"),
+            "raw top-level apiKey leaked: {rendered}"
+        );
+
+        // The redaction sentinel must be present.
+        assert!(
+            rendered.contains("[REDACTED]"),
+            "expected [REDACTED] sentinel in output: {rendered}"
+        );
+
+        // Whitelisted fields render their values normally (after redaction).
+        assert!(
+            rendered.contains("claude-opus-4-7"),
+            "expected whitelisted model field value: {rendered}"
+        );
+        assert!(
+            rendered.contains("acceptEdits"),
+            "expected whitelisted permissionMode value: {rendered}"
+        );
+
+        // MCP server name must still appear (so users know the server is
+        // configured), command/url too — but headers must not.
+        assert!(rendered.contains("github"), "MCP server name missing: {rendered}");
+        // The literal lowercase `"headers"` key string SHOULD NOT appear in
+        // the output, because the MCP summary deliberately omits it.
+        assert!(
+            !rendered.contains("\"Authorization\""),
+            "Authorization key leaked in MCP summary: {rendered}"
+        );
+
+        // Hooks summary should mention SessionEnd but not its env.
+        assert!(
+            rendered.contains("SessionEnd"),
+            "hook event name missing: {rendered}"
+        );
+        assert!(
+            !rendered.contains("OPENAI_KEY"),
+            "hook env key leaked: {rendered}"
+        );
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
     }
 }

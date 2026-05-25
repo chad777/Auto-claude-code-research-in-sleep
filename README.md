@@ -315,6 +315,21 @@ The system prompt explicitly informs the model of its exact identity (ARIS-Code)
 
 ---
 
+## 🔌 MCP servers (experimental)
+
+> ⚠ **Experimental**: As of v0.4.14, MCP servers configured in
+> `settings.json` are validated and probed (stdio handshake works),
+> but **tool calls from MCP servers are not yet dispatched into the
+> LLM context**. Full MCP tool dispatch is planned for v0.4.16.
+
+`aris doctor` will print a warning whenever `mcpServers` are present
+in the merged settings so you don't silently assume tools are wired
+through. The Codex MCP integration (used by review skills) is the
+exception — it is invoked through the dedicated reviewer path, not
+through the generic MCP tool-dispatch pipeline.
+
+---
+
 ## 🗺️ Roadmap
 
 - [x] Phase 0: Rust fork foundation (based on claw-code)

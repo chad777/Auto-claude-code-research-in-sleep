@@ -191,9 +191,9 @@ for helper in "${RUNTIME_HELPERS[@]}"; do
 done
 
 # NOTE: this script does NOT auto-prune assets/tools/ — the 20 helpers
-# above are the complete intended bundle. If a stale helper survives that
-# nothing references, the bundle inventory test catches it on next
-# `cargo test`.
+# above are the complete intended bundle as of v0.4.13. If a stale helper
+# survives that nothing references, the bundle inventory test catches it
+# on next `cargo test`.
 
 # ---------------------------------------------------------------
 # Step 7: Record source commit

@@ -308,6 +308,18 @@ sudo mv aris /usr/local/bin/aris
 
 ---
 
+## 🔌 MCP servers（实验性）
+
+> ⚠ **实验性**：截至 v0.4.14，`settings.json` 中配置的 MCP servers 仅完成
+> 校验与 stdio 握手探测，**MCP server 的工具调用尚未被分发进 LLM 的工具
+> 上下文**。完整的 MCP 工具分发计划在 v0.4.16 落地。
+>
+> 当 `mcpServers` 字段存在于合并后的设置时，`aris doctor` 会打印警告，
+> 避免你误以为工具已经接通。Codex MCP（被 review 系列技能使用）是例外
+> ——它走的是专用 reviewer 路径，而不是通用的 MCP tool-dispatch pipeline。
+
+---
+
 ## 🗺️ 路线图
 
 - [x] Phase 0：Rust fork 基础架构（基于 claw-code）
