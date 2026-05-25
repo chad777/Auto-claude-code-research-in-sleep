@@ -117,6 +117,25 @@ bounds, zero/negative, parse failure, and edge boundaries.
 from `v0.4.11` (when the sync infrastructure first landed) to
 `v0.4.13` (current bundle generation). Cosmetic.
 
+### Late bundle sync (post-release `357a418`)
+
+Tag `v0.4.14` also includes a same-day sync to main HEAD
+[`7e3ab67`](https://github.com/wanshuiyin/Auto-claude-code-research-in-sleep/commit/7e3ab67)
+that picks up:
+
+- `tools/meta_opt/check_ready.sh` upstream fix — extracts `"ts"`
+  field with `match()` before comparison (closes the same `$0 > ts`
+  always-true bug ARIS-Code flagged in v0.4.13 audit followup, plus
+  a pre-existing `grep -c X || echo 0` two-line-output crash that
+  ARIS-Code's first patch hadn't caught — main's codex-round-1 did).
+- New `/wiki-enrich` skill (fills paper TODO sections left by
+  `ingest_paper`).
+- Two minor SKILL.md / script refreshes (`auto-review-loop-llm`,
+  `render-html`).
+
+Bundle inventory: 76 → **77 skills**, 54 helpers unchanged. All 9
+cache drift tests pass; `SKILLS_SOURCE_COMMIT` pin updated.
+
 ### Test inventory
 
 `cargo test -p runtime --lib`: 117 passed (3 new prompt tests +
