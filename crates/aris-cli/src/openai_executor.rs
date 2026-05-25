@@ -563,6 +563,11 @@ on a compatible third-party proxy, or use Claude/another provider as executor an
             // or premature EOF before any event has been emitted. See
             // openai_executor.rs::stream_retry_budget docstring.
             let mut stream_retries_remaining: u8 = stream_retry_budget();
+            // v0.4.14 C11: per-chunk idle timeout. None = wait forever
+            // (legacy behaviour, opt-in via `ARIS_STREAM_IDLE_TIMEOUT_SECS=0`).
+            // On elapse the stream walks the same retry path as a
+            // mid-body abort.
+            let idle_timeout = api::resolve_stream_idle_timeout();
             // "Has the caller seen any meaningful output yet?" If true,
             // we cannot restart — there's no resume primitive in
             // OpenAI's API and re-sending would duplicate output.
@@ -584,7 +589,47 @@ on a compatible third-party proxy, or use Claude/another provider as executor an
                     runtime::clear_interrupt();
                     return Err(RuntimeError::new("interrupted by user"));
                 }
-                let chunk_result = response.chunk().await;
+                // v0.4.14 C11 — wrap chunk read in tokio::time::timeout so
+                // a hung upstream proxy can't stall this loop forever.
+                // Idle elapse is treated equivalently to a premature
+                // EOF / mid-body abort and walks through the same
+                // retry path.
+                let chunk_future = response.chunk();
+                let chunk_result = match idle_timeout {
+                    Some(dur) => match tokio::time::timeout(dur, chunk_future).await {
+                        Ok(inner) => inner,
+                        Err(_elapsed) => {
+                            if nothing_emitted_yet(
+                                &events,
+                                &pending_tools,
+                                &current_reasoning,
+                            ) && stream_retries_remaining > 0
+                            {
+                                stream_retries_remaining -= 1;
+                                eprintln!(
+                                    "\x1b[33m  OpenAI stream restart (idle timeout {}s, {} attempt(s) left)\x1b[0m",
+                                    dur.as_secs(),
+                                    stream_retries_remaining
+                                );
+                                response = stream_restart_send(
+                                    &self.http,
+                                    &url,
+                                    &self.api_key,
+                                    &body,
+                                )
+                                .await?;
+                                stream_buf.clear();
+                                done = false;
+                                continue;
+                            }
+                            return Err(RuntimeError::new(format!(
+                                "OpenAI stream idle timeout ({}s, retries exhausted or partial output already emitted)",
+                                dur.as_secs()
+                            )));
+                        }
+                    },
+                    None => chunk_future.await,
+                };
                 let chunk = match chunk_result {
                     Ok(Some(c)) => c,
                     Ok(None) => {

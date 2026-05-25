@@ -244,6 +244,7 @@ impl AnthropicClient {
             has_emitted_meaningful_content: false,
             stream_retries_remaining: read_stream_retry_budget(),
             observed_terminal: false,
+            idle_timeout: resolve_stream_idle_timeout(),
             done: false,
         })
     }
@@ -631,6 +632,49 @@ fn read_stream_retry_budget() -> u8 {
 /// which already handles the request-send phase.
 const STREAM_RETRY_BACKOFF: Duration = Duration::from_millis(500);
 
+/// Default chunk-idle timeout when `ARIS_STREAM_IDLE_TIMEOUT_SECS` is unset
+/// or unparseable: 120s.
+const STREAM_IDLE_TIMEOUT_DEFAULT_SECS: i64 = 120;
+/// Lower clamp for the chunk-idle timeout (10s). Smaller values would
+/// race normal long-thinking turns.
+const STREAM_IDLE_TIMEOUT_MIN_SECS: i64 = 10;
+/// Upper clamp for the chunk-idle timeout (30min). Larger values are
+/// equivalent to "no timeout" — use `0` / negative to opt out explicitly.
+const STREAM_IDLE_TIMEOUT_MAX_SECS: i64 = 1800;
+
+/// v0.4.14 C11 — pure helper for parsing the chunk-idle timeout string.
+/// Returns `None` when the parsed value is `<= 0` (caller treats as
+/// "indefinite chunk wait"), otherwise clamps into `[10, 1800]` seconds.
+/// Unparseable / missing / blank → default 120s. Pure so it's testable
+/// without `std::env::set_var` racing the cargo test harness.
+#[must_use]
+pub(crate) fn parse_stream_idle_timeout_secs(raw: Option<&str>) -> Option<Duration> {
+    let secs = raw
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(STREAM_IDLE_TIMEOUT_DEFAULT_SECS);
+    if secs <= 0 {
+        return None;
+    }
+    let clamped = secs.clamp(STREAM_IDLE_TIMEOUT_MIN_SECS, STREAM_IDLE_TIMEOUT_MAX_SECS) as u64;
+    Some(Duration::from_secs(clamped))
+}
+
+/// Resolve the chunk-idle timeout for streaming reads from the
+/// `ARIS_STREAM_IDLE_TIMEOUT_SECS` env var. Default 120s, clamp
+/// `[10, 1800]`, `0` / negative disables. Returning `None` means
+/// "do not wrap chunk().await in tokio::time::timeout" — chunks may
+/// block indefinitely if the upstream proxy stops sending keepalives.
+///
+/// v0.4.14 C11 (codex audit P2): prevents stuck-forever symptoms on
+/// long-lived HTTPS streams when the upstream silently hangs without
+/// sending TCP RST or HTTP body.
+#[must_use]
+pub fn resolve_stream_idle_timeout() -> Option<Duration> {
+    parse_stream_idle_timeout_secs(std::env::var("ARIS_STREAM_IDLE_TIMEOUT_SECS").ok().as_deref())
+}
+
 /// Whether a reqwest::Error represents a transient stream-body failure
 /// that warrants a whole-stream restart (mid-body abort, decode/framing
 /// interrupted, timeout, connect reset). Excludes HTTP status errors
@@ -687,6 +731,12 @@ pub struct MessageStream {
     /// "proxy aborted before sending anything" from "complete short
     /// response".
     observed_terminal: bool,
+    /// v0.4.14 C11 — per-chunk idle timeout wrapped around
+    /// `response.chunk().await`. `None` means "wait indefinitely"
+    /// (legacy behaviour, opt-in via `ARIS_STREAM_IDLE_TIMEOUT_SECS=0`).
+    /// On elapse the stream goes through the existing mid-body abort
+    /// retry path (same gates as a transient reqwest::Error).
+    idle_timeout: Option<Duration>,
     done: bool,
 }
 
@@ -838,7 +888,46 @@ impl MessageStream {
                 return Ok(None);
             }
 
-            match self.response.chunk().await {
+            // v0.4.14 C11 — wrap chunk read in tokio::time::timeout so
+            // a hung upstream (proxy holding the connection without
+            // sending keepalives) can't stall this loop forever. Idle
+            // elapse is treated equivalently to a mid-body abort and
+            // walks through the same restart gate.
+            let chunk_future = self.response.chunk();
+            let chunk_result = match self.idle_timeout {
+                Some(dur) => match tokio::time::timeout(dur, chunk_future).await {
+                    Ok(inner) => inner,
+                    Err(_elapsed) => {
+                        if !self.has_emitted_meaningful_content
+                            && self.stream_retries_remaining > 0
+                        {
+                            self.stream_retries_remaining -= 1;
+                            eprintln!(
+                                "stream restart (idle timeout {}s, {} attempt(s) left)",
+                                dur.as_secs(),
+                                self.stream_retries_remaining
+                            );
+                            self.try_refresh_stream().await?;
+                            continue;
+                        }
+                        return Err(ApiError::Api {
+                            status: reqwest::StatusCode::REQUEST_TIMEOUT,
+                            error_type: Some("stream_idle_timeout".to_string()),
+                            message: Some(format!(
+                                "Anthropic stream idle timeout ({}s, retries exhausted or partial output already emitted)",
+                                dur.as_secs()
+                            )),
+                            body: format!(
+                                "Anthropic stream idle timeout after {}s with no chunk; retries exhausted or partial output already emitted",
+                                dur.as_secs()
+                            ),
+                            retryable: false,
+                        });
+                    }
+                },
+                None => chunk_future.await,
+            };
+            match chunk_result {
                 Ok(Some(chunk)) => {
                     self.pending.extend(self.parser.push(&chunk)?);
                 }
@@ -1464,5 +1553,43 @@ mod tests {
 
         // Single retry left + good preconditions → DO retry.
         assert!(super::should_retry_on_premature_eof(false, false, true, true, 1));
+    }
+
+    /// v0.4.14 C11 — chunk-idle timeout env parser truth table. Pure
+    /// helper avoids racing the global env var across parallel tests;
+    /// `resolve_stream_idle_timeout()` is a thin env-read wrapper around
+    /// this function, so coverage here is sufficient.
+    #[test]
+    fn resolve_stream_idle_timeout_parses_env() {
+        use super::parse_stream_idle_timeout_secs;
+        use std::time::Duration;
+
+        // unset → default 120s
+        assert_eq!(parse_stream_idle_timeout_secs(None), Some(Duration::from_secs(120)));
+
+        // valid mid-range
+        assert_eq!(parse_stream_idle_timeout_secs(Some("30")), Some(Duration::from_secs(30)));
+
+        // below clamp (10s) → clamped up to 10s
+        assert_eq!(parse_stream_idle_timeout_secs(Some("5")), Some(Duration::from_secs(10)));
+
+        // above clamp (1800s) → clamped down to 1800s
+        assert_eq!(parse_stream_idle_timeout_secs(Some("9999")), Some(Duration::from_secs(1800)));
+
+        // zero → opt-out (None == indefinite wait)
+        assert_eq!(parse_stream_idle_timeout_secs(Some("0")), None);
+
+        // negative → opt-out
+        assert_eq!(parse_stream_idle_timeout_secs(Some("-1")), None);
+
+        // parse failure → fall back to default 120s, not silently disable
+        assert_eq!(parse_stream_idle_timeout_secs(Some("abc")), Some(Duration::from_secs(120)));
+
+        // blank / whitespace-only → treated as missing → default 120s
+        assert_eq!(parse_stream_idle_timeout_secs(Some("   ")), Some(Duration::from_secs(120)));
+
+        // exact boundaries → pass through
+        assert_eq!(parse_stream_idle_timeout_secs(Some("10")), Some(Duration::from_secs(10)));
+        assert_eq!(parse_stream_idle_timeout_secs(Some("1800")), Some(Duration::from_secs(1800)));
     }
 }
