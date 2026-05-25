@@ -34,7 +34,7 @@ Add to `~/.claude/settings.json`:
       "env": {
         "LLM_API_KEY": "your-api-key",
         "LLM_BASE_URL": "https://api.deepseek.com/v1",
-        "LLM_MODEL": "deepseek-v4-flash"
+        "LLM_MODEL": "deepseek-chat"
       }
     }
   }
@@ -45,8 +45,8 @@ Add to `~/.claude/settings.json`:
 
 | Provider | LLM_BASE_URL | LLM_MODEL |
 |----------|--------------|-----------|
-| **OpenAI** | `https://api.openai.com/v1` | `gpt-4o`, `gpt-5.5`, `o3`, `o4-mini` |
-| **DeepSeek** | `https://api.deepseek.com/v1` | `deepseek-v4-flash`, `deepseek-v4-pro` ([legacy `deepseek-chat` / `deepseek-reasoner` deprecate 2026-07-24](https://api-docs.deepseek.com/updates/); R1-class reasoner models reject `tool_choice`, use `*-flash` / `*-pro`) |
+| **OpenAI** | `https://api.openai.com/v1` | `gpt-4o`, `o3` |
+| **DeepSeek** | `https://api.deepseek.com/v1` | `deepseek-chat`, `deepseek-reasoner` |
 | **MiniMax** | `https://api.minimax.io/v1` | `MiniMax-M2.7` |
 | **Kimi (Moonshot)** | `https://api.moonshot.cn/v1` | `moonshot-v1-8k`, `moonshot-v1-32k` |
 | **ZhiPu (GLM)** | `https://open.bigmodel.cn/api/paas/v4` | `glm-4`, `glm-4-plus` |
@@ -62,7 +62,7 @@ Add to `~/.claude/settings.json`:
 mcp__llm-chat__chat:
   prompt: |
     [Review prompt content]
-  model: "deepseek-v4-flash"
+  model: "deepseek-chat"
   system: "You are a senior ML reviewer..."
 ```
 
