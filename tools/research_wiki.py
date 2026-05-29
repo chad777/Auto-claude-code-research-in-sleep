@@ -182,7 +182,18 @@ def rebuild_query_pack(wiki_root: str, max_chars: int = 8000):
             sections_map[current_heading] = "\n".join(current_lines).strip()
 
         def _section(name: str) -> str | None:
+            # Exact match first, then a tolerant match so template drift
+            # ("Existing Results" vs "Existing Results (if any)", trailing
+            # punctuation, case) still resolves to the intended section.
             text = sections_map.get(name, "").strip()
+            if not text:
+                want = name.lower().rstrip(":").strip()
+                for k, v in sections_map.items():
+                    kk = k.lower().rstrip(":").strip()
+                    if kk == want or kk.startswith(want) or want.startswith(kk):
+                        text = v.strip()
+                        if text:
+                            break
             return text if text else None
 
         # Priority order for /idea-creator: problem → constraints → direction → background
@@ -203,6 +214,14 @@ def rebuild_query_pack(wiki_root: str, max_chars: int = 8000):
         if parts:
             brief = "\n\n".join(parts)
             sections.append(f"## Project Direction\n{brief}\n")
+        else:
+            # Fallback: the brief uses none of the template's known headings
+            # (custom template, or a free-form brief). Don't silently drop the
+            # whole brief — fall back to the original flat-slice behavior so
+            # /idea-creator still gets *some* project context.
+            flat = raw.strip()[:600]
+            if flat:
+                sections.append(f"## Project Direction\n{flat}\n")
 
     # 2. Gap map (1200 chars)
     gap_path = root / "gap_map.md"
