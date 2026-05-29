@@ -172,6 +172,134 @@ fn stream_chunk_error_is_retryable(error: &reqwest::Error) -> bool {
         || error.is_decode()
 }
 
+/// What to do when an OpenAI-compatible stream hits a clean EOF
+/// (`response.chunk()` returned `Ok(None)`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamEofAction {
+    /// A terminal signal arrived — break the loop and let the
+    /// `Ensure MessageStop` fallback synthesize the terminal event.
+    Complete,
+    /// Nothing meaningful was emitted yet and restart budget remains —
+    /// re-send the whole request (a proxy likely closed the connection
+    /// before producing any output).
+    Restart,
+    /// Content was already emitted but no terminal signal arrived — the
+    /// stream was cut mid-response. Hard error.
+    Truncated,
+}
+
+/// Decide how to treat a clean stream EOF. Extracted as a pure function
+/// so the completion-vs-truncation decision is unit-testable (the live
+/// loop needs an HTTP body).
+///
+/// A response is **complete** when *either* terminal signal arrived:
+/// - `observed_done` — the `data: [DONE]` SSE sentinel (OpenAI canonical), or
+/// - `observed_finish_reason` — a non-empty `choices[].finish_reason`, which
+///   the Chat Completions spec defines as the model's terminal chunk.
+///
+/// Many OpenAI-compatible providers (MiniMax — issue #249, and others)
+/// send `finish_reason: "stop"` but never emit `[DONE]`. Requiring
+/// `[DONE]` alone misreported every successful completion as a
+/// truncation. We accept either signal; only when NEITHER arrived do we
+/// fall back to the emitted-content heuristic (restart if nothing was
+/// emitted and budget remains, otherwise treat as a genuine mid-response
+/// truncation). Crucially this only relaxes how a *clean* EOF is judged —
+/// reads are never stopped early at `finish_reason`, so a trailing
+/// usage-only chunk (`stream_options.include_usage`) is still consumed.
+fn stream_eof_action(
+    observed_done: bool,
+    observed_finish_reason: bool,
+    nothing_emitted: bool,
+    retries_remaining: u8,
+) -> StreamEofAction {
+    if observed_done || observed_finish_reason {
+        return StreamEofAction::Complete;
+    }
+    if nothing_emitted && retries_remaining > 0 {
+        return StreamEofAction::Restart;
+    }
+    StreamEofAction::Truncated
+}
+
+/// Detail of a mid-stream error envelope, if a parsed SSE `data:` object
+/// carries a non-null top-level `error` (OE4 / #249). Returns `None` for a
+/// normal data chunk. Only message + code/type are surfaced — never the
+/// whole envelope — so nothing the provider may have reflected leaks into
+/// logs. `code` is read as either a string or an integer (providers vary).
+fn stream_error_detail(parsed: &Value) -> Option<String> {
+    let err = parsed.get("error")?;
+    if err.is_null() {
+        return None;
+    }
+    // Some proxies send a bare string `"error": "..."`.
+    if let Some(s) = err.as_str() {
+        return Some(s.to_string());
+    }
+    let msg = err
+        .get("message")
+        .and_then(|m| m.as_str())
+        .unwrap_or("(no message)");
+    let code = err
+        .get("code")
+        .and_then(|c| {
+            c.as_str()
+                .map(str::to_string)
+                .or_else(|| c.as_i64().map(|n| n.to_string()))
+        })
+        .or_else(|| err.get("type").and_then(|t| t.as_str()).map(str::to_string))
+        .unwrap_or_default();
+    if code.is_empty() {
+        Some(msg.to_string())
+    } else {
+        Some(format!("{msg} ({code})"))
+    }
+}
+
+/// The non-empty `finish_reason` of a streaming choice, if present. Read
+/// independently of `delta` so a terminal choice carrying only
+/// `finish_reason` (no `delta`) is still recognized (OE7 / #249).
+fn choice_finish_reason(choice: &Value) -> Option<&str> {
+    choice
+        .get("finish_reason")
+        .and_then(|r| r.as_str())
+        .filter(|r| !r.is_empty())
+}
+
+/// Accumulate one streaming `tool_calls[]` delta entry into `pending`
+/// (slot index → (id, name, arguments)). Tool-call fields arrive
+/// incrementally across chunks: `id` is overwritten whenever the field is
+/// present, a non-empty `name` is retained, and `arguments` concatenate.
+fn accumulate_tool_call(pending: &mut Vec<(String, String, String)>, tc: &Value) {
+    let idx = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
+    while pending.len() <= idx {
+        pending.push((String::new(), String::new(), String::new()));
+    }
+    if let Some(id) = tc.get("id").and_then(|i| i.as_str()) {
+        pending[idx].0 = id.to_string();
+    }
+    if let Some(func) = tc.get("function") {
+        if let Some(name) = func.get("name").and_then(|n| n.as_str()) {
+            if !name.is_empty() {
+                pending[idx].1 = name.to_string();
+            }
+        }
+        if let Some(args) = func.get("arguments").and_then(|a| a.as_str()) {
+            pending[idx].2.push_str(args);
+        }
+    }
+}
+
+/// Extract the trimmed payload of an SSE `data:` line (OE3 / #249).
+/// Tolerates both `data: {...}` (OpenAI canonical, one space) and
+/// `data:{...}` (no space — W3C EventSource permits zero or one space
+/// after the field colon, and some OpenAI-compatible providers omit it,
+/// which the old `strip_prefix("data: ")` silently dropped). Returns
+/// `None` for blank lines, comment lines, and non-`data:` field lines
+/// (`event:`, `id:`, `retry:`), which the streaming loop skips.
+fn sse_data_payload(line: &str) -> Option<&str> {
+    line.strip_prefix("data:").map(str::trim)
+}
+
 /// Re-send the streaming POST when restarting a broken stream. Bounded
 /// inline retry loop covers 429 / 5xx / transient network errors during
 /// the restart — without it, a restart triggered by proxy instability
@@ -582,6 +710,14 @@ on a compatible third-party proxy, or use Claude/another provider as executor an
             // `[DONE]` sentinel — distinguishes "stream completed normally"
             // from "proxy closed connection before sending [DONE]".
             let mut observed_done = false;
+            // #249 v0.4.15: a non-empty `choices[].finish_reason` is the
+            // Chat Completions spec's terminal-chunk marker and is an
+            // equally authoritative completion signal. OpenAI-compatible
+            // providers (MiniMax etc.) often send it but never emit
+            // `[DONE]`; without this a clean EOF was misreported as a
+            // truncation. We still read until EOF (never stop early at
+            // finish_reason) so a trailing usage-only chunk isn't lost.
+            let mut observed_finish_reason = false;
 
             loop {
                 // Check for Ctrl+C interrupt between chunks
@@ -633,41 +769,49 @@ on a compatible third-party proxy, or use Claude/another provider as executor an
                 let chunk = match chunk_result {
                     Ok(Some(c)) => c,
                     Ok(None) => {
-                        // Clean EOF. Three branches:
-                        // 1. Saw [DONE] before EOF → normal completion, break.
-                        // 2. Nothing emitted + retries remain → proxy
-                        //    abort, restart the request.
-                        // 3. Otherwise → truncated stream is a hard
-                        //    failure. Returning Err prevents
-                        //    `Ensure MessageStop` later from synthesizing
-                        //    success out of a half-finished response.
-                        if observed_done {
-                            break;
+                        // Clean EOF. Decide complete / restart / truncated
+                        // via the pure `stream_eof_action` helper. A
+                        // response is complete if EITHER `[DONE]` OR a
+                        // non-empty `finish_reason` was seen (#249: MiniMax
+                        // & other compat providers send finish_reason but
+                        // not `[DONE]`); only with neither do we restart
+                        // (nothing emitted yet) or hard-error (truncated).
+                        match stream_eof_action(
+                            observed_done,
+                            observed_finish_reason,
+                            nothing_emitted_yet(&events, &pending_tools, &current_reasoning),
+                            stream_retries_remaining,
+                        ) {
+                            StreamEofAction::Complete => break,
+                            StreamEofAction::Restart => {
+                                stream_retries_remaining -= 1;
+                                eprintln!(
+                                    "\x1b[33m  OpenAI stream restart (premature EOF, {} attempt(s) left)\x1b[0m",
+                                    stream_retries_remaining
+                                );
+                                response = stream_restart_send(
+                                    &self.http,
+                                    &url,
+                                    &self.api_key,
+                                    &body,
+                                )
+                                .await?;
+                                stream_buf.clear();
+                                done = false;
+                                continue;
+                            }
+                            StreamEofAction::Truncated => {
+                                // Returning Err prevents `Ensure MessageStop`
+                                // below from synthesizing success out of a
+                                // half-finished response.
+                                return Err(RuntimeError::new(
+                                    "OpenAI stream ended prematurely without [DONE] sentinel \
+                                     or finish_reason (retries exhausted or partial output \
+                                     already emitted)"
+                                        .to_string(),
+                                ));
+                            }
                         }
-                        if nothing_emitted_yet(&events, &pending_tools, &current_reasoning)
-                            && stream_retries_remaining > 0
-                        {
-                            stream_retries_remaining -= 1;
-                            eprintln!(
-                                "\x1b[33m  OpenAI stream restart (premature EOF, {} attempt(s) left)\x1b[0m",
-                                stream_retries_remaining
-                            );
-                            response = stream_restart_send(
-                                &self.http,
-                                &url,
-                                &self.api_key,
-                                &body,
-                            )
-                            .await?;
-                            stream_buf.clear();
-                            done = false;
-                            continue;
-                        }
-                        return Err(RuntimeError::new(
-                            "OpenAI stream ended prematurely without [DONE] sentinel \
-                             (retries exhausted or partial output already emitted)"
-                                .to_string(),
-                        ));
                     }
                     Err(error) => {
                         if nothing_emitted_yet(&events, &pending_tools, &current_reasoning)
@@ -705,9 +849,10 @@ on a compatible third-party proxy, or use Claude/another provider as executor an
                         continue;
                     }
 
-                    let data = if let Some(d) = line.strip_prefix("data: ") {
-                        d.trim()
-                    } else {
+                    // OE3 (#249): tolerate `data:{...}` without the space
+                    // after the colon (some OpenAI-compatible providers omit
+                    // it). Non-`data:` field lines (event:/id:/retry:) → skip.
+                    let Some(data) = sse_data_payload(&line) else {
                         continue;
                     };
 
@@ -732,6 +877,19 @@ on a compatible third-party proxy, or use Claude/another provider as executor an
                         Ok(v) => v,
                         Err(_) => continue,
                     };
+
+                    // OE4 (#249): a mid-stream error envelope carries no
+                    // `choices`, so it would be silently dropped by the
+                    // `choices` guard below. That is doubly dangerous now
+                    // that a prior `finish_reason` marks the stream
+                    // "complete" on EOF — an error chunk arriving after a
+                    // finish_reason would otherwise be misjudged as
+                    // success. Surface it as a hard error.
+                    if let Some(detail) = stream_error_detail(&parsed) {
+                        return Err(RuntimeError::new(format!(
+                            "OpenAI stream returned a mid-stream error: {detail}"
+                        )));
+                    }
 
                     // Extract usage if present (some providers send it).
                     // v0.4.10 T35: read OpenAI's automatic prefix-cache hit
@@ -769,70 +927,72 @@ on a compatible third-party proxy, or use Claude/another provider as executor an
                     };
 
                     for choice in choices {
-                        let Some(delta) = choice.get("delta") else {
-                            continue;
-                        };
-
-                        // Kimi: capture reasoning_content from delta
-                        if supports_reasoning {
-                            if let Some(rc) = delta.get("reasoning_content").and_then(|r| r.as_str()) {
-                                current_reasoning.push_str(rc);
-                            }
+                        // OE7 (#249): read finish_reason BEFORE touching
+                        // `delta`. Some providers emit a terminal choice
+                        // carrying only `finish_reason` and no `delta`; the
+                        // old `let Some(delta) = … else continue` skipped
+                        // such a choice entirely, so its finish_reason was
+                        // never recorded and the EOF completion check below
+                        // would not fire. Capture it here, flush after the
+                        // delta block (a chunk may carry both tool_calls and
+                        // finish_reason — flush last so final args land).
+                        let finish_reason = choice_finish_reason(choice);
+                        if finish_reason.is_some() {
+                            observed_finish_reason = true;
                         }
 
-                        // Text content
-                        if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
-                            if !content.is_empty() {
-                                if let Some(rendered) = markdown_stream.push(&renderer, content) {
-                                    write!(out, "{rendered}")
-                                        .and_then(|()| out.flush())
-                                        .map_err(|e| RuntimeError::new(e.to_string()))?;
+                        if let Some(delta) = choice.get("delta") {
+                            // Kimi: capture reasoning_content from delta
+                            if supports_reasoning {
+                                if let Some(rc) =
+                                    delta.get("reasoning_content").and_then(|r| r.as_str())
+                                {
+                                    current_reasoning.push_str(rc);
                                 }
-                                events.push(AssistantEvent::TextDelta(content.to_string()));
                             }
-                        }
 
-                        // Tool calls
-                        if let Some(tool_calls) =
-                            delta.get("tool_calls").and_then(|tc| tc.as_array())
-                        {
-                            for tc in tool_calls {
-                                let idx = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0)
-                                    as usize;
-
-                                // Ensure vector is long enough
-                                while pending_tools.len() <= idx {
-                                    pending_tools.push((String::new(), String::new(), String::new()));
-                                }
-
-                                if let Some(id) = tc.get("id").and_then(|i| i.as_str()) {
-                                    pending_tools[idx].0 = id.to_string();
-                                }
-                                if let Some(func) = tc.get("function") {
-                                    if let Some(name) = func.get("name").and_then(|n| n.as_str()) {
-                                        if !name.is_empty() {
-                                            pending_tools[idx].1 = name.to_string();
-                                        }
-                                    }
-                                    if let Some(args) =
-                                        func.get("arguments").and_then(|a| a.as_str())
+                            // Text content
+                            if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
+                                if !content.is_empty() {
+                                    if let Some(rendered) =
+                                        markdown_stream.push(&renderer, content)
                                     {
-                                        pending_tools[idx].2.push_str(args);
+                                        write!(out, "{rendered}")
+                                            .and_then(|()| out.flush())
+                                            .map_err(|e| RuntimeError::new(e.to_string()))?;
                                     }
+                                    events.push(AssistantEvent::TextDelta(content.to_string()));
+                                }
+                            }
+
+                            // Tool calls
+                            if let Some(tool_calls) =
+                                delta.get("tool_calls").and_then(|tc| tc.as_array())
+                            {
+                                for tc in tool_calls {
+                                    accumulate_tool_call(&mut pending_tools, tc);
                                 }
                             }
                         }
 
-                        // Check finish_reason
-                        if let Some(reason) = choice.get("finish_reason").and_then(|r| r.as_str())
-                        {
-                            if reason == "tool_calls" || reason == "stop" {
-                                flush_pending_tools(
-                                    &mut pending_tools,
-                                    out,
-                                    &mut events,
-                                )?;
+                        // OE2 (#249): flush on ANY non-empty finish_reason,
+                        // not just stop/tool_calls. Non-standard terminal
+                        // values (length / content_filter / max_output /
+                        // sensitive …) are emitted by some compat providers.
+                        // Not logical ToolUse loss-prevention — the
+                        // `Ensure MessageStop` fallback below would still
+                        // drain leftover pending_tools into events — but
+                        // flushing here keeps in-stream ordering AND the
+                        // per-tool terminal rendering (`flush_pending_tools`
+                        // prints the tool-call start line; the fallback
+                        // drain does not).
+                        if let Some(reason) = finish_reason {
+                            if reason == "length" || reason == "content_filter" {
+                                eprintln!(
+                                    "\x1b[33m  OpenAI stream finished with reason='{reason}' — output may be truncated or filtered\x1b[0m"
+                                );
                             }
+                            flush_pending_tools(&mut pending_tools, out, &mut events)?;
                         }
                     }
                 }
@@ -1204,5 +1364,187 @@ mod tests {
         ));
         // Negative: empty body must not classify (fail-safe).
         assert!(!is_stream_options_unknown_field_error(""));
+    }
+
+    // #249 v0.4.15: clean-EOF completion-vs-truncation truth table.
+    // Mirrors api/src/client.rs should_retry_on_premature_eof_truth_table.
+    // Columns: observed_done × observed_finish_reason × nothing_emitted ×
+    //          retries_remaining → StreamEofAction.
+    #[test]
+    fn stream_eof_action_truth_table() {
+        use StreamEofAction::*;
+
+        // --- Completion via [DONE] (legacy / OpenAI canonical) ---
+        // [DONE] seen → Complete regardless of finish_reason / emitted / retries.
+        assert_eq!(stream_eof_action(true, false, false, 2), Complete);
+        assert_eq!(stream_eof_action(true, false, true, 0), Complete);
+        assert_eq!(stream_eof_action(true, true, false, 2), Complete);
+
+        // --- Completion via finish_reason, NO [DONE] (#249 MiniMax core) ---
+        // finish_reason seen + content emitted + clean EOF → Complete, NOT error.
+        assert_eq!(stream_eof_action(false, true, false, 2), Complete);
+        // finish_reason seen even with retries exhausted → still Complete.
+        assert_eq!(stream_eof_action(false, true, false, 0), Complete);
+        // finish_reason seen and nothing emitted (terminal-only choice) →
+        // Complete (don't waste a restart on a finished-but-empty response).
+        assert_eq!(stream_eof_action(false, true, true, 2), Complete);
+
+        // --- Genuine truncation: NEITHER signal, content already emitted ---
+        // Cannot restart (would duplicate output) → Truncated (hard error).
+        assert_eq!(stream_eof_action(false, false, false, 2), Truncated);
+        assert_eq!(stream_eof_action(false, false, false, 0), Truncated);
+
+        // --- Proxy abort before any output: NEITHER signal, nothing emitted ---
+        // Restart if budget remains, else Truncated.
+        assert_eq!(stream_eof_action(false, false, true, 2), Restart);
+        assert_eq!(stream_eof_action(false, false, true, 1), Restart);
+        assert_eq!(stream_eof_action(false, false, true, 0), Truncated);
+    }
+
+    // OE4 (#249): mid-stream error envelope detection.
+    #[test]
+    fn stream_error_detail_classification() {
+        use serde_json::json;
+        // Normal data chunk → None.
+        assert_eq!(
+            stream_error_detail(&json!({"choices": [{"delta": {"content": "hi"}}]})),
+            None
+        );
+        // No error key → None.
+        assert_eq!(stream_error_detail(&json!({"usage": {"prompt_tokens": 1}})), None);
+        // Explicit null error → None (some providers send `error: null`).
+        assert_eq!(stream_error_detail(&json!({"error": null})), None);
+        // Error object with message + string code.
+        assert_eq!(
+            stream_error_detail(
+                &json!({"error": {"message": "rate limited", "code": "rate_limit"}})
+            ),
+            Some("rate limited (rate_limit)".to_string())
+        );
+        // Error object with integer code (providers vary).
+        assert_eq!(
+            stream_error_detail(&json!({"error": {"message": "bad", "code": 400}})),
+            Some("bad (400)".to_string())
+        );
+        // Error object with `type` fallback when no `code`.
+        assert_eq!(
+            stream_error_detail(
+                &json!({"error": {"message": "nope", "type": "invalid_request_error"}})
+            ),
+            Some("nope (invalid_request_error)".to_string())
+        );
+        // Error object message only.
+        assert_eq!(
+            stream_error_detail(&json!({"error": {"message": "boom"}})),
+            Some("boom".to_string())
+        );
+        // Bare string error (some proxies).
+        assert_eq!(
+            stream_error_detail(&json!({"error": "upstream exploded"})),
+            Some("upstream exploded".to_string())
+        );
+        // Error object with neither message nor code → placeholder.
+        assert_eq!(
+            stream_error_detail(&json!({"error": {"foo": "bar"}})),
+            Some("(no message)".to_string())
+        );
+    }
+
+    // OE7 (#249): finish_reason read independently of `delta`.
+    #[test]
+    fn choice_finish_reason_handles_delta_less_and_empty() {
+        use serde_json::json;
+        // Terminal choice with finish_reason and NO delta — the core OE7
+        // case: must still be recognized.
+        assert_eq!(
+            choice_finish_reason(&json!({"finish_reason": "stop"})),
+            Some("stop")
+        );
+        // Non-standard terminal value still recognized.
+        assert_eq!(
+            choice_finish_reason(&json!({"finish_reason": "length"})),
+            Some("length")
+        );
+        // finish_reason alongside a delta.
+        assert_eq!(
+            choice_finish_reason(&json!({"delta": {"content": "x"}, "finish_reason": "tool_calls"})),
+            Some("tool_calls")
+        );
+        // Empty string finish_reason → None (not a terminal signal).
+        assert_eq!(choice_finish_reason(&json!({"finish_reason": ""})), None);
+        // Null finish_reason (mid-stream chunk) → None.
+        assert_eq!(
+            choice_finish_reason(&json!({"delta": {"content": "x"}, "finish_reason": null})),
+            None
+        );
+        // Absent finish_reason → None.
+        assert_eq!(choice_finish_reason(&json!({"delta": {"content": "x"}})), None);
+    }
+
+    // Tool-call delta accumulation across chunks.
+    #[test]
+    fn accumulate_tool_call_builds_and_concatenates() {
+        use serde_json::json;
+        let mut pending: Vec<(String, String, String)> = Vec::new();
+
+        // First delta: id + name + partial args.
+        accumulate_tool_call(
+            &mut pending,
+            &json!({"index": 0, "id": "call_1", "function": {"name": "search", "arguments": "{\"q\":"}}),
+        );
+        // Second delta (same index): only more args — id/name must persist,
+        // args concatenate.
+        accumulate_tool_call(
+            &mut pending,
+            &json!({"index": 0, "function": {"arguments": "\"rust\"}"}}),
+        );
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].0, "call_1");
+        assert_eq!(pending[0].1, "search");
+        assert_eq!(pending[0].2, "{\"q\":\"rust\"}");
+
+        // A second tool at index 1 must not clobber index 0.
+        accumulate_tool_call(
+            &mut pending,
+            &json!({"index": 1, "id": "call_2", "function": {"name": "fetch", "arguments": "{}"}}),
+        );
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[0].0, "call_1"); // unchanged
+        assert_eq!(pending[1].0, "call_2");
+        assert_eq!(pending[1].1, "fetch");
+        assert_eq!(pending[1].2, "{}");
+
+        // Missing index defaults to slot 0 (OpenAI always sends index; this
+        // is the documented fallback, not a guarantee of correctness for
+        // parallel tool calls — see OE6 deferred to v0.4.16).
+        let mut p2: Vec<(String, String, String)> = Vec::new();
+        accumulate_tool_call(&mut p2, &json!({"id": "x", "function": {"name": "n"}}));
+        assert_eq!(p2.len(), 1);
+        assert_eq!(p2[0].0, "x");
+    }
+
+    // OE3 (#249): SSE `data:` payload parsing tolerates missing space.
+    #[test]
+    fn sse_data_payload_tolerates_missing_space() {
+        // Canonical OpenAI form (one space).
+        assert_eq!(sse_data_payload("data: {\"x\":1}"), Some("{\"x\":1}"));
+        // No space after colon (OE3 core — some compat providers).
+        assert_eq!(sse_data_payload("data:{\"x\":1}"), Some("{\"x\":1}"));
+        // [DONE] sentinel both ways.
+        assert_eq!(sse_data_payload("data: [DONE]"), Some("[DONE]"));
+        assert_eq!(sse_data_payload("data:[DONE]"), Some("[DONE]"));
+        // Extra surrounding whitespace is trimmed.
+        assert_eq!(sse_data_payload("data:   spaced  "), Some("spaced"));
+        // Empty payload (harmless — serde parse fails downstream, skipped).
+        assert_eq!(sse_data_payload("data:"), Some(""));
+        // Non-data field lines → None (loop skips them).
+        assert_eq!(sse_data_payload("event: message"), None);
+        assert_eq!(sse_data_payload("id: 42"), None);
+        assert_eq!(sse_data_payload("retry: 1000"), None);
+        // A field that merely starts with "data" but isn't "data:" → None.
+        assert_eq!(sse_data_payload("database: x"), None);
+        // Blank / comment lines → None.
+        assert_eq!(sse_data_payload(""), None);
+        assert_eq!(sse_data_payload(": keep-alive"), None);
     }
 }
