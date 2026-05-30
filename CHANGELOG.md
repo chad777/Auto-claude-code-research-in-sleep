@@ -1,5 +1,92 @@
 # ARIS-Code Changelog
 
+## v0.4.16 (2026-05-30)
+
+A **REPL UX + provider-hardening** release built on a zero-regression
+discipline: before any refactor, 64 characterization ("golden") tests were
+written to lock the *current* behavior of every provider-routing, pricing,
+reviewer, subagent, and REPL surface the changes would touch; those tests
+stayed green through every subsequent commit, so a regression would have
+failed at the source. Reviewed phase-by-phase by Codex MCP (gpt-5.5 xhigh)
+plus a final integration pass. Design + the full 96-case behavior matrix:
+`idea-stage/v0.4.16/{plan.md,design_raw.json,p8_design.json}`.
+
+### 🆕 REPL command history + Ctrl+R search ([#274](https://github.com/wanshuiyin/Auto-claude-code-research-in-sleep/issues/274))
+
+Two purely-additive interactive-shell features (Up/Down history navigation
+already worked in-session; this adds the rest):
+
+- **Cross-session persistence** — submitted prompts are saved to
+  `~/.config/aris/history` and reloaded on startup, so history survives
+  restarts. The file is `0600`; an `ARIS_NO_HISTORY` env var is a
+  kill-switch (load + save become no-ops); a **disk-only** secret-skip
+  heuristic refuses to persist a line that looks like a credential
+  (`sk-…` key shape, known credential env names incl. AWS, `password=` /
+  `api_key:` / `--api-key value` forms, long high-entropy tokens) — the
+  line still enters in-memory history (so in-session Up/Down is
+  unchanged), only the on-disk copy is withheld. Best-effort: a write
+  failure never breaks the REPL.
+- **Ctrl+R reverse incremental search** (`(reverse-i-search)\`query':`,
+  bash-style): type to narrow, Ctrl+R for the next older match, Enter to
+  load the match into the buffer (you still press Enter to submit), Esc /
+  Ctrl+C / Ctrl+G to cancel and restore. CJK/wide-char-aware single-line
+  rendering; no new dependency (built on the existing crossterm input
+  layer). No existing key binding or render path changed.
+
+### 🔒 OpenAI-family subagents now fail loud (stops a credential leak)
+
+Previously, when the main session used an OpenAI-family executor
+(Kimi / GLM / Gemini / MiniMax / OpenAI / …), spawning a sub-agent would
+**silently fall back to building an Anthropic client and bill the user's
+Anthropic OAuth/Keychain credential** with a wrong model name. The
+sub-agent runtime now detects this (`EXECUTOR_PROVIDER == "openai"`) and
+returns a clear error instead — *"subagents currently require an
+Anthropic-family executor; OpenAI-family subagent dispatch lands in
+v0.4.17. Your main session is unaffected."* — carrying no credential
+names. Anthropic-family executors (native + anthropic-compat) are
+completely unaffected (their `EXECUTOR_PROVIDER` is never `"openai"`, so
+the guard cannot fire). Full OpenAI-family sub-agent **routing** is a
+larger cross-crate change (lowering the OpenAI executor into a shared
+crate) scheduled for v0.4.17; this release closes the credential-leak
+window in the meantime.
+
+### 🧱 Provider-classification groundwork (no behavior change)
+
+- The three byte-identical word-boundary matchers
+  (`openai_executor::word_match`, `usage::has_word`,
+  `tools::reviewer_word_match`) are consolidated into one canonical
+  `runtime::word_match`; the three former functions now forward to it, so
+  every call site and every routing/pricing/reviewer truth value is
+  unchanged. (`usage::provider_match`, a different and more permissive
+  matcher, is deliberately left separate.)
+- A new `runtime::ProviderFamily` classifier
+  (`AnthropicNative` / `AnthropicCompat` / `OpenAiCompat` / `Unknown`,
+  exact-match) names the executor families as a *pure type* — it reads no
+  env, picks no endpoint, and is wired into no routing yet (P8 / v0.4.17
+  will consume it). `Unknown` is intentional so a future dispatch can't
+  misclassify an unrecognized provider string.
+
+### Zero-regression / tests
+
+`cargo test` (single-threaded, CI mode): runtime 164, aris-cli 128,
+tools 49, commands 5 — all green, including the 64 Phase-0
+characterization tests that lock the unchanged routing/pricing/reviewer/
+push_history behavior. The dangerous code (config env-writing, the
+order-sensitive pricing chain, reviewer routing, `provider_match`, the
+in-memory `push_history` contract, every existing key binding) is
+byte-identical.
+
+### Deferred to v0.4.17
+
+Full OpenAI-family sub-agent routing (headless OpenAI client lowered into
+the `api` crate + a `SubagentExecutorClient` enum), and the `api`-crate
+`read_api_key_*` test isolation (they read the machine's real macOS
+Keychain OAuth credential, so they fail locally on a box with Claude Code
+installed; CI is unaffected — the real fix needs a Keychain gate, not just
+a config-dir override). Hook-schema preservation + MCP manager production
+wiring remain v0.4.17 scope; CL2 / OE5 / OE6 / OE8 streaming siblings and
+the sandbox / rustls / JSON architecture work remain v0.5.0.
+
 ## v0.4.15 (2026-05-29)
 
 A focused **OpenAI-compatible streaming robustness** hotfix. Closes
