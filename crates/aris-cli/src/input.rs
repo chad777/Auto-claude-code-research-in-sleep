@@ -29,6 +29,63 @@ pub enum ReadOutcome {
     Exit,
 }
 
+/// Outcome of the Ctrl+R reverse-search submode (v0.4.16 Track A).
+/// `Accept` carries the chosen history entry as chars (loaded into the buffer;
+/// the user then presses Enter to submit). `Cancel` restores the prior buffer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReverseSearchResult {
+    Accept(Vec<char>),
+    Cancel,
+}
+
+/// Find the index of the newest history entry at or before `from_idx` whose
+/// text contains `query` (case-insensitive, substring). History is oldest-first
+/// so we scan downward (newest → oldest) starting at `from_idx`.
+///
+/// An empty `query` matches the entry at `from_idx` itself (bash behaviour:
+/// the most recent candidate). Returns `None` if no entry matches.
+///
+/// Pure + char-based (CJK safe). Extracted as a free function so the match
+/// selection logic is unit-testable without a TTY.
+fn reverse_search_match(history: &[String], query: &[char], from_idx: usize) -> Option<usize> {
+    if history.is_empty() {
+        return None;
+    }
+    let query_lower: Vec<char> = query
+        .iter()
+        .flat_map(|c| c.to_lowercase())
+        .collect();
+    let start = from_idx.min(history.len().saturating_sub(1));
+    for idx in (0..=start).rev() {
+        if entry_contains(&history[idx], &query_lower) {
+            return Some(idx);
+        }
+    }
+    None
+}
+
+/// Case-insensitive substring test where `needle_lower` is already lowercased
+/// chars. An empty needle matches everything. Char-based (CJK safe).
+fn entry_contains(haystack: &str, needle_lower: &[char]) -> bool {
+    if needle_lower.is_empty() {
+        return true;
+    }
+    let hay: Vec<char> = haystack.chars().flat_map(|c| c.to_lowercase()).collect();
+    if needle_lower.len() > hay.len() {
+        return false;
+    }
+    hay.windows(needle_lower.len())
+        .any(|w| w == needle_lower)
+}
+
+/// Erase the reverse-search prompt line and park the cursor at column 0 so the
+/// caller's next `redraw` (which starts from a fresh draw) is valid.
+fn clear_reverse_search(stdout: &mut io::Stdout) -> io::Result<()> {
+    stdout.queue(cursor::MoveToColumn(0))?;
+    stdout.queue(terminal::Clear(ClearType::FromCursorDown))?;
+    stdout.flush()
+}
+
 pub struct LineEditor {
     prompt: String,
     completions: Vec<(String, String)>,
@@ -49,6 +106,24 @@ impl LineEditor {
         let entry = entry.into();
         if !entry.trim().is_empty() {
             self.history.push(entry);
+        }
+    }
+
+    /// v0.4.16 Track A (additive): seed the in-memory history Vec from a
+    /// persisted history file before the first `read_line`. Uses the *same*
+    /// blank filter as `push_history` (`!entry.trim().is_empty()`); the loaded
+    /// entries are appended oldest-first so Up/Down indexing reproduces exactly.
+    ///
+    /// Best-effort: a missing/corrupt file (or the `ARIS_NO_HISTORY`
+    /// kill-switch) yields a silent empty start — no error surfaces. Pre-existing
+    /// in-memory entries are preserved (loaded entries are appended after them).
+    pub fn load_history_from(&mut self, path: &std::path::PathBuf) {
+        for entry in crate::history::load_history(path) {
+            // `load_history` already applied the blank filter, but re-check so
+            // this method is independently correct regardless of caller.
+            if !entry.trim().is_empty() {
+                self.history.push(entry);
+            }
         }
     }
 
@@ -286,6 +361,52 @@ impl LineEditor {
                     sel = 0;
                 }
 
+                // ── Ctrl+R: reverse incremental history search (additive) ─────
+                // v0.4.16 Track A. Today this lands in `_ => continue` and is
+                // swallowed; the regular-char arm below requires NONE|SHIFT so
+                // Char('r')+CONTROL can never reach it. Adding this arm does not
+                // change the reachability of any existing arm. The submode owns
+                // its own event loop + redraw and never toggles raw mode or
+                // bracketed paste (it runs inside read_line's lifecycle).
+                (KeyCode::Char('r'), KeyModifiers::CONTROL) => {
+                    // Snapshot the FULL pre-search state so Cancel is a true
+                    // no-op (buffer + cursor + dropdown selection + history-nav).
+                    let initial_buf = buf.clone();
+                    let initial_cursor = cursor_pos;
+                    let initial_sel = sel;
+                    let initial_history_idx = history_idx;
+                    let initial_saved_buf = saved_buf.clone();
+                    // The current input may have wrapped across several physical
+                    // rows; move the cursor back to the input start row first so
+                    // the submode draws over (and clears) the whole input area,
+                    // not just the current row. After this the cursor is at the
+                    // input start and the submode's single-line prompt sits on
+                    // exactly one row.
+                    move_to_input_start(&mut stdout, &render, terminal_width())?;
+                    match self.reverse_search(&mut stdout)? {
+                        ReverseSearchResult::Accept(entry) => {
+                            buf = entry;
+                            cursor_pos = buf.len();
+                            sel = 0;
+                            history_idx = None;
+                            saved_buf = None;
+                        }
+                        ReverseSearchResult::Cancel => {
+                            buf = initial_buf;
+                            cursor_pos = initial_cursor.min(buf.len());
+                            sel = initial_sel;
+                            history_idx = initial_history_idx;
+                            saved_buf = initial_saved_buf;
+                        }
+                    }
+                    // The submode erased its single-line prompt and parked the
+                    // cursor at column 0 of the input start row. Reset the row
+                    // anchor so the next `redraw`'s `move_to_input_start` does
+                    // not `MoveToPreviousLine` past the (now single-line) area.
+                    render.cursor_row = 0;
+                    // Fall through to the existing redraw at the end of the loop.
+                }
+
                 // ── Regular character ────────────────────────────────────────
                 (KeyCode::Char(c), mods)
                     if mods == KeyModifiers::NONE || mods == KeyModifiers::SHIFT =>
@@ -301,6 +422,154 @@ impl LineEditor {
 
             self.redraw(&mut stdout, &mut render, &buf, cursor_pos, sel)?;
         }
+    }
+
+    /// Ctrl+R reverse incremental history search submode (v0.4.16 Track A).
+    ///
+    /// Self-contained: owns its own event loop + a single search-prompt line
+    /// that it draws and then erases on exit. It does **not** toggle raw mode or
+    /// bracketed paste (it runs inside `read_line`'s lifecycle) and never emits
+    /// `Exit`/`Cancel` out of `read_line_raw`.
+    ///
+    /// On exit it clears its own prompt line and parks the cursor at column 0 of
+    /// the (now empty) input line, so the caller's subsequent `redraw` —
+    /// starting from `render.cursor_row == 0` after a fresh draw — stays valid.
+    ///
+    /// Keys: printable char → extend query (re-scan newest→oldest); Backspace →
+    /// shrink query; Ctrl+R again → step to the next older match; Enter → Accept
+    /// the matched entry into the buffer; Esc / Ctrl+C / Ctrl+G → Cancel; other
+    /// keys ignored. Non-TTY callers never reach here (fallback skips raw loop).
+    fn reverse_search(&self, stdout: &mut io::Stdout) -> io::Result<ReverseSearchResult> {
+        let mut query: Vec<char> = Vec::new();
+        // The scan anchor is always the newest entry on a query change; Ctrl+R
+        // steps from the current match minus one. We don't keep it as a
+        // persistent local because every branch recomputes the anchor it needs.
+        let newest = || self.history.len().saturating_sub(1);
+        let mut matched: Option<usize> = if self.history.is_empty() {
+            None
+        } else {
+            reverse_search_match(&self.history, &query, newest())
+        };
+
+        self.draw_reverse_search(stdout, &query, matched)?;
+
+        loop {
+            let ev = event::read()?;
+
+            // Ignore resize/paste inside the submode (keep the prompt as-is);
+            // a resize just redraws the single prompt line.
+            match ev {
+                Event::Resize(..) => {
+                    self.draw_reverse_search(stdout, &query, matched)?;
+                    continue;
+                }
+                Event::Paste(_) => continue,
+                _ => {}
+            }
+
+            let Event::Key(KeyEvent {
+                code,
+                modifiers,
+                kind,
+                ..
+            }) = ev
+            else {
+                continue;
+            };
+            if kind == KeyEventKind::Release {
+                continue;
+            }
+
+            match (code, modifiers) {
+                // Cancel: restore the prior buffer.
+                (KeyCode::Esc, _)
+                | (KeyCode::Char('c' | 'g'), KeyModifiers::CONTROL) => {
+                    // Buffer restore is handled by the caller (read_line_raw).
+                    clear_reverse_search(stdout)?;
+                    return Ok(ReverseSearchResult::Cancel);
+                }
+
+                // Accept the current match (or, if none, cancel without change).
+                (KeyCode::Enter, _) => {
+                    clear_reverse_search(stdout)?;
+                    return match matched {
+                        Some(idx) => {
+                            Ok(ReverseSearchResult::Accept(self.history[idx].chars().collect()))
+                        }
+                        None => Ok(ReverseSearchResult::Cancel),
+                    };
+                }
+
+                // Step to the next older match.
+                (KeyCode::Char('r'), KeyModifiers::CONTROL) => {
+                    if let Some(cur) = matched {
+                        if cur > 0 {
+                            if let Some(next) =
+                                reverse_search_match(&self.history, &query, cur - 1)
+                            {
+                                matched = Some(next);
+                            }
+                        }
+                    }
+                    self.draw_reverse_search(stdout, &query, matched)?;
+                }
+
+                // Shrink the query.
+                (KeyCode::Backspace, _) => {
+                    query.pop();
+                    matched = reverse_search_match(&self.history, &query, newest());
+                    self.draw_reverse_search(stdout, &query, matched)?;
+                }
+
+                // Extend the query with a printable char (re-scan newest→oldest).
+                (KeyCode::Char(c), mods)
+                    if mods == KeyModifiers::NONE || mods == KeyModifiers::SHIFT =>
+                {
+                    query.push(c);
+                    matched = reverse_search_match(&self.history, &query, newest());
+                    self.draw_reverse_search(stdout, &query, matched)?;
+                }
+
+                // Ignore everything else (don't leak it to the outer loop).
+                _ => continue,
+            }
+        }
+    }
+
+    /// Draw the single reverse-search prompt line in place: clear from column 0
+    /// downward, print the `reverse-i-search` prompt + current match, then park
+    /// the cursor at column 0 of that same line (we never leave the search line
+    /// during the submode, so a one-line render is self-consistent).
+    fn draw_reverse_search(
+        &self,
+        stdout: &mut io::Stdout,
+        query: &[char],
+        matched: Option<usize>,
+    ) -> io::Result<()> {
+        let query_str: String = query.iter().collect();
+        let match_str = matched.map_or("", |idx| self.history[idx].as_str());
+        let prefix = format!("(reverse-i-search)`{query_str}': ");
+        // Keep the whole search line to a SINGLE terminal row. A long history
+        // match (or a long query) would otherwise wrap, after which the
+        // submode's "park cursor at one row" bookkeeping — and the caller's
+        // `render.cursor_row = 0` — would misanchor the next redraw. Clip by
+        // DISPLAY CELLS (CJK/wide-char aware), budget `width-1` so a wide char
+        // landing exactly at the right edge can't push to the next row.
+        let width = terminal_width().saturating_sub(1);
+        let prefix_w = visible_len(&prefix);
+        let (prefix_out, match_out) = if prefix_w >= width {
+            (clip_cells(&prefix, width), String::new())
+        } else {
+            (prefix, clip_cells(match_str, width - prefix_w))
+        };
+        stdout.queue(cursor::MoveToColumn(0))?;
+        stdout.queue(terminal::Clear(ClearType::FromCursorDown))?;
+        stdout.queue(SetForegroundColor(Color::DarkGrey))?;
+        stdout.queue(Print(prefix_out))?;
+        stdout.queue(ResetColor)?;
+        stdout.queue(Print(match_out))?;
+        stdout.queue(cursor::MoveToColumn(0))?;
+        stdout.flush()
     }
 
     fn compute_matches(&self, line: &str) -> Vec<usize> {
@@ -845,6 +1114,36 @@ fn clip(s: &str, max: usize) -> String {
     format!("{truncated}…")
 }
 
+/// Truncate `s` to at most `max_cells` **display columns** (CJK/wide-char
+/// aware via [`char_width`]), appending an ellipsis `…` when truncated. Unlike
+/// [`clip`] (which counts chars), this counts display cells, so a run of wide
+/// characters cannot overflow a fixed-width line — required by the Ctrl+R
+/// search prompt to stay a single terminal row (codex Phase-1 fix). Assumes
+/// `s` has no ANSI escapes (the search prompt builds plain text).
+fn clip_cells(s: &str, max_cells: usize) -> String {
+    if max_cells == 0 {
+        return String::new();
+    }
+    let total: usize = s.chars().map(char_width).sum();
+    if total <= max_cells {
+        return s.to_string();
+    }
+    // Reserve one cell for the ellipsis.
+    let budget = max_cells.saturating_sub(1);
+    let mut out = String::new();
+    let mut used = 0usize;
+    for ch in s.chars() {
+        let w = char_width(ch);
+        if used + w > budget {
+            break;
+        }
+        out.push(ch);
+        used += w;
+    }
+    out.push('…');
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -889,6 +1188,24 @@ mod tests {
     fn clip_truncates_long_strings() {
         assert_eq!(clip("hello world", 5), "hell…");
         assert_eq!(clip("short", 10), "short");
+    }
+
+    #[test]
+    fn clip_cells_truncates_by_display_width() {
+        // ASCII (1 cell each): same as clip.
+        assert_eq!(clip_cells("hello", 10), "hello");
+        assert_eq!(clip_cells("hello world", 5), "hell…");
+        // Wide CJK chars are 2 cells each: "中文" fits exactly in 4.
+        assert_eq!(clip_cells("中文", 4), "中文");
+        assert_eq!(clip_cells("中文字", 3), "中…");
+        // The load-bearing property: a run of wide chars must NEVER exceed the
+        // budget in DISPLAY cells (clip(), counting chars, would fail this).
+        let wide = "一二三四五"; // 5 chars = 10 cells
+        let out = clip_cells(wide, 5);
+        let cells: usize = out.chars().map(char_width).sum();
+        assert!(cells <= 5, "clipped display width {cells} must be <= 5");
+        // Zero budget → empty.
+        assert_eq!(clip_cells("x", 0), "");
     }
 
     #[test]
@@ -967,6 +1284,84 @@ mod tests {
         ed.push_history("/status");
         ed.push_history("/status");
         assert_eq!(ed.history.len(), 2);
+    }
+
+    // === v0.4.16 Track A: reverse_search match-selection logic (pure, no TTY).
+    // The terminal-rendering side (prompt draw/erase + cursor parking) is
+    // exercised only by the manual TTY smoke test in Phase 3.
+
+    fn hist(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn chars(s: &str) -> Vec<char> {
+        s.chars().collect()
+    }
+
+    #[test]
+    fn reverse_search_empty_query_picks_newest_at_anchor() {
+        let h = hist(&["alpha", "beta", "gamma"]);
+        // Empty query, anchor at newest (idx 2) → newest entry.
+        assert_eq!(super::reverse_search_match(&h, &[], 2), Some(2));
+        // Anchor lower → that entry.
+        assert_eq!(super::reverse_search_match(&h, &[], 1), Some(1));
+    }
+
+    #[test]
+    fn reverse_search_finds_newest_match_first() {
+        let h = hist(&["run tests", "fix bug", "run server", "deploy"]);
+        // Query "run", anchor at newest → newest matching = idx 2 ("run server").
+        let q = chars("run");
+        assert_eq!(super::reverse_search_match(&h, &q, h.len() - 1), Some(2));
+        // Step older from idx 1 → idx 0 ("run tests").
+        assert_eq!(super::reverse_search_match(&h, &q, 1), Some(0));
+    }
+
+    #[test]
+    fn reverse_search_is_case_insensitive() {
+        let h = hist(&["Hello World", "FOO"]);
+        assert_eq!(super::reverse_search_match(&h, &chars("hello"), 1), Some(0));
+        assert_eq!(super::reverse_search_match(&h, &chars("foo"), 1), Some(1));
+    }
+
+    #[test]
+    fn reverse_search_handles_cjk_substring() {
+        let h = hist(&["请帮我写代码", "explain this"]);
+        // CJK substring match is char-based, not byte-based.
+        assert_eq!(super::reverse_search_match(&h, &chars("写代码"), 1), Some(0));
+        assert_eq!(super::reverse_search_match(&h, &chars("没有"), 1), None);
+    }
+
+    #[test]
+    fn reverse_search_no_match_returns_none() {
+        let h = hist(&["alpha", "beta"]);
+        assert_eq!(super::reverse_search_match(&h, &chars("zzz"), 1), None);
+    }
+
+    #[test]
+    fn reverse_search_empty_history_returns_none() {
+        let h: Vec<String> = Vec::new();
+        assert_eq!(super::reverse_search_match(&h, &chars("x"), 0), None);
+        assert_eq!(super::reverse_search_match(&h, &[], 0), None);
+    }
+
+    #[test]
+    fn reverse_search_clamps_out_of_range_anchor() {
+        let h = hist(&["one", "two"]);
+        // Anchor past the end is clamped to the last index.
+        assert_eq!(super::reverse_search_match(&h, &[], 99), Some(1));
+        assert_eq!(super::reverse_search_match(&h, &chars("one"), 99), Some(0));
+    }
+
+    #[test]
+    fn reverse_search_result_accept_loads_entry() {
+        // Mirror the caller mapping: Accept(entry) → buf = entry.
+        let entry: Vec<char> = chars("/research-review");
+        let result = super::ReverseSearchResult::Accept(entry.clone());
+        match result {
+            super::ReverseSearchResult::Accept(e) => assert_eq!(e, entry),
+            super::ReverseSearchResult::Cancel => panic!("expected Accept"),
+        }
     }
 
     #[test]

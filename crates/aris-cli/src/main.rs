@@ -1,4 +1,5 @@
 mod config;
+mod history;
 mod init;
 mod input;
 mod memories;
@@ -1143,6 +1144,13 @@ fn run_repl(
         slash_command_completion_candidates(),
     );
 
+    // v0.4.16 Track A (additive): seed in-memory history from the persisted
+    // file (`~/.config/aris/history`) before the first read_line. Best-effort —
+    // missing/corrupt file or the ARIS_NO_HISTORY kill-switch → silent empty
+    // start. This only adds entries to the existing in-memory Vec.
+    let history_path = history::history_path();
+    editor.load_history_from(&history_path);
+
     // Install Ctrl+C handler: set runtime interrupt flag instead of killing the process
     let _ = ctrlc::set_handler(|| {
         runtime::set_interrupt();
@@ -1181,6 +1189,12 @@ fn run_repl(
                     }
                     continue;
                 }
+                // v0.4.16 Track A: persist the submitted entry to disk in
+                // addition to the (unchanged) in-memory push. The disk append
+                // honors the ARIS_NO_HISTORY kill-switch and a disk-only
+                // secret-skip; the in-memory push below is byte-identical to
+                // before so session-local Up/Down behaviour is unchanged.
+                history::append_entry(&history_path, &input);
                 editor.push_history(input);
                 // Visual separator before assistant response
                 let term_w = crossterm::terminal::size()
