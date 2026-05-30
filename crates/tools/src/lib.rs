@@ -1885,6 +1885,26 @@ fn run_agent_job(job: &AgentJob) -> Result<(), String> {
 fn build_agent_runtime(
     job: &AgentJob,
 ) -> Result<ConversationRuntime<AnthropicRuntimeClient, SubagentToolExecutor>, String> {
+    // P8 safety gate (v0.4.16): subagents are not yet routed to OpenAI-family
+    // executors. `EXECUTOR_PROVIDER == "openai"` is the exact value
+    // `apply_to_env` (config.rs) writes for executor providers openai/custom —
+    // every OpenAI-compatible menu provider (GLM/Kimi/MiniMax/Gemini/…)
+    // collapses to this literal. Without this gate an OpenAI-family main
+    // session would SILENTLY build the Anthropic client below and bill the
+    // user's Anthropic OAuth/Keychain credential. Fail loud instead. The
+    // exact-match (no trim, no lowercase) mirrors
+    // `resolve_openai_executor_config`, so the detection set is exactly the
+    // routing set and never misfires on anthropic / anthropic-compat
+    // (Category A/B), whose EXECUTOR_PROVIDER is unset/cleared. Full
+    // OpenAI-family subagent routing lands in v0.4.17. The message carries no
+    // credential names by design.
+    if std::env::var("EXECUTOR_PROVIDER").as_deref() == Ok("openai") {
+        return Err("subagents currently require an Anthropic-family executor; \
+                    OpenAI-family subagent dispatch lands in v0.4.17. \
+                    Your main session is unaffected."
+            .to_string());
+    }
+
     let model = job
         .manifest
         .model
@@ -5596,12 +5616,14 @@ printf 'pwsh:%s' "$1"
     // ===================================================================
     // B. SUBAGENT (build_agent_runtime) characterization — Category A/B/C
     //
-    // `build_agent_runtime` (tools/src/lib.rs) is PROVIDER-BLIND today: it
-    // unconditionally constructs an `AnthropicRuntimeClient`, which calls
-    // `AnthropicClient::from_env()` and NEVER reads EXECUTOR_PROVIDER /
-    // EXECUTOR_API_KEY / resolve_openai_executor_config. P8 will add provider
-    // dispatch; these tests lock the current behavior the refactor must not
-    // regress (A, B) and document the current-broken state (C).
+    // For Anthropic-family executors (A: anthropic native, B: anthropic-compat)
+    // `build_agent_runtime` constructs an `AnthropicRuntimeClient` exactly as
+    // before — EXECUTOR_PROVIDER is unset/cleared for them so the P8 v0.4.16
+    // guard never fires; these tests lock that unchanged behavior.
+    // For OpenAI-family executors (C: EXECUTOR_PROVIDER=="openai") the P8
+    // v0.4.16 minimal guard now FAILS LOUD (was: silently built an Anthropic
+    // client and billed the user's Anthropic credential). The C tests assert
+    // that fail-loud contract; full OpenAI subagent routing lands in v0.4.17.
     //
     // The auth BRANCH (x-api-key vs Bearer) is not observable through the
     // built `ConversationRuntime` (its inner api_client is private with no
@@ -5710,61 +5732,57 @@ printf 'pwsh:%s' "$1"
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    // Category C (current-broken baseline) + PROVIDER-BLINDNESS lock.
-    //
-    // build_agent_runtime ignores EXECUTOR_PROVIDER / EXECUTOR_API_KEY
-    // entirely. With both ANTHROPIC_* cleared, setting EXECUTOR_PROVIDER=openai
-    // + EXECUTOR_API_KEY must produce the SAME outcome as having NO executor
-    // env at all — proving the function is provider-blind. This invariant is
-    // independent of any machine-local OAuth/Keychain fallback (both runs see
-    // the identical OAuth state), so it is deterministic across dev + CI.
-    //
-    // We assert outcome-equality (Ok-vs-Ok or Err-vs-Err), which is what the
-    // P8 refactor will deliberately BREAK for the openai case. After P8 the
-    // openai run should diverge (build an OpenAI-backed runtime) while the
-    // anthropic-blind run is unchanged. Today they must be identical.
+    // P8 v0.4.16 (minimal error-guard): build_agent_runtime now FAILS LOUD for
+    // an OpenAI-family executor instead of silently building an Anthropic
+    // client (which would bill the user's Anthropic credential). The baseline
+    // (anthropic) path is unchanged. Full OpenAI subagent routing lands in
+    // v0.4.17, at which point the openai run should build an OpenAI runtime
+    // instead of erroring.
     #[test]
-    fn char_build_agent_runtime_is_provider_blind_for_openai() {
+    fn char_build_agent_runtime_rejects_openai_provider() {
         let _g = env_lock_reviewer().lock().unwrap();
         let _snap = SubagentEnvSnapshot::capture_and_clear();
-        // No ANTHROPIC_* set; whatever OAuth/Keychain fallback exists is the
-        // SAME for both runs below.
-
-        // Run 1: provider-blind baseline (no executor env).
+        // No ANTHROPIC_* / EXECUTOR_* set: the anthropic baseline path is
+        // whatever OAuth/Keychain fallback exists — we do NOT force its outcome
+        // (a dev box with Claude Code can legally build Ok). We only assert it
+        // does not hit the new openai guard.
         let (job1, dir1) = capture_agent_job("char-runtime-c1");
-        let blind_ok = build_agent_runtime(&job1).is_ok();
+        let baseline = build_agent_runtime(&job1);
         let _ = std::fs::remove_dir_all(dir1);
+        if let Err(msg) = &baseline {
+            assert!(
+                !msg.contains("Anthropic-family"),
+                "baseline (no EXECUTOR_PROVIDER) must NOT hit the openai guard: {msg}"
+            );
+        }
 
-        // Run 2: openai executor env present, but build_agent_runtime ignores it.
+        // EXECUTOR_PROVIDER=openai must now hard-error with the guard message
+        // (no more silent provider-blind Anthropic build).
         std::env::set_var("EXECUTOR_PROVIDER", "openai");
         std::env::set_var("EXECUTOR_API_KEY", "sk-openai-exec");
         std::env::set_var("EXECUTOR_BASE_URL", "https://api.openai.com/v1");
         let (job2, dir2) = capture_agent_job("char-runtime-c2");
-        let openai_ok = build_agent_runtime(&job2).is_ok();
+        let openai = build_agent_runtime(&job2);
         let _ = std::fs::remove_dir_all(dir2);
 
-        assert_eq!(
-            blind_ok, openai_ok,
-            "build_agent_runtime is PROVIDER-BLIND today: EXECUTOR_PROVIDER=openai must \
-             yield the SAME outcome as no executor env (it ignores EXECUTOR_* and \
-             EXECUTOR_API_KEY entirely). P8 will deliberately break this for openai."
+        // `ConversationRuntime` is not `Debug`, so use let-else rather than
+        // `expect_err` to pull out the error.
+        let Err(err) = openai else {
+            panic!("EXECUTOR_PROVIDER=openai must fail loud, not build an Anthropic client");
+        };
+        assert!(
+            err.contains("Anthropic-family") && err.contains("v0.4.17"),
+            "openai subagent must fail with the v0.4.16 guard message. got: {err}"
         );
     }
 
-    // Category C error-message lock (conditional on no OAuth fallback).
-    //
-    // With NO ANTHROPIC_* env AND no usable saved/Keychain OAuth token,
-    // build_agent_runtime surfaces the Anthropic MissingApiKey message
-    // because the client is built blindly from Anthropic env — EXECUTOR_API_KEY
-    // is never consulted. We DO NOT force an Err (OAuth/Keychain can legally
-    // make it Ok on a dev machine with Claude Code installed); instead we lock
-    // the SHAPE: IF it errs, the error is the Anthropic auth message, never an
-    // OpenAI/executor one. This documents the current-broken Category C state.
-    // Two explicit arms (Err shape-lock + Ok OAuth-fallback doc) are kept on
-    // purpose as a characterization record; clippy would collapse to `if let`.
-    #[allow(clippy::single_match_else)]
+    // P8 v0.4.16 fail-loud contract: EXECUTOR_PROVIDER=openai now returns the
+    // guard Err DETERMINISTICALLY (no longer depends on OAuth/Keychain state,
+    // because the guard returns before any Anthropic client is built), and the
+    // message carries NO credential env names (anti-leak, mirroring the v0.4.14
+    // S9 redaction posture).
     #[test]
-    fn char_build_agent_runtime_category_c_error_shape() {
+    fn char_build_agent_runtime_rejects_openai_with_credential_free_message() {
         let _g = env_lock_reviewer().lock().unwrap();
         let _snap = SubagentEnvSnapshot::capture_and_clear();
         std::env::set_var("EXECUTOR_PROVIDER", "openai");
@@ -5774,30 +5792,23 @@ printf 'pwsh:%s' "$1"
         let result = build_agent_runtime(&job);
         let _ = std::fs::remove_dir_all(dir);
 
-        match result {
-            Err(msg) => {
-                // Current-broken: the error path is the ANTHROPIC auth path,
-                // proving EXECUTOR_API_KEY was ignored. P8 fixes this.
-                assert!(
-                    msg.contains("ANTHROPIC_AUTH_TOKEN")
-                        || msg.contains("ANTHROPIC_API_KEY")
-                        || msg.to_lowercase().contains("oauth"),
-                    "Category C error must come from the Anthropic auth path, not the \
-                     unused EXECUTOR_API_KEY. got: {msg}"
-                );
-                assert!(
-                    !msg.contains("EXECUTOR_API_KEY") && !msg.contains("OPENAI_API_KEY"),
-                    "EXECUTOR_API_KEY/OPENAI_API_KEY must NOT appear — proves they are \
-                     ignored by the provider-blind subagent path. got: {msg}"
-                );
-            }
-            Ok(_) => {
-                // A dev machine with a valid saved/Keychain OAuth token builds
-                // an Anthropic runtime regardless of EXECUTOR_PROVIDER=openai —
-                // which is ITSELF the provider-blind / current-broken behavior
-                // (the openai executor key is silently unused). Acceptable; the
-                // provider-blindness invariant is locked separately above.
-            }
-        }
+        // `ConversationRuntime` is not `Debug`; use let-else instead of expect_err.
+        let Err(msg) = result else {
+            panic!("EXECUTOR_PROVIDER=openai subagent must fail loud");
+        };
+        assert!(
+            msg.contains("Anthropic-family") && msg.contains("v0.4.17"),
+            "must be the v0.4.16 guard message: {msg}"
+        );
+        // Anti-leak: the guard message must never echo a credential env NAME
+        // nor the actual key VALUE (the sentinel set above).
+        assert!(
+            !msg.contains("ANTHROPIC_API_KEY")
+                && !msg.contains("ANTHROPIC_AUTH_TOKEN")
+                && !msg.contains("EXECUTOR_API_KEY")
+                && !msg.contains("OPENAI_API_KEY")
+                && !msg.contains("sk-openai-exec"),
+            "guard message must not leak any credential env name or value: {msg}"
+        );
     }
 }
