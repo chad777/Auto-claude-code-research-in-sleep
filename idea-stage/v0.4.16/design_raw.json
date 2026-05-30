@@ -1,0 +1,652 @@
+{
+  "summary": "Read-only baseline + design for v0.4.16 (REPL UX + Provider abstraction), organized around a ZERO-REGRESSION guarantee: exhaustively characterize current provider-routing + REPL behavior, then design behavior-preserving refactors + a characterization-test matrix that locks current behavior before any code changes.",
+  "agentCount": 5,
+  "logs": [],
+  "result": {
+    "characterization_test_matrix": [
+      {
+        "test_name": "exec_anthropic_official_endpoint",
+        "input": "apply_to_env(ForceAll): executor_provider=\"anthropic\", executor_api_key=K, executor_base_url=None",
+        "expected_output": "ANTHROPIC_API_KEY=K set; ANTHROPIC_BASE_URL UNSET; CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS UNSET; EXECUTOR_PROVIDER UNSET. resolve_openai_executor_config()=None. AuthSource::ApiKey -> header x-api-key. read_base_url=DEFAULT_BASE_URL. read_send_betas=true",
+        "covers": "anthropic native (Category A default fallback, highest-priority invariant)"
+      },
+      {
+        "test_name": "exec_anthropic_custom_url_keeps_xapikey",
+        "input": "executor_provider=\"anthropic\", executor_api_key=K, executor_base_url=Some(\"https://code.newcli.com/claude\")",
+        "expected_output": "ANTHROPIC_API_KEY=K; ANTHROPIC_BASE_URL=https://code.newcli.com/claude; CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1; EXECUTOR_PROVIDER UNSET. Still AuthSource::ApiKey -> x-api-key (NOT Bearer). send_betas=false",
+        "covers": "#158/#162 regression: anthropic+custom URL must NOT auto-switch to anthropic-compat/Bearer"
+      },
+      {
+        "test_name": "exec_anthropic_compat_bearer",
+        "input": "executor_provider=\"anthropic-compat\", executor_api_key=K, executor_base_url=Some(\"https://api.deepseek.com/anthropic\")",
+        "expected_output": "ANTHROPIC_AUTH_TOKEN=K (NOT ANTHROPIC_API_KEY); ANTHROPIC_BASE_URL set; CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1; EXECUTOR_PROVIDER UNSET. AuthSource::BearerToken -> Authorization: Bearer. send_betas=false",
+        "covers": "anthropic-compat Bearer path (the x-api-key vs Bearer bisection)"
+      },
+      {
+        "test_name": "exec_anthropic_compat_no_baseurl_edge",
+        "input": "executor_provider=\"anthropic-compat\", executor_api_key=K, executor_base_url=None",
+        "expected_output": "ANTHROPIC_AUTH_TOKEN=K set; ANTHROPIC_BASE_URL UNSET; CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS UNSET (both gated inside if-let Some(url)). Bearer auth, betas STILL ON",
+        "covers": "anthropic-compat base_url=None corner: betas-disable gated on Some(url)"
+      },
+      {
+        "test_name": "exec_openai_family",
+        "input": "executor_provider=\"openai\", executor_api_key=K, executor_base_url=Some(\"https://api.openai.com/v1\")",
+        "expected_output": "EXECUTOR_PROVIDER=openai; EXECUTOR_API_KEY=K; EXECUTOR_BASE_URL set; no ANTHROPIC_* set. resolve_openai_executor_config()=Some. OpenAI executor, bearer_auth",
+        "covers": "openai executor path + EXECUTOR_PROVIDER exact-match gate"
+      },
+      {
+        "test_name": "exec_custom_maps_to_openai",
+        "input": "executor_provider=\"custom\", executor_api_key=K, executor_base_url=Some(URL)",
+        "expected_output": "EXECUTOR_PROVIDER=openai (custom collapses); EXECUTOR_API_KEY=K; EXECUTOR_BASE_URL=URL. resolve_openai_executor_config()=Some. custom indistinguishable from openai at runtime; config.json keeps executor_provider=\"custom\" for menu echo",
+        "covers": "custom->openai collapse (runtime-indistinguishable invariant)"
+      },
+      {
+        "test_name": "exec_openai_api_key_fallback",
+        "input": "EXECUTOR_PROVIDER=openai set, EXECUTOR_API_KEY UNSET, OPENAI_API_KEY=R set",
+        "expected_output": "resolve_openai_executor_config api_key = R (fallback EXECUTOR_API_KEY -> OPENAI_API_KEY)",
+        "covers": "openai_executor api_key fallback chain"
+      },
+      {
+        "test_name": "resolve_returns_none_for_non_openai",
+        "input": "EXECUTOR_PROVIDER=\"anthropic-compat\" (or empty / unset / any non-\"openai\")",
+        "expected_output": "resolve_openai_executor_config()=None (EXACT match, no trim) -> Anthropic client path",
+        "covers": "EXECUTOR_PROVIDER exact-match=None fallback (main.rs:91 1:1 contract)"
+      },
+      {
+        "test_name": "resolve_exact_no_trim",
+        "input": "EXECUTOR_PROVIDER=\" openai \" (with spaces)",
+        "expected_output": "resolve_openai_executor_config()=None (exact compare, no trim/lowercase)",
+        "covers": "no-trim exact match between resolve and main.rs predict"
+      },
+      {
+        "test_name": "auth_api_key_and_bearer_combined",
+        "input": "ANTHROPIC_API_KEY=K AND ANTHROPIC_AUTH_TOKEN=T both set",
+        "expected_output": "AuthSource::ApiKeyAndBearer -> apply() emits BOTH x-api-key:K AND Authorization: Bearer T (not either-or)",
+        "covers": "combined-header auth state (intentional)"
+      },
+      {
+        "test_name": "auth_oauth_fallback_order",
+        "input": "no ANTHROPIC_API_KEY, no ANTHROPIC_AUTH_TOKEN, credentials.json OAuth present",
+        "expected_output": "from_env_or_saved falls to saved OAuth -> BearerToken; if absent, macOS Keychain -> BearerToken; else MissingApiKey",
+        "covers": "Anthropic auth resolution fallback chain (OAuth/Keychain)"
+      },
+      {
+        "test_name": "force_clears_stale_beta_flag",
+        "input": "prior run left ANTHROPIC_BASE_URL+CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1; then force_apply_executor_env for anthropic official (base_url=None)",
+        "expected_output": "stale BASE_URL and betas-disable flag removed first (remove_var) so official endpoint runs betas ON",
+        "covers": "force_apply_executor_env_clears_stale_beta_disable_flag test"
+      },
+      {
+        "test_name": "force_executor_only_preserves_reviewer_keys",
+        "input": "ApplyMode::ForceExecutorOnly with OPENAI_API_KEY (reviewer) already set in shell",
+        "expected_output": "executor env cleared/forced; OPENAI_API_KEY (and other reviewer keys) NOT cleared",
+        "covers": "executor/reviewer env isolation (ForceExecutorOnly)"
+      },
+      {
+        "test_name": "setup_menu_4_glm",
+        "input": "setup exec choice=4",
+        "expected_output": "exec_info=(\"openai\",\"EXECUTOR_API_KEY\",\"GLM API key\",base=https://open.bigmodel.cn/api/paas/v4,model=GLM-5); echo back via base_url.contains(\"bigmodel\")->\"4\"",
+        "covers": "GLM menu collapse + echo"
+      },
+      {
+        "test_name": "setup_menu_5_minimax_openai",
+        "input": "setup exec choice=5",
+        "expected_output": "exec_info=(\"openai\",...,base=https://api.minimax.chat/v1,model=MiniMax-M2.7); echo base_url.contains(\"minimax\")->\"5\"",
+        "covers": "MiniMax OpenAI-format menu (distinct from anthropic-compat path)"
+      },
+      {
+        "test_name": "setup_menu_6_kimi",
+        "input": "setup exec choice=6",
+        "expected_output": "exec_info=(\"openai\",...,base=https://api.moonshot.cn/v1,model=kimi-k2.5); echo base_url.contains(\"moonshot\")->\"6\"",
+        "covers": "Kimi menu collapse + echo"
+      },
+      {
+        "test_name": "setup_menu_7_deepseek_compat",
+        "input": "setup exec choice=7",
+        "expected_output": "exec_info=(\"anthropic-compat\",\"ANTHROPIC_AUTH_TOKEN\",base=https://api.deepseek.com/anthropic,model=deepseek-v4-pro); echo provider==anthropic-compat && base_url.contains(\"deepseek\")->\"7\"",
+        "covers": "DeepSeek executor=anthropic-compat (NOT openai) + echo"
+      },
+      {
+        "test_name": "setup_menu_3_gemini",
+        "input": "setup exec choice=3",
+        "expected_output": "exec_info=(\"openai\",...,base=https://generativelanguage.googleapis.com/v1beta/openai,model=gemini-2.5-pro); echo base_url.contains(\"googleapis\")->\"3\"",
+        "covers": "Gemini OpenAI-compat menu + echo"
+      },
+      {
+        "test_name": "setup_menu_8_9_10_echo",
+        "input": "setup exec choice in {8 Xiaomi, 9 Qwen, 10 Doubao}",
+        "expected_output": "all openai-family base_urls (xiaomimimo / dashscope / volces); echo via base_url.contains substring->\"8\"/\"9\"/\"10\"",
+        "covers": "Xiaomi/Qwen/Doubao menu collapse + substring echo"
+      },
+      {
+        "test_name": "setup_menu_2_or_unknown_proxy_echo",
+        "input": "executor_provider=openai with base_url not matching any keyword (custom openai proxy)",
+        "expected_output": "default_executor echo falls back to \"2\" (OpenAI). pure UX, routing unaffected",
+        "covers": "echo fallback for unmatched openai proxy URL"
+      },
+      {
+        "test_name": "reasoning_o3_mini",
+        "input": "supports_reasoning_effort(\"o3-mini\")",
+        "expected_output": "true",
+        "covers": "word_match o3 with trailing - boundary"
+      },
+      {
+        "test_name": "reasoning_provider_prefix_o3",
+        "input": "supports_reasoning_effort(\"openai/o3-mini\")",
+        "expected_output": "true",
+        "covers": "word_match / boundary (P1.B)"
+      },
+      {
+        "test_name": "reasoning_colon_prefix_o4",
+        "input": "supports_reasoning_effort(\"proxy:o4\")",
+        "expected_output": "true",
+        "covers": "word_match : boundary + end-of-string"
+      },
+      {
+        "test_name": "reasoning_midword_o32_reject",
+        "input": "supports_reasoning_effort(\"o32-mini\")",
+        "expected_output": "false",
+        "covers": "word_match rejects mid-word"
+      },
+      {
+        "test_name": "reasoning_gpt55",
+        "input": "supports_reasoning_effort(\"gpt-5.5\")",
+        "expected_output": "true (contains)",
+        "covers": "gpt-5.5 contains branch"
+      },
+      {
+        "test_name": "reasoning_gpt56_pro",
+        "input": "supports_reasoning_effort(\"gpt-5.6-pro\")",
+        "expected_output": "true (contains gpt-5.6)",
+        "covers": "gpt-5.6 contains"
+      },
+      {
+        "test_name": "reasoning_reasoner",
+        "input": "supports_reasoning_effort(\"deepseek-reasoner\")",
+        "expected_output": "true (contains reasoner)",
+        "covers": "reasoner contains"
+      },
+      {
+        "test_name": "reasoning_thinking",
+        "input": "supports_reasoning_effort(\"glm-4.6-thinking\")",
+        "expected_output": "true (contains thinking)",
+        "covers": "thinking contains"
+      },
+      {
+        "test_name": "reasoning_negatives",
+        "input": "supports_reasoning_effort(\"gpt-5.4\") / (\"gpt-4o\") / (\"kimi-k2.5\")",
+        "expected_output": "false for all three",
+        "covers": "non-reasoning models"
+      },
+      {
+        "test_name": "replay_kimi",
+        "input": "supports_reasoning_content_replay(\"kimi-k2.5\")",
+        "expected_output": "true (contains kimi; superset of effort)",
+        "covers": "replay superset - kimi"
+      },
+      {
+        "test_name": "replay_moonshot",
+        "input": "supports_reasoning_content_replay(\"moonshot-v1\")",
+        "expected_output": "true",
+        "covers": "replay moonshot"
+      },
+      {
+        "test_name": "replay_mimo",
+        "input": "supports_reasoning_content_replay(\"mimo-7b\")",
+        "expected_output": "true",
+        "covers": "replay mimo"
+      },
+      {
+        "test_name": "replay_deepseek_r1",
+        "input": "supports_reasoning_content_replay(\"deepseek-r1\")",
+        "expected_output": "true (contains deepseek-r1 and -r1)",
+        "covers": "replay deepseek-r1"
+      },
+      {
+        "test_name": "replay_bare_r1_substring",
+        "input": "supports_reasoning_content_replay(\"qwen3-r1-custom\")",
+        "expected_output": "true (bare contains '-r1', NOT word_match)",
+        "covers": "replay loose -r1 contains (must not tighten)"
+      },
+      {
+        "test_name": "replay_delegates_to_effort",
+        "input": "supports_reasoning_content_replay(\"o3-mini\")",
+        "expected_output": "true (delegates to supports_reasoning_effort)",
+        "covers": "replay superset delegation"
+      },
+      {
+        "test_name": "replay_gpt4o_false",
+        "input": "supports_reasoning_content_replay(\"gpt-4o\")",
+        "expected_output": "false",
+        "covers": "replay negative"
+      },
+      {
+        "test_name": "effort_default",
+        "input": "reasoning_effort() with ARIS_REASONING_EFFORT unset",
+        "expected_output": "\"xhigh\"",
+        "covers": "effort default"
+      },
+      {
+        "test_name": "effort_trim",
+        "input": "reasoning_effort() ARIS_REASONING_EFFORT=\"  high  \"",
+        "expected_output": "\"high\" (trimmed)",
+        "covers": "effort trim"
+      },
+      {
+        "test_name": "effort_empty_falls_back",
+        "input": "reasoning_effort() ARIS_REASONING_EFFORT=\"\" (or \"   \")",
+        "expected_output": "\"xhigh\" (empty/whitespace filtered)",
+        "covers": "effort empty fallback"
+      },
+      {
+        "test_name": "price_haiku",
+        "input": "pricing_for_model(\"claude-haiku-4-5\")",
+        "expected_output": "input=1.0 output=5.0 cc=1.25 cr=0.1",
+        "covers": "Claude haiku tier"
+      },
+      {
+        "test_name": "price_opus",
+        "input": "pricing_for_model(\"claude-opus-4-8\")",
+        "expected_output": "input=15.0 output=75.0 cc=18.75 cr=1.5",
+        "covers": "Claude opus tier"
+      },
+      {
+        "test_name": "price_sonnet",
+        "input": "pricing_for_model(\"claude-sonnet-4-6\")",
+        "expected_output": "default_sonnet_tier input=15.0 output=75.0 cc=18.75 cr=1.5",
+        "covers": "Claude sonnet (=opus numerics)"
+      },
+      {
+        "test_name": "price_gpt55",
+        "input": "pricing_for_model(\"gpt-5.5\")",
+        "expected_output": "openai_pricing(5.0,30.0): in=5.0 out=30.0 cc=5.0 cr=0.5",
+        "covers": "gpt-5.5 openai cache formula"
+      },
+      {
+        "test_name": "price_gpt54_nano_order",
+        "input": "pricing_for_model(\"gpt-5.4-nano\")",
+        "expected_output": "openai_pricing(0.20,1.25): cr=0.02 (nano matched BEFORE gpt-5.4)",
+        "covers": "order-sensitive nano-before-base"
+      },
+      {
+        "test_name": "price_gpt54_mini_order",
+        "input": "pricing_for_model(\"gpt-5.4-mini\")",
+        "expected_output": "openai_pricing(0.75,4.5): cr=0.075",
+        "covers": "order-sensitive mini-before-base"
+      },
+      {
+        "test_name": "price_gpt54",
+        "input": "pricing_for_model(\"gpt-5.4\")",
+        "expected_output": "openai_pricing(2.5,15.0): cr=0.25",
+        "covers": "gpt-5.4 base"
+      },
+      {
+        "test_name": "price_gpt4o_mini_order",
+        "input": "pricing_for_model(\"gpt-4o-mini\")",
+        "expected_output": "openai_pricing(0.15,0.6): cr=0.015 (before gpt-4o)",
+        "covers": "order gpt-4o-mini before gpt-4o"
+      },
+      {
+        "test_name": "price_gpt4o",
+        "input": "pricing_for_model(\"gpt-4o\")",
+        "expected_output": "openai_pricing(2.5,10.0): cr=0.25",
+        "covers": "gpt-4o base"
+      },
+      {
+        "test_name": "price_o4_mini",
+        "input": "pricing_for_model(\"o4-mini\")",
+        "expected_output": "openai_pricing(4.0,16.0): cr=0.4 (has_word o4)",
+        "covers": "o4 has_word"
+      },
+      {
+        "test_name": "price_o3",
+        "input": "pricing_for_model(\"o3\")",
+        "expected_output": "openai_pricing(2.0,8.0): cr=0.2",
+        "covers": "o3 has_word"
+      },
+      {
+        "test_name": "price_o1_preview",
+        "input": "pricing_for_model(\"o1-preview\")",
+        "expected_output": "openai_pricing(15.0,60.0): cr=1.5",
+        "covers": "o1 has_word"
+      },
+      {
+        "test_name": "price_google_o3_to_openai",
+        "input": "pricing_for_model(\"google/o3\")",
+        "expected_output": "openai_pricing(2.0,8.0) (has_word o3 across / boundary; provider segment ignored)",
+        "covers": "o-series provider-prefix routes to OpenAI price (feature)"
+      },
+      {
+        "test_name": "price_gemini_flash_order",
+        "input": "pricing_for_model(\"gemini-2.5-flash\")",
+        "expected_output": "generic_pricing(0.3,2.5): cr=0.15 (before 2.5-pro)",
+        "covers": "gemini flash-before-pro order"
+      },
+      {
+        "test_name": "price_gemini_pro",
+        "input": "pricing_for_model(\"gemini-2.5-pro\")",
+        "expected_output": "generic_pricing(2.5,10.0): cr=1.25",
+        "covers": "gemini 2.5-pro"
+      },
+      {
+        "test_name": "price_gemini_20_flash",
+        "input": "pricing_for_model(\"gemini-2.0-flash\")",
+        "expected_output": "generic_pricing(0.1,0.4): cr=0.05",
+        "covers": "gemini 2.0-flash"
+      },
+      {
+        "test_name": "price_deepseek_v4_order",
+        "input": "pricing_for_model(\"deepseek-v4\")",
+        "expected_output": "in=0.27 out=1.10 cc=0.27 cr=0.07 (before -v3)",
+        "covers": "deepseek v4-before-v3 order"
+      },
+      {
+        "test_name": "price_deepseek_v3",
+        "input": "pricing_for_model(\"deepseek-v3\")",
+        "expected_output": "in=0.27 out=1.10 cc=0.27 cr=0.07",
+        "covers": "deepseek v3"
+      },
+      {
+        "test_name": "price_deepseek_r1",
+        "input": "pricing_for_model(\"deepseek-r1\") / (\"deepseek-reasoner\")",
+        "expected_output": "in=0.55 out=2.19 cc=0.55 cr=0.14",
+        "covers": "deepseek R1 tier"
+      },
+      {
+        "test_name": "price_deepseek_chat_fallthrough",
+        "input": "pricing_for_model(\"deepseek-chat\")",
+        "expected_output": "in=0.27 out=1.10 cc=0.27 cr=0.07 (bare deepseek contains)",
+        "covers": "deepseek generic fallthrough"
+      },
+      {
+        "test_name": "price_glm",
+        "input": "pricing_for_model(\"glm-4-plus\")",
+        "expected_output": "generic_pricing(0.5,2.0): cr=0.25",
+        "covers": "glm provider_match"
+      },
+      {
+        "test_name": "price_minimax",
+        "input": "pricing_for_model(\"minimax-m2.7\")",
+        "expected_output": "generic_pricing(0.6,2.4): cr=0.3",
+        "covers": "minimax provider_match"
+      },
+      {
+        "test_name": "price_kimi_moonshot",
+        "input": "pricing_for_model(\"kimi-k2.5\") / (\"moonshot-v1\")",
+        "expected_output": "generic_pricing(0.6,2.5): cr=0.3",
+        "covers": "kimi/moonshot provider_match"
+      },
+      {
+        "test_name": "price_provider_prefix_kimi",
+        "input": "pricing_for_model(\"openai/kimi-k2.5\")",
+        "expected_output": "generic_pricing(0.6,2.5) (/kimi prefix)",
+        "covers": "provider_match / segment"
+      },
+      {
+        "test_name": "price_my_kimi_clone_rejected",
+        "input": "pricing_for_model(\"my-kimi-clone\")",
+        "expected_output": "None -> estimated-default sonnet tier (provider_match rejects mid-word)",
+        "covers": "provider_match mid-word reject (P2)"
+      },
+      {
+        "test_name": "price_kimiclone_permissive",
+        "input": "pricing_for_model(\"kimiclone-foo\")",
+        "expected_output": "generic_pricing(0.6,2.5) (starts_with kimi permissive)",
+        "covers": "provider_match starts_with permissive (pinned)"
+      },
+      {
+        "test_name": "price_qwen_digit_suffix",
+        "input": "pricing_for_model(\"qwen3.6-plus\")",
+        "expected_output": "generic_pricing(0.4,1.6): cr=0.2",
+        "covers": "qwen digit-suffix provider_match"
+      },
+      {
+        "test_name": "price_mimo_doubao",
+        "input": "pricing_for_model(\"mimo-7b\") / (\"doubao-pro\")",
+        "expected_output": "mimo generic(0.4,1.6); doubao generic(0.3,1.2)",
+        "covers": "mimo/doubao provider_match"
+      },
+      {
+        "test_name": "price_unknown_none",
+        "input": "pricing_for_model(\"custom-model\")",
+        "expected_output": "None -> caller appends ' pricing=estimated-default' + default_sonnet_tier",
+        "covers": "unknown->estimated-default suffix"
+      },
+      {
+        "test_name": "route_gemini",
+        "input": "route_openai_compat_model(\"gemini-2.5-pro\")",
+        "expected_output": "(GEMINI_API_KEY, .../v1beta/openai/chat/completions, \"gemini\")",
+        "covers": "reviewer route gemini"
+      },
+      {
+        "test_name": "route_glm_case",
+        "input": "route_openai_compat_model(\"GLM-5\")",
+        "expected_output": "(GLM_API_KEY, open.bigmodel.cn/.../v4/chat/completions, \"glm\")",
+        "covers": "reviewer route glm dual-case contains"
+      },
+      {
+        "test_name": "route_minimax_startswith",
+        "input": "route_openai_compat_model(\"MiniMax-M2.7\")",
+        "expected_output": "(MINIMAX_API_KEY, api.minimax.chat/v1/chat/completions, \"minimax\")",
+        "covers": "reviewer route minimax starts_with"
+      },
+      {
+        "test_name": "route_my_minimax_to_openai",
+        "input": "route_openai_compat_model(\"my-minimax-clone\")",
+        "expected_output": "(OPENAI_API_KEY, api.openai.com/v1/chat/completions, \"openai\") (starts_with miss -> else)",
+        "covers": "reviewer minimax starts_with mid-word miss"
+      },
+      {
+        "test_name": "route_kimi_contains",
+        "input": "route_openai_compat_model(\"my-kimi\")",
+        "expected_output": "(KIMI_API_KEY, api.moonshot.cn/v1/chat/completions, \"kimi\") (contains kimi - DIFFERS from pricing provider_match!)",
+        "covers": "MAJOR inconsistency: reviewer kimi contains vs pricing provider_match"
+      },
+      {
+        "test_name": "route_deepseek",
+        "input": "route_openai_compat_model(\"deepseek-chat\")",
+        "expected_output": "(DEEPSEEK_API_KEY, api.deepseek.com/v1/chat/completions, \"deepseek\")",
+        "covers": "reviewer route deepseek"
+      },
+      {
+        "test_name": "route_else_openai",
+        "input": "route_openai_compat_model(\"gpt-5.5\") / (\"o3\") / (\"o4\")",
+        "expected_output": "(OPENAI_API_KEY, api.openai.com/v1/chat/completions, \"openai\")",
+        "covers": "reviewer route else fallthrough"
+      },
+      {
+        "test_name": "resolve_reviewer_none_input",
+        "input": "resolve_reviewer_model(None, \"kimi-k2.5\")",
+        "expected_output": "\"kimi-k2.5\" (configured)",
+        "covers": "reviewer resolve no override"
+      },
+      {
+        "test_name": "resolve_reviewer_empty_input",
+        "input": "resolve_reviewer_model(Some(\"\"), \"kimi-k2.5\")",
+        "expected_output": "\"kimi-k2.5\"",
+        "covers": "reviewer resolve empty filtered"
+      },
+      {
+        "test_name": "resolve_reviewer_equal_shortcircuit",
+        "input": "resolve_reviewer_model(Some(\"kimi-k2.5\"), \"kimi-k2.5\")",
+        "expected_output": "\"kimi-k2.5\" (requested==configured, skips key check)",
+        "covers": "reviewer resolve equality short-circuit"
+      },
+      {
+        "test_name": "resolve_reviewer_missing_key_fallback",
+        "input": "resolve_reviewer_model(Some(\"gpt-4o\"), \"kimi-k2.5\") with no OPENAI_API_KEY",
+        "expected_output": "\"kimi-k2.5\" (requested key missing -> configured)",
+        "covers": "reviewer resolve missing-key fallback"
+      },
+      {
+        "test_name": "resolve_reviewer_provider_mismatch",
+        "input": "resolve_reviewer_model(Some(\"gpt-4o\"), \"MiniMax-M2.7\") both keys set",
+        "expected_output": "\"MiniMax-M2.7\" (provider openai!=minimax -> configured)",
+        "covers": "reviewer resolve provider-mismatch fallback"
+      },
+      {
+        "test_name": "resolve_reviewer_same_provider_override",
+        "input": "resolve_reviewer_model(Some(\"gpt-5.5-mini\"), \"gpt-5.5\") with OPENAI_API_KEY",
+        "expected_output": "\"gpt-5.5-mini\" (same provider + key present -> accept)",
+        "covers": "reviewer resolve accept override"
+      },
+      {
+        "test_name": "review_custom_path",
+        "input": "run_llm_review reviewer_provider=\"custom\", ARIS_REVIEWER_MODEL set, ARIS_REVIEWER_BASE_URL set, ARIS_REVIEWER_AUTH_TOKEN set",
+        "expected_output": "call_openai_compat_reviewer; key=ARIS_REVIEWER_AUTH_TOKEN; refuses gpt-5.5 fallback; URL appends /v1/chat/completions or /chat/completions per suffix",
+        "covers": "reviewer custom OpenAI-compat path"
+      },
+      {
+        "test_name": "review_custom_no_model_errors",
+        "input": "run_llm_review reviewer_provider=\"custom\", no ARIS_REVIEWER_MODEL, no input.model",
+        "expected_output": "Err 'custom reviewer has no model configured' (does NOT fall back to gpt-5.5)",
+        "covers": "custom reviewer refuses default fallback"
+      },
+      {
+        "test_name": "review_anthropic_compat",
+        "input": "run_llm_review reviewer_provider=\"anthropic-compat\"",
+        "expected_output": "call_anthropic_compat_reviewer; key=ARIS_REVIEWER_AUTH_TOKEN or ANTHROPIC_AUTH_TOKEN; default base api.anthropic.com; endpoint=base+/v1/messages; honors input.model else configured(default gpt-5.5)",
+        "covers": "reviewer anthropic-compat path"
+      },
+      {
+        "test_name": "review_deepseek",
+        "input": "run_llm_review reviewer_provider=\"deepseek\"",
+        "expected_output": "call_anthropic_compat_reviewer; default base api.deepseek.com/anthropic; endpoint=base+/v1/messages",
+        "covers": "reviewer deepseek path (shares anthropic-compat branch, diff base)"
+      },
+      {
+        "test_name": "review_default_openai_compat",
+        "input": "run_llm_review no reviewer_provider",
+        "expected_output": "resolve_reviewer_model->route_openai_compat_model; configured default gpt-5.5; custom_base_url override applies",
+        "covers": "reviewer default OpenAI-compat path"
+      },
+      {
+        "test_name": "review_anthropic_compat_body",
+        "input": "call_anthropic_compat_reviewer",
+        "expected_output": "{model,max_tokens:8192,messages}; Bearer; header anthropic-version:2023-06-01; NO reasoning_effort; parses content[0].text",
+        "covers": "anthropic-compat reviewer body shape"
+      },
+      {
+        "test_name": "review_openai_compat_body_reasoning",
+        "input": "call_openai_compat_reviewer for \"o3-mini\"",
+        "expected_output": "{model,messages,reasoning_effort:\"xhigh\"} (reviewer_supports_reasoning_effort=true)",
+        "covers": "reviewer openai body with reasoning_effort"
+      },
+      {
+        "test_name": "review_openai_compat_body_no_reasoning",
+        "input": "call_openai_compat_reviewer for \"gpt-4o\"",
+        "expected_output": "{model,messages} no reasoning_effort",
+        "covers": "reviewer openai body without reasoning_effort"
+      },
+      {
+        "test_name": "reviewer_word_match_prefix",
+        "input": "reviewer_supports_reasoning_effort(\"openai/o3-mini\") / (\"proxy:o4-preview\")",
+        "expected_output": "true (mirrors executor word_match)",
+        "covers": "reviewer_word_match boundary parity"
+      },
+      {
+        "test_name": "reviewer_word_match_midword",
+        "input": "reviewer_supports_reasoning_effort(\"o32-mini\")",
+        "expected_output": "false",
+        "covers": "reviewer_word_match mid-word reject"
+      },
+      {
+        "test_name": "reasoning_with_tools_strip",
+        "input": "OpenAI executor: model gpt-5.5, base_url contains api.openai.com, enable_tools=true, ARIS_FORCE_REASONING_WITH_TOOLS unset",
+        "expected_output": "reasoning_effort STRIPPED from body + one-time stderr warning",
+        "covers": "openai_tool_reasoning_block strip (official endpoint only)"
+      },
+      {
+        "test_name": "reasoning_with_tools_thirdparty_keeps",
+        "input": "OpenAI executor: model gpt-5.5, base_url NOT api.openai.com, enable_tools=true",
+        "expected_output": "reasoning_effort KEPT (third-party proxy unaffected by strip)",
+        "covers": "strip gated on api.openai.com substring"
+      },
+      {
+        "test_name": "subagent_openai_current_broken",
+        "input": "build_agent_runtime with EXECUTOR_PROVIDER=openai (no ANTHROPIC_*), no residual OAuth",
+        "expected_output": "BASELINE current: builds AnthropicRuntimeClient -> from_env -> MissingApiKey error (EXECUTOR_API_KEY unused). This is the documented CURRENT-broken state P8 fixes",
+        "covers": "subagent Category C current error baseline (lock before P8)"
+      },
+      {
+        "test_name": "subagent_anthropic_works",
+        "input": "build_agent_runtime with EXECUTOR_PROVIDER unset/anthropic, ANTHROPIC_API_KEY set",
+        "expected_output": "AnthropicRuntimeClient -> ApiKey -> works. Must stay byte-identical after P8",
+        "covers": "subagent Category A must-not-regress"
+      },
+      {
+        "test_name": "subagent_anthropic_compat_works",
+        "input": "build_agent_runtime with ANTHROPIC_AUTH_TOKEN+ANTHROPIC_BASE_URL set (deepseek/minimax compat)",
+        "expected_output": "AnthropicRuntimeClient -> BearerToken -> base_url compat endpoint -> works (silently). Must stay working after P8",
+        "covers": "subagent Category B must-not-regress (behavior-changing risk zone)"
+      }
+    ],
+    "provider_family_design": "DESIGN PRINCIPLE: ProviderFamily is a PURE CLASSIFIER added ALONGSIDE the existing code, never replacing the dispatch logic in the first PR. Default (Anthropic) path is touched zero times. Phase 1 introduces the enum and delegates ONLY the predicate twins; the env-writing match in config.rs::apply_to_env_inner and resolve_openai_executor_config stay byte-identical.\n\n== enum ProviderFamily ==\nVariants chosen to match the ONLY runtime-observable distinctions, not the menu items (menu->family is many-to-one, exactly today's collapse):\n  AnthropicNative    // executor_provider==\\\"anthropic\\\", api_key path -> x-api-key\n  AnthropicCompat    // executor_provider==\\\"anthropic-compat\\\" (incl. deepseek menu opt 7) -> ANTHROPIC_AUTH_TOKEN Bearer\n  OpenAiCompat       // executor_provider in {openai, custom} and all collapsed menu items (glm/minimax-openai/kimi/gemini/doubao/qwen/mimo) -> EXECUTOR_* Bearer\nCRITICAL: custom and openai map to the SAME variant because they are runtime-indistinguishable today (config.rs:144). The config.json string \\\"custom\\\" is NOT derived from the family; it is preserved verbatim as a separate persisted field for menu echo. The enum never round-trips custom<->openai.\n\n== resolver API (additive, side-effect-free) ==\n  fn ProviderFamily::from_executor_provider(s: &str) -> ProviderFamily  // exact-match, no trim/lowercase, mirrors current string compares\n  fn ProviderFamily::from_model_for_pricing(model: &str) -> Option<PricingTier>  // NOT introduced in PR1 - see RISK\nThe resolver does NOT read env, does NOT write env, does NOT pick endpoints. It is a classifier only. All endpoint/key/header decisions remain in their current callsites.\n\n== per-callsite delegation plan ==\n\n(1) EXECUTOR env-writing (config.rs::apply_to_env_inner 143-200) — DO NOT DELEGATE IN PR1. This is the #158/#162 minefield. The match on provider string stays exactly as-is. Optionally in a LATER PR, wrap the match arms behind `match ProviderFamily::from_executor_provider(provider)` but ONLY after the characterization tests (exec_anthropic_*, exec_anthropic_compat_*, exec_openai_*, exec_custom_*) are green, and the new match must produce byte-identical set_var/remove_var calls. Reason output is verbatim: the family is a 1:1 relabel of the same three string arms; AnthropicNative->arm \\\"anthropic\\\", AnthropicCompat->arm \\\"anthropic-compat\\\", OpenAiCompat->arms \\\"openai\\\"|\\\"custom\\\". No arm is merged, so the x-api-key vs Bearer bisection and the betas-disable-only-on-Some(url) gates are preserved literally.\n\n(2) resolve_openai_executor_config (openai_executor.rs:372) — DO NOT CHANGE. It keys off EXECUTOR_PROVIDER==\\\"openai\\\" exact. ProviderFamily::from_executor_provider would return OpenAiCompat for both \\\"openai\\\" and \\\"custom\\\", but ONLY \\\"openai\\\" is ever serialized to EXECUTOR_PROVIDER (custom is rewritten to \\\"openai\\\" at config.rs:145). So the family classifier agrees with the existing check by construction; we still keep the literal string compare to honor the main.rs:91 \\\"EXACT match (no trim) 1:1\\\" contract. Output verbatim because the code is unchanged.\n\n(3) pricing (usage.rs::pricing_for_model) — DO NOT DELEGATE. The if-else chain is order-sensitive AND uses THREE different match strategies (contains for Claude/OpenAI-named/Gemini/DeepSeek, has_word for o-series, provider_match for Chinese providers). A ProviderFamily classifier cannot reproduce this without encoding the exact order and the exact per-family strategy. POINT-NAMED RISK: any attempt to route pricing through ProviderFamily risks reordering or homogenizing the match strategy. Recommendation: leave pricing entirely untouched in v0.4.16; only SHARE the word-boundary helper (see (6)). Output stays verbatim because the chain is unchanged.\n\n(4) reviewer routing (tools/lib.rs::route_openai_compat_model + resolve_reviewer_model) — DO NOT DELEGATE to the same classifier as pricing. The MAJOR documented inconsistency (kimi/moonshot use contains here but provider_match in pricing; minimax uses starts_with here but provider_match in pricing; glm uses dual-case contains) means a unified ProviderFamily would CHANGE answers for strings like \\\"my-kimi-clone\\\" (reviewer=kimi today, would become whatever unified rule says). POINT-NAMED RISK: unifying reviewer+pricing provider detection is a guaranteed regression. Recommendation: keep route_openai_compat_model exactly as-is. Output verbatim because unchanged.\n\n(5) reasoning predicates (openai_executor supports_reasoning_effort / reviewer_supports_reasoning_effort) — These two are already byte-identical twins. They MAY share the word_match helper (see (6)) but the contains-list (gpt-5.5/gpt-5.6/reasoner/thinking) stays inline in each. ProviderFamily is NOT involved (reasoning is a model-capability predicate, not a provider-family predicate). Output verbatim: same boolean expression, same word_match semantics.\n\n(6) word-boundary helper (openai_executor::word_match L99, runtime::usage::has_word L283, tools::reviewer_word_match L3654) — These three are byte-identical copies. SAFE consolidation target: move ONE canonical `word_match(haystack,needle)` into a shared location (e.g. runtime crate, re-exported) and have all three call it. Boundary set `-_/:` + string ends must be preserved character-for-character. This is the ONLY safe shared-code extraction in the whole provider area, and it changes no truth value (the functions are already identical). Guarded by the reasoning_* and price_o* and reviewer_word_match_* characterization tests on both sides. POINT-NAMED CAVEAT: this consolidation must NOT touch provider_match (usage.rs:234) — provider_match has different semantics (starts_with + /:-prefix, permissive) and is NOT a word_match.\n\n(7) brand/doctor — These are display-only (setup menu echo via base_url.contains substrings at config.rs:315-330; doctor diagnostics). They MAY consume ProviderFamily for cleaner display BUT the echo currently falls back to \\\"2\\\" for unmatched openai proxy URLs. If ProviderFamily replaces the substring echo, the fallback case must still resolve to \\\"2\\\". Recommendation: leave echo substring logic as-is in v0.4.16; it is pure UX with zero routing impact. If touched later, pin with setup_menu_*_echo tests.\n\n== summary of what is byte-identical vs risk ==\nByte-identical (unchanged code): config.rs env-writing, resolve_openai_executor_config, pricing chain, reviewer routing, reviewer resolve. \nSafe shared extraction (identical truth values): the three word_match twins -> one helper.\nDefault Anthropic executor path: ZERO changes. ProviderFamily::AnthropicNative is a relabel only; the \\\"anthropic\\\" arm in config.rs and the None-return in resolve are exactly as today.\nThe honest position: ProviderFamily in v0.4.16 should be a CLASSIFIER + DOCUMENTATION layer that makes the three families nameable and shares the one truly-identical helper, NOT a refactor that re-routes any callsite. Re-routing pricing or reviewer through it is where regressions live and is explicitly deferred.",
+    "p8_design": "P8 = give the Subagent runtime (build_agent_runtime, tools/lib.rs:1885) the SAME provider dispatch the CLI executor already has (main.rs:3918 build_runtime), so OpenAI-family executor configs route correctly instead of falling through to a broken AnthropicClient.\n\n== safety verdict by executor family (from subagent baseline, three-way split) ==\n\nCATEGORY A — Anthropic native (x-api-key) + Anthropic OAuth/Claude.ai login = COMMON CASE, currently WORKS.\nVerdict: P8 must be BEHAVIOR-PRESERVING. Mechanism: the new dispatch is `if resolve_openai_executor_config().is_some() { OpenAI branch } else { existing AnthropicRuntimeClient::new(...) }`. The else-branch is byte-identical to today's unconditional line 1894. Because EXECUTOR_PROVIDER is NOT \\\"openai\\\" for Category A, resolve returns None, and we hit the unchanged else. ZERO behavior change for the majority. This is the highest-priority constraint and the dispatch is structured so Category A literally cannot enter the new code path.\n\nCATEGORY B — anthropic-compat (DeepSeek opt 7, MiniMax-as-compat) = currently SILENTLY WORKS.\nVerdict: BEHAVIOR-CHANGING RISK ZONE. These set ANTHROPIC_AUTH_TOKEN + ANTHROPIC_BASE_URL but NOT EXECUTOR_PROVIDER=openai, so resolve_openai_executor_config returns None -> they ALSO hit the unchanged else-branch (AnthropicRuntimeClient) and keep working. P8 design MUST ensure the OpenAI-detection predicate is EXACTLY resolve_openai_executor_config (EXECUTOR_PROVIDER==\\\"openai\\\"), never a broader \\\"is this non-Anthropic\\\" test. If P8 accidentally classified anthropic-compat into the OpenAI branch it would break a currently-working path. DISCLOSE in release notes that anthropic-compat subagents are regression-tested. Guarded by subagent_anthropic_compat_works characterization test. NOTE: the Subagent's AnthropicRuntimeClient already lacks the CLI's per-model max_tokens / OAuth-ttl / cache_control handling (hardcoded 32k); P8 does NOT change that — preserving the existing (imperfect but working) behavior is the goal, not fixing it.\n\nCATEGORY C — OpenAI-family (openai/gemini/glm/minimax-openai/kimi/xiaomi/qwen/doubao/custom, all serialize to EXECUTOR_PROVIDER=openai) = currently BROKEN (MissingApiKey error, or silently-wrong-client if residual Anthropic OAuth exists -> account/cost leak).\nVerdict: P8 is a PURE BUG-FIX / BEHAVIOR-PRESERVING (current state is hard-error or obvious-wrong-route; correct routing breaks no legit workflow). This is the population P8 wins. Includes shutting the C1 cost-leak (subagent silently spending Anthropic quota with a non-existent model name).\n\n== design ==\n1. Reuse, do NOT re-create. The subagent baseline explicitly warns there are already TWO AnthropicRuntimeClient structs (tools/lib.rs:2064 and main.rs:4046) — do not add a third client. Introduce an ExecutorClient-style enum for the subagent runtime mirroring the CLI's ExecutorClient (main.rs:4019), OR better: extract the CLI's ExecutorClient + its OpenAI arm into a shared module the subagent can import. The subagent path needs the OpenAI executor client wired to EXECUTOR_API_KEY/EXECUTOR_BASE_URL exactly like the CLI executor.\n2. Dispatch in build_agent_runtime: \n     let client = if resolve_openai_executor_config().is_some() { ExecutorClient::OpenAI(build_openai_subagent_client(model, allowed_tools)?) } else { ExecutorClient::Anthropic(AnthropicRuntimeClient::new(model, allowed_tools.clone())?) };\n   The return type changes from concrete ConversationRuntime<AnthropicRuntimeClient,...> to a runtime parameterized over the enum (same shape the CLI already uses).\n3. The OpenAI subagent client must consume EXECUTOR_API_KEY (with the EXECUTOR_API_KEY->OPENAI_API_KEY fallback preserved) and EXECUTOR_BASE_URL, apply the same reasoning_effort/strip/replay predicates the CLI OpenAI executor uses (share, don't fork).\n4. Env inheritance: subagents are in-process threads (lib.rs:1849) inheriting process env set by apply_to_env at startup (main.rs:195). No env plumbing needed; resolve_openai_executor_config reads the same EXECUTOR_PROVIDER the CLI sees. This is why the dispatch predicate is automatically consistent between CLI executor and subagent.\n\n== Anthropic common-case zero-change proof ==\nFor Category A/B, EXECUTOR_PROVIDER != \\\"openai\\\", so resolve_openai_executor_config().is_some() == false, so the else-branch runs the literal unchanged AnthropicRuntimeClient::new(model, allowed_tools.clone())? — same call, same args, same line semantics as today's 1894. The only structural change is that this line is now inside an else, which is a no-op for the value produced. Locked by subagent_anthropic_works and subagent_anthropic_compat_works.",
+    "repl_additive_design": "TRACK A is PURELY ADDITIVE: one new persistence module + one new Ctrl+R arm. No existing arm, no existing state field, no existing redraw path is modified. Every change is an insertion.\n\n== PART 1: HISTORY PERSISTENCE ==\n\nFile format: plain-text, one raw (untrimmed-content-but-newline-stripped) entry per line, chronological (oldest first), at ~/.config/aris/history. Rationale: mirrors config.rs:58-61 dir convention (runtime::home_dir() + \\\".config/aris\\\"); newline-delimited so append-on-submit is a single O_APPEND write; oldest-first so the in-memory Vec order (newest = history.len()-1) is preserved unchanged, keeping Up/Down indexing byte-identical. Entries containing an embedded newline are impossible because the REPL is single-line and submitted input has trailing \\\\r/\\\\n stripped already; to be safe, the writer SKIPS any entry whose content contains a literal newline (defensive, append-only).\n\nLOAD hook (additive, startup): new method LineEditor::load_history_from(path) called ONCE in run_repl right after `let mut editor = input::LineEditor::new(...)` (main.rs:1127-1130), BEFORE the first read_line. It reads the file if present, splits on \\\\n, and for each line calls the SAME trim/blank filter as push_history (input.rs:50: skip if entry.trim().is_empty()) then self.history.push(raw). Missing/corrupt file => silently start empty (mirror config.load() .ok().unwrap_or_default()). Optional cap: load only the last N (e.g. 1000) lines. CRUCIAL: load runs only on the interactive path; on non-TTY read_line_fallback the loaded history is simply unused (never read), matching baseline.\n\nSAVE hook (additive, on-submit): the single correct trigger is the existing push_history call at main.rs:1170 — it already runs ONLY after Submit that is non-empty, not /exit|/quit, and not a SlashCommand (slash commands `continue` earlier at 1150-1168). Make push_history (or a thin wrapper) ALSO append the entry to disk. Append-per-entry (not save-on-exit) because run_repl can exit via Ctrl+C/Ctrl+D where a final flush would be skipped (main.rs:1190-1193). The on-disk append applies the IDENTICAL trim/blank filter (input.rs:50) so disk and memory agree. The in-memory self.history.push semantics are UNTOUCHED; only a disk append is ADDED. Do NOT hook into run_turn or handle_repl_command — that would start persisting slash commands and break the \\\"only free-text turns remembered\\\" contract.\n\nSECURITY: \n- File perms 0600 (owner rw only). On create: open with OpenOptions().mode(0o600) (unix); after first write, defensively chmod 0600. Mirrors that credentials live in the same dir tree.\n- Secret-skip heuristic: before appending (and before in-memory push? NO — only before DISK append, to keep in-session Up/Down byte-identical to today), skip lines that look like secrets: contains \\\"sk-\\\", \\\"ANTHROPIC_API_KEY\\\", \\\"AUTH_TOKEN\\\", a long base64-ish/hex run (>=32 chars of [A-Za-z0-9_-]), or matches /api[_-]?key/i with an = / : value. This skip is DISK-ONLY: the line still goes into self.history in-memory (so the user can Up-arrow it in the same session exactly as today) but is never written to disk. This guarantees zero change to in-session behavior while preventing on-disk secret leak (consistent with the v0.4.14 S9 secret-leak hardening posture).\n- ARIS_NO_HISTORY env: if set (truthy), BOTH load and save become no-ops. The REPL behaves exactly as today (no file touched, no disk read). This is the kill-switch for users who never want persistence. In-memory self.history still accumulates within a session (unchanged behavior), only disk I/O is disabled.\n\n== PART 2: CTRL+R REVERSE SEARCH (additive sub-mode) ==\n\nInsertion: ONE new arm `(KeyCode::Char('r'), KeyModifiers::CONTROL) => { ... }` inside the match block (input.rs:146-300), placed after Ctrl+W (287) and before the regular-Char catch-all (290). This is purely additive: today Ctrl+R falls to `_ => continue` (299) and is swallowed; the regular-Char arm requires NONE|SHIFT so Char('r')+CONTROL never reached it. Adding the explicit arm changes NO existing arm's reachability.\n\nSub-mode state machine (self-contained, owns its own event loop + redraw so the 17 existing arms are never interleaved):\n  fn reverse_search(&self, stdout, history: &[String], initial_buf: &[char]) -> io::Result<ReverseSearchResult>\n  ReverseSearchResult = Accept(Vec<char>) | Cancel\nState: query: Vec<char> (char-based, CJK-safe like the rest), match_idx: pointer into history scanned newest->oldest, current_match: Option<usize>.\nPrompt line rendered as `(reverse-i-search)\\\\`{query}': {matched_entry}` (bash-style).\nKeys inside sub-loop:\n  - printable Char (NONE|SHIFT): push to query, re-scan newest->oldest for first substring match, redraw.\n  - Backspace: pop query char, widen search, redraw.\n  - Ctrl+R again: step to next OLDER match for current query (advance match_idx).\n  - Enter: return Accept(matched_entry chars) — or empty-query/no-match returns Accept(initial_buf) i.e. unchanged.\n  - Esc: return Cancel.\n  - Ctrl+C / Ctrl+G: return Cancel (treated as cancel, do NOT propagate Exit/Cancel out of read_line_raw).\n  - any other key: ignore (no-op) within sub-loop.\nOuter arm maps result back into outer locals then falls through to the existing redraw at input.rs:302:\n  - Accept(entry): buf = entry, cursor_pos = buf.len(), sel=0, history_idx=None, saved_buf=None. (Convention preserved: Enter-in-normal-mode remains the only Submit path — Ctrl+R accepts INTO the buffer, user presses Enter again to submit. Does NOT add a parallel Submit return.)\n  - Cancel: buf = initial_buf restored unchanged, cursor_pos clamped to buf.len(), sel=0, history_idx=None.\nClean return: the sub-loop clears its own search-prompt line on exit and leaves the cursor at column 0 of the input line so the outer redraw()/move_to_input_start math (input.rs:504-514, driven by render.cursor_row) stays valid. The sub-loop NEVER toggles raw mode or bracketed paste (it runs inside read_line()'s EnableBracketedPaste lifecycle, input.rs:67-83). Dropdown re-appears correctly if accepted entry starts with '/' because the outer redraw recomputes matches from the new buf.\nNon-TTY: Ctrl+R is unreachable on read_line_fallback (input.rs:452-466 never enters raw mode / the match loop), preserving that path verbatim.\n\n== must_not_change -> invariant mapping (verbatim preservation checklist) ==\n1. Bracketed paste + normalize_paste_text -> UNCHANGED; Ctrl+R sub-loop does not touch paste; persistence never alters paste arm. (test normalize_paste_text_flattens_newlines_and_tabs stays green.)\n2. EnableBracketedPaste/DisableBracketedPaste lifecycle + Unsupported fallback -> UNCHANGED; sub-loop runs INSIDE it, toggles nothing.\n3. CJK/wide-char width math (char_width, visible_len, layout_*) -> UNCHANGED; reverse_search uses char-based indexing only, reuses no byte offsets. (layout tests stay green.)\n4. Completion dropdown (compute_matches, MAX_DROPDOWN, redraw render, Tab inline, Enter-selects, Up/Down move-selection) -> UNCHANGED; new arm sets buf then defers to existing redraw which recomputes matches. (dropdown tests stay green.)\n5. Dropdown-takes-priority-over-history gating (Up/Down only nav history when matches.is_empty()) -> UNCHANGED; Ctrl+R is orthogonal, sets history_idx=None on accept.\n6. Every existing KeyCode arm byte-for-byte (Ctrl+C/D, Enter, Tab, Esc, Backspace, Delete, Left, Right, Home/Ctrl+A, End/Ctrl+E, Ctrl+K/U/W, regular Char w/ history_idx=None) + `_ => continue` + Release-skip -> UNCHANGED; only a NEW arm inserted.\n7. History state machine (saved_buf stash/restore, idx clamp 0 & len-1, no de-dup/cap, raw-untrimmed push, slash excluded) -> UNCHANGED in-memory; persistence only ADDS disk append/load using the SAME filter. (push_history_ignores_blank stays green.)\n8. Non-TTY read_line_fallback -> UNCHANGED; load may populate self.history but it is unused there; Ctrl+R/redraw unreachable.\n9. select_menu/select_menu_raw -> UNTOUCHED (out of scope).\n10. run_repl control flow (Submit->trim->empty-skip->/exit|/quit->parse continue->push_history->separator->run_turn; Cancel no-op; Exit persist+break) -> UNCHANGED; save hook attaches to the EXISTING push_history call at 1170 without altering branching; load hook is a new line at 1130.",
+    "zero_regression_guarantee": "Honest answer to the user: NO software change can be proven absolutely (100%) safe in the mathematical sense, but this design reduces residual risk to near-zero by making both tracks ADDITIVE and gating every behavior-preserving claim with a golden test that runs before AND after. Where I cannot guarantee byte-identical behavior, I name it explicitly in the risk register rather than hide it. Concretely:\n\nTRACK B (provider/ProviderFamily) — zero-regression mechanism:\n1. Characterization-test-first: the ~95-case matrix above is written and committed GREEN against the CURRENT code BEFORE any refactor line is touched. Each case's expected_output is the verified-current value (I read config.rs:143-200, openai_executor.rs:35-149, usage.rs:75-303, tools/lib.rs:3350-3518, client.rs:35-88 and confirmed every baseline value matches source). \n2. Scope discipline: the actual code change in v0.4.16 is intentionally minimal — ONLY consolidate the three byte-identical word_match/has_word/reviewer_word_match twins into one shared helper (provably truth-preserving because they are already identical), plus add the ProviderFamily classifier as a NEW non-routing type. config.rs env-writing, resolve_openai_executor_config, the pricing chain, and reviewer routing are NOT re-routed. \n3. Verification: `cargo test` must show the full matrix green before and after; specifically exec_anthropic_custom_url_keeps_xapikey (the #158/#162 guard), all price_* order-sensitive cases, and route_kimi_contains (the documented reviewer-vs-pricing inconsistency) must be unchanged. The Anthropic native path has ZERO code touching it.\n=> Guarantee level: HIGH for the helper consolidation (identical functions), and ABSOLUTE for unchanged callsites (no diff = no regression). The risk is entirely in NOT over-reaching, which the design enforces by deferring pricing/reviewer re-routing.\n\nTRACK A.1 (P8 subagent) — zero-regression mechanism:\n1. Dispatch is structured so Category A (Anthropic native, the common case) and Category B (anthropic-compat) literally cannot enter new code: they have EXECUTOR_PROVIDER != \\\"openai\\\", so resolve_openai_executor_config().is_some()==false, so they run the unchanged else-branch (the literal old line 1894). \n2. Locked by subagent_anthropic_works + subagent_anthropic_compat_works characterization tests (these encode the CURRENT working behavior and must stay green). \n3. The fixed Category C path only activates for configs that TODAY hard-error or wrong-route, so there is no legit working behavior to break.\n=> Guarantee: BEHAVIOR-PRESERVING for A (structurally cannot change), for B (same else-branch, regression-tested, disclosed), pure bug-fix for C.\n\nTRACK A.2 (REPL persistence + Ctrl+R) — zero-regression mechanism:\n1. Every change is an INSERTION: one new persistence module, one new load line at main.rs:1130, one disk-append added to the existing push_history call, one new Ctrl+R match arm. No existing arm, field, or redraw is modified.\n2. In-session behavior is byte-identical: the secret-skip and ARIS_NO_HISTORY apply ONLY to disk I/O; self.history in-memory accumulates exactly as today, so Up/Down/saved_buf/history_idx semantics are untouched.\n3. The 10-item must_not_change checklist is mapped one-to-one to an invariant; the existing input.rs unit tests (normalize_paste_text, layout_*, dropdown matches, push_history_ignores_blank) pin them and must stay green.\n4. Ctrl+R sub-mode owns its own loop and never toggles raw mode / bracketed paste, so it cannot corrupt the outer terminal state.\n=> Guarantee: HIGH. The only paths that change are previously-no-op (Ctrl+R was swallowed by `_ => continue`) and newly-added disk I/O that fails silently.\n\nOVERALL: I can guarantee that previously-working provider configs and REPL operations are preserved to the extent that (a) unchanged code cannot regress, and (b) every changed/shared point is pinned by a golden test that must be green before and after. I cannot honestly promise mathematical 100% — the residual risks (terminal-rendering edge cases in Ctrl+R, the word_match consolidation, the must-not-overreach discipline on pricing/reviewer) are enumerated in the risk register with mitigations. The design's core safety property is that it does the LEAST possible to the dangerous code (provider routing) and confines novelty to additive surfaces (subagent dispatch, REPL persistence/search).",
+    "risk_register": [
+      {
+        "risk": "word_match/has_word/reviewer_word_match consolidation accidentally changes the boundary set (-_/:) or string-end handling, shifting o-series truth tables across executor+pricing+reviewer simultaneously",
+        "severity": "medium",
+        "mitigation": "Extract the EXACT current function verbatim (already byte-identical in all 3 sites); pin with reasoning_o3_mini, reasoning_provider_prefix_o3, reasoning_colon_prefix_o4, reasoning_midword_o32_reject, price_o3, price_google_o3_to_openai, reviewer_word_match_prefix/midword run before+after. Do NOT touch provider_match (different semantics)."
+      },
+      {
+        "risk": "Over-reach: routing pricing_for_model through ProviderFamily would reorder the order-sensitive if-else chain (gpt-5.4-nano before gpt-5.4 etc.) or homogenize the contains/has_word/provider_match mix, causing 12.5x mispricing",
+        "severity": "high",
+        "mitigation": "Explicitly DEFER pricing re-routing out of v0.4.16. Leave pricing_for_model byte-identical. ProviderFamily is classifier-only, not a pricing source. Pinned by all price_* order tests."
+      },
+      {
+        "risk": "Over-reach: unifying route_openai_compat_model with pricing's provider detection would change answers for my-kimi-clone (reviewer kimi via contains vs pricing estimated-default via provider_match), my-minimax-clone (starts_with miss), GLM dual-case",
+        "severity": "high",
+        "mitigation": "DEFER reviewer re-routing. Keep route_openai_compat_model verbatim. Pin route_kimi_contains, route_my_minimax_to_openai, route_glm_case as the documented-inconsistency lock."
+      },
+      {
+        "risk": "#158/#162 regression: a future refactor of config.rs apply_to_env_inner merges anthropic+custom-URL into anthropic-compat, flipping x-api-key to Bearer for anthropic-format proxies (code.newcli.com/claude, modelscope)",
+        "severity": "high",
+        "mitigation": "Do NOT delegate config.rs env-writing in PR1. If wrapped behind ProviderFamily later, AnthropicNative arm must keep x-api-key. Pinned by exec_anthropic_custom_url_keeps_xapikey (highest-priority guard)."
+      },
+      {
+        "risk": "P8 Category B: if the OpenAI-detection predicate is broader than EXACT resolve_openai_executor_config (e.g. a 'non-Anthropic' test), anthropic-compat subagents (DeepSeek opt 7, MiniMax-compat) that currently silently work get mis-routed into the OpenAI branch and break",
+        "severity": "high",
+        "mitigation": "Use resolve_openai_executor_config (EXECUTOR_PROVIDER==\"openai\" exact) as the ONLY dispatch predicate, identical to CLI executor. Pin subagent_anthropic_compat_works. DISCLOSE in release notes that anthropic-compat subagents are regression-tested."
+      },
+      {
+        "risk": "P8 introduces a THIRD AnthropicRuntimeClient or forks the OpenAI executor logic, creating new drift between subagent and CLI executor (max_tokens/reasoning/replay divergence)",
+        "severity": "medium",
+        "mitigation": "Reuse/extract the CLI ExecutorClient + resolve_openai_executor_config abstraction (main.rs:4019) into a shared module; do not re-create. Share the reasoning/strip/replay predicates."
+      },
+      {
+        "risk": "Ctrl+R sub-loop leaves terminal in inconsistent render state (wrong cursor_row) so the outer redraw mis-positions, corrupting the line on return — a visual regression not caught by unit tests",
+        "severity": "medium",
+        "mitigation": "Sub-loop clears its own prompt line and leaves cursor at column 0 of input line before falling through to existing redraw at input.rs:302; manual TTY verification across resize + CJK + dropdown-on-accept; never toggle raw mode / bracketed paste inside sub-loop. This is the hardest-to-unit-test surface; flag for human smoke test."
+      },
+      {
+        "risk": "History persistence writes a secret (API key pasted then submitted as free-text) to ~/.config/aris/history on disk",
+        "severity": "medium",
+        "mitigation": "Disk-only secret-skip heuristic (sk-, AUTH_TOKEN, api[_-]?key=, >=32-char token runs) + file perms 0600 + ARIS_NO_HISTORY kill-switch. In-memory history unchanged so no in-session behavior shift. Heuristic is best-effort, not exhaustive — disclose it can miss novel secret formats."
+      },
+      {
+        "risk": "Secret-skip heuristic false-positive drops a legitimate free-text line from DISK history (user can't recall it next session)",
+        "severity": "low",
+        "mitigation": "Skip is disk-only; line still available via Up-arrow in the SAME session (in-memory unchanged). Keep heuristic conservative (require key-ish keyword OR long high-entropy token, not just any long line)."
+      },
+      {
+        "risk": "Corrupt/oversized history file slows or breaks REPL startup",
+        "severity": "low",
+        "mitigation": "Load tolerates missing/corrupt silently (mirror config.load .ok().unwrap_or_default), cap to last N (e.g. 1000) lines on load; never fail the REPL on history I/O."
+      },
+      {
+        "risk": "setup menu echo (base_url.contains substrings) if migrated to ProviderFamily loses the fallback-to-\"2\" for unmatched openai proxy URLs",
+        "severity": "low",
+        "mitigation": "Leave echo substring logic untouched in v0.4.16 (pure UX, zero routing impact). If touched later, pin setup_menu_2_or_unknown_proxy_echo."
+      },
+      {
+        "risk": "Two parallel tracks edit overlapping files and create merge conflicts or interleaved regressions",
+        "severity": "low",
+        "mitigation": "File-boundary separation enforced (see implementation_plan): Track A touches input.rs + new history module + main.rs:1127-1130/1170 REPL-construction lines only; Track B touches openai_executor.rs/usage.rs/tools-lib.rs predicates + new ProviderFamily type + (P8) tools-lib.rs:1885 build_agent_runtime + main.rs executor dispatch. The only shared file is main.rs but in DISJOINT line regions (REPL loop ~1127-1195 vs executor build ~3918-4073). Coordinate via separate functions; no shared-line edits."
+      }
+    ],
+    "implementation_plan": "ORDERING RULE: characterization tests are written and committed GREEN against current code BEFORE any production line changes. This is the provable safety net — a refactor is only allowed if every golden case is green before AND after.\n\n== PHASE 0 (shared prerequisite, BOTH tracks blocked on this) ==\n0.1 Write the full characterization_test_matrix as Rust #[test]s against CURRENT code:\n    - executor/auth + predicate cases -> crates/aris-cli/tests/ (new file, e.g. provider_routing_golden.rs) for config.rs apply_to_env + resolve; openai_executor predicates as #[cfg(test)] in openai_executor.rs.\n    - pricing cases -> crates/runtime/src/usage.rs #[cfg(test)] module.\n    - reviewer cases -> crates/tools/src/lib.rs #[cfg(test)] module.\n    - subagent A/B/C cases -> crates/tools (build_agent_runtime is provider-blind today; lock the Anthropic+compat works behavior, document C as current-error).\n    - REPL must_not_change -> the existing input.rs tests already cover most; add any gaps (paste, layout, dropdown, push_history blank) as needed.\n0.2 Run `cargo test`; ALL green = baseline locked. Commit. This commit is the rollback anchor.\n\n== PHASE 1: TRACK A and TRACK B run IN PARALLEL (zero file overlap) ==\n\nTRACK A (REPL additive) — owner: REPL engineer. Files:\n  - crates/aris-cli/src/input.rs : add LineEditor::load_history_from + disk-append in/around push_history (input.rs:48) + new Ctrl+R arm (insert after input.rs:287) + reverse_search() helper. NO existing arm edited.\n  - crates/aris-cli/src/main.rs : add ONE load line at ~1130; the save hook attaches to the EXISTING push_history call at 1170 (no branching change). Lines 1127-1130 and 1170 ONLY.\n  - new module (e.g. crates/aris-cli/src/history.rs or inline in input.rs) : file format, 0600, secret-skip, ARIS_NO_HISTORY.\n  Order within track: (A1) persistence load/save + tests for file format/0600/secret-skip/ARIS_NO_HISTORY; (A2) Ctrl+R sub-mode + tests for reverse_search match/cancel/accept; (A3) manual TTY smoke test (resize, CJK, dropdown-on-accept, paste still flattens).\n\nTRACK B (provider) — owner: provider engineer. Files:\n  - crates/aris-cli/src/openai_executor.rs (word_match), crates/runtime/src/usage.rs (has_word), crates/tools/src/lib.rs (reviewer_word_match) : consolidate the 3 identical twins into ONE shared helper (e.g. in runtime crate, re-exported). NO truth value changes; provider_match untouched.\n  - new ProviderFamily type (e.g. crates/runtime/src/provider.rs or aris-cli) : classifier only, from_executor_provider exact-match. NOT wired into config.rs env-writing or pricing or reviewer routing in this release.\n  Order within track: (B1) extract word_match helper, re-run reasoning/price/reviewer word-boundary tests; (B2) add ProviderFamily classifier + its own unit tests; (B3) P8 subagent dispatch (see Phase 2).\n\nFILE-OVERLAP CHECK: Track A touches input.rs + main.rs(1127-1170 region) + new history module. Track B touches openai_executor.rs + usage.rs + tools/lib.rs(predicates + later 1885) + new provider module + main.rs(executor build 3918-4073 region). The ONLY shared file is main.rs, but in DISJOINT line regions (REPL loop ~1127-1195 vs executor build ~3918-4073). No shared-line edit => safe to parallelize; final merge is a clean concat.\n\n== PHASE 2: P8 (Track B, after B2; can overlap Track A) ==\n  - crates/tools/src/lib.rs:1885 build_agent_runtime : add `if resolve_openai_executor_config().is_some() { OpenAI } else { unchanged Anthropic }` dispatch; change return type to the enum-parameterized runtime (mirror CLI ExecutorClient main.rs:4019). Reuse/extract CLI ExecutorClient + OpenAI client — do NOT create a third client.\n  - Verify subagent_anthropic_works + subagent_anthropic_compat_works stay green (Category A/B structurally unchanged). Add subagent OpenAI-family positive test (Category C now routes correctly).\n\n== PHASE 3: integration ==\n  3.1 Merge Track A + Track B; run FULL characterization matrix — must be 100% green (same as Phase 0.2).\n  3.2 cargo test workspace-wide + clippy.\n  3.3 Per project convention (every step calls Codex): run Codex review on the design (this doc), the characterization matrix completeness, and the final diff. PASS gate required before push.\n  3.4 Do NOT push until user has tested locally (per feedback_dev_workflow: commit, wait for user verification, then push). Branch first since this is not a trivial change.\n\nWHO DOES WHAT: Phase 0 is shared (whoever sets up tests, ideally both pairing so each track owns its baseline). Track A = REPL engineer (input.rs/history/main.rs REPL region). Track B = provider engineer (predicates/ProviderFamily/P8/main.rs executor region). Codex reviews each phase gate."
+  }
+}

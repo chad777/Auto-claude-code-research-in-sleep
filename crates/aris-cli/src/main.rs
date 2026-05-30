@@ -7,6 +7,20 @@ mod openai_compat;
 mod openai_executor;
 mod render;
 
+/// Crate-wide test lock for any test that mutates process-global env vars
+/// (`EXECUTOR_*` / `OPENAI_API_KEY` / `ANTHROPIC_*`). A SINGLE lock shared
+/// across the `config` and `openai_executor` test modules so their
+/// env-mutating characterization tests cannot race in a parallel
+/// `cargo test` (codex Phase-0 gap #1). Poison-tolerant guard helper so one
+/// panicking test does not cascade-poison the rest.
+#[cfg(test)]
+pub(crate) static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn env_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    ENV_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+}
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;

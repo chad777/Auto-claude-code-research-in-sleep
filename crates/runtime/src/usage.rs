@@ -436,8 +436,66 @@ impl UsageTracker {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_usd, pricing_for_model, TokenUsage, UsageTracker};
+    // Test docs reference matrix IDs like `matrix[39]` and bare provider
+    // names (OpenAI, DeepSeek, IEEE-754) for traceability; the pedantic
+    // `doc_markdown` lint wants every such token backticked. These are
+    // test-only docs, so we silence it module-wide rather than peppering
+    // backticks through prose.
+    #![allow(clippy::doc_markdown)]
+
+    use super::{
+        format_usd, has_word, pricing_for_model, provider_match, TokenUsage, UsageTracker,
+    };
     use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
+
+    // ── Characterization-test helpers (v0.4.16 Phase 0, T2) ─────────────
+    //
+    // These are GOLDEN-MASTER tests: they lock what `pricing_for_model`
+    // *actually computes today*, NOT what it "should" compute. They exist
+    // to guard the upcoming P7 provider-routing refactor. `pricing_for_model`
+    // is a SEQUENCE-SENSITIVE if-else chain mixing THREE match strategies:
+    //   * `contains()`     — claude / gpt-N / gemini / deepseek families
+    //   * `has_word()`     — o-series (o4/o3/o1), word-boundary only
+    //   * `provider_match()` — Chinese OSS providers, prefix/segment only
+    // Re-ordering or unifying these branches would silently mis-price by up
+    // to 12.5x (e.g. gpt-5.4-nano $0.20 vs gpt-5.4 $2.50 = 12.5x). Each test
+    // documents WHICH branch it pins and WHY the order matters.
+    //
+    // Discipline: if a test fails, the CODE is source of truth — update the
+    // expected value and record the discrepancy, never weaken the assertion.
+
+    /// Assert all four per-million tiers of a resolved `ModelPricing`.
+    ///
+    /// input / output / cache_creation are stored verbatim from f64 literals
+    /// in the chain, so they get EXACT equality. cache_read is always a
+    /// DERIVED product (`input * 0.1` for OpenAI, `input / 2.0` for generic,
+    /// or a verbatim Anthropic/DeepSeek literal), so IEEE-754 rounding can
+    /// make e.g. `0.20 * 0.1 == 0.020000000000000004 != 0.02`. We therefore
+    /// compare cache_read within a 1e-12 absolute tolerance — far tighter
+    /// than ANY real pricing-tier gap (smallest is 0.005), so this still
+    /// catches a wrong tier (off by 0.01+) while ignoring the last-ULP noise
+    /// that is the code's actual output. (Code stays source of truth.)
+    fn assert_pricing(model: &str, input: f64, output: f64, cc: f64, cr: f64) {
+        let p = pricing_for_model(model)
+            .unwrap_or_else(|| panic!("expected `{model}` to resolve to a pricing tier"));
+        // 1e-12 abs tolerance on every field. input/output/cc are stored
+        // verbatim so they match to the bit; cache_read is derived
+        // (`input*0.1` / `input/2`) and carries last-ULP noise. The
+        // tolerance is ~9 orders of magnitude below the smallest real tier
+        // gap (0.005), so a wrong tier still fails loudly while ULP noise is
+        // absorbed. Using `abs() < eps` (not `assert_eq!`) also keeps clippy
+        // `float_cmp` quiet without an `#[allow]`.
+        let close = |got: f64, want: f64, field: &str| {
+            assert!(
+                (got - want).abs() < 1e-12,
+                "{field} tier mismatch for `{model}`: got {got}, expected ~{want}"
+            );
+        };
+        close(p.input_cost_per_million, input, "input");
+        close(p.output_cost_per_million, output, "output");
+        close(p.cache_creation_cost_per_million, cc, "cache_creation");
+        close(p.cache_read_cost_per_million, cr, "cache_read");
+    }
 
     #[test]
     fn tracks_true_cumulative_usage() {
@@ -587,5 +645,373 @@ mod tests {
             pricing_for_model("kimiclone-foo").is_some(),
             "kimiclone-foo starts with `kimi` so the provider_match prefix branch fires"
         );
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // CHARACTERIZATION TESTS (v0.4.16 Phase 0, agent T2)
+    // Golden master of `pricing_for_model` — pins TODAY'S routing for the
+    // P7 provider-routing refactor. Maps to design_raw.json
+    // characterization_test_matrix items 39-67 (price_*) plus added coverage.
+    // ════════════════════════════════════════════════════════════════════
+
+    // ── Anthropic Claude family (`contains` strategy) ───────────────────
+
+    /// matrix[39] price_haiku — `contains("haiku")`, FIRST branch in chain.
+    #[test]
+    fn price_haiku() {
+        assert_pricing("claude-haiku-4-5", 1.0, 5.0, 1.25, 0.1);
+    }
+
+    /// matrix[40] price_opus — `contains("opus")`. Note opus numerics are
+    /// identical to the default sonnet tier (15/75/18.75/1.5); the branch
+    /// still matters because `opus` is checked BEFORE `sonnet`.
+    #[test]
+    fn price_opus() {
+        assert_pricing("claude-opus-4-8", 15.0, 75.0, 18.75, 1.5);
+    }
+
+    /// matrix[41] price_sonnet — `contains("sonnet")` -> default_sonnet_tier.
+    /// Numerically equal to opus by design; locks that they stay aligned.
+    #[test]
+    fn price_sonnet() {
+        assert_pricing("claude-sonnet-4-6", 15.0, 75.0, 18.75, 1.5);
+    }
+
+    // ── OpenAI GPT families (`contains`, ORDER-SENSITIVE) ───────────────
+    // openai_pricing(input, output): cache_creation = input,
+    // cache_read = input * 0.1 (10% prefix-cache discount).
+
+    /// matrix[42] price_gpt55 — `contains("gpt-5.5")`. cr = 5.0*0.1 = 0.5.
+    #[test]
+    fn price_gpt55() {
+        assert_pricing("gpt-5.5", 5.0, 30.0, 5.0, 0.5);
+    }
+
+    /// codex Phase-0 gap #2 — contains-vs-word_match discriminator for the
+    /// pricing chain. `xxgpt-5.5yy` has NO word boundary around `gpt-5.5`
+    /// (`x`/`y` are not in the -_/: set), so it routes to GPT-5.5 pricing ONLY
+    /// because the chain uses `contains("gpt-5.5")`. If a refactor ever
+    /// converts this branch to a word-boundary match, this case flips to the
+    /// estimated-default tier and the assert fails — the regression we want to
+    /// catch. (The order-sensitive `price_gpt54_*` cases use hyphen-bounded
+    /// hosts and so do not exercise this axis.)
+    #[test]
+    fn price_contains_strategy_is_bare_substring() {
+        assert_pricing("xxgpt-5.5yy", 5.0, 30.0, 5.0, 0.5);
+    }
+
+    /// matrix[43] price_gpt54_nano_order — ORDER-SENSITIVE: `gpt-5.4-nano`
+    /// MUST be checked BEFORE `gpt-5.4` (which `contains` would also match).
+    /// If reordered, this $0.20 model gets billed at $2.50 = 12.5x. cr=0.02.
+    #[test]
+    fn price_gpt54_nano_order_before_base() {
+        assert_pricing("gpt-5.4-nano", 0.20, 1.25, 0.20, 0.02);
+    }
+
+    /// matrix[44] price_gpt54_mini_order — ORDER-SENSITIVE: `gpt-5.4-mini`
+    /// before `gpt-5.4`. cr = 0.75*0.1 = 0.075.
+    #[test]
+    fn price_gpt54_mini_order_before_base() {
+        assert_pricing("gpt-5.4-mini", 0.75, 4.5, 0.75, 0.075);
+    }
+
+    /// matrix[45] price_gpt54 — `contains("gpt-5.4")` base tier, reached
+    /// only AFTER nano/mini have failed. cr = 2.5*0.1 = 0.25.
+    #[test]
+    fn price_gpt54_base() {
+        assert_pricing("gpt-5.4", 2.5, 15.0, 2.5, 0.25);
+    }
+
+    /// matrix[46] price_gpt4o_mini_order — ORDER-SENSITIVE: `gpt-4o-mini`
+    /// before `gpt-4o`. cr = 0.15*0.1 = 0.015.
+    #[test]
+    fn price_gpt4o_mini_order_before_base() {
+        assert_pricing("gpt-4o-mini", 0.15, 0.6, 0.15, 0.015);
+    }
+
+    /// matrix[47] price_gpt4o — `contains("gpt-4o")` base. cr = 0.25.
+    #[test]
+    fn price_gpt4o_base() {
+        assert_pricing("gpt-4o", 2.5, 10.0, 2.5, 0.25);
+    }
+
+    // ── OpenAI o-series (`has_word`, word-boundary strategy) ────────────
+
+    /// matrix[48] price_o4_mini — `has_word("o4")` with `-mini` boundary.
+    /// cr = 4.0*0.1 = 0.4.
+    #[test]
+    fn price_o4_mini_has_word() {
+        assert_pricing("o4-mini", 4.0, 16.0, 4.0, 0.4);
+    }
+
+    /// matrix[49] price_o3 — bare `o3`, `has_word` start+end boundary.
+    /// cr = 2.0*0.1 = 0.2.
+    #[test]
+    fn price_o3_bare_has_word() {
+        assert_pricing("o3", 2.0, 8.0, 2.0, 0.2);
+    }
+
+    /// matrix[50] price_o1_preview — `has_word("o1")` with `-preview`
+    /// boundary. cr = 15.0*0.1 = 1.5.
+    #[test]
+    fn price_o1_preview_has_word() {
+        assert_pricing("o1-preview", 15.0, 60.0, 15.0, 1.5);
+    }
+
+    /// matrix[51] price_google_o3_to_openai — FEATURE: a provider-prefixed
+    /// o-series model `google/o3` routes to the OpenAI o3 PRICE because
+    /// `has_word` treats `/` as a boundary. The `google/` provider segment
+    /// is intentionally ignored for pricing. Pins this cross-provider quirk.
+    #[test]
+    fn price_google_slash_o3_routes_to_openai() {
+        assert_pricing("google/o3", 2.0, 8.0, 2.0, 0.2);
+    }
+
+    /// Added: `o3-mini` resolves to the o3 price tier (has_word `o3` with
+    /// trailing `-` boundary). Mirrors reasoning matrix[20].
+    #[test]
+    fn price_o3_mini_has_word() {
+        assert_pricing("o3-mini", 2.0, 8.0, 2.0, 0.2);
+    }
+
+    /// Added: mid-word `o32-mini` must NOT match the o3 tier (has_word
+    /// rejects `o32` because `2` is not a boundary). Mirrors matrix[23].
+    /// It also matches no other branch -> None -> estimated-default.
+    #[test]
+    fn price_o32_midword_rejected() {
+        assert!(
+            pricing_for_model("o32-mini").is_none(),
+            "o32-mini must NOT route to o3 tier (has_word mid-word rejection)"
+        );
+    }
+
+    // ── Google Gemini (`contains`, ORDER-SENSITIVE) ─────────────────────
+    // generic_pricing(input, output): cache_creation = input,
+    // cache_read = input / 2.
+
+    /// matrix[52] price_gemini_flash_order — ORDER-SENSITIVE: `gemini-2.5-
+    /// flash` MUST precede `gemini-2.5-pro` (both share the `gemini-2.5-`
+    /// stem; pro's `contains` would NOT match flash, but flash's would not
+    /// match pro — the real risk is a future merge). cr = 0.3/2 = 0.15.
+    #[test]
+    fn price_gemini_25_flash_order_before_pro() {
+        assert_pricing("gemini-2.5-flash", 0.3, 2.5, 0.3, 0.15);
+    }
+
+    /// matrix[53] price_gemini_pro — `contains("gemini-2.5-pro")`.
+    /// cr = 2.5/2 = 1.25.
+    #[test]
+    fn price_gemini_25_pro() {
+        assert_pricing("gemini-2.5-pro", 2.5, 10.0, 2.5, 1.25);
+    }
+
+    /// matrix[54] price_gemini_20_flash — `contains("gemini-2.0-flash")`.
+    /// cr = 0.1/2 = 0.05.
+    #[test]
+    fn price_gemini_20_flash() {
+        assert_pricing("gemini-2.0-flash", 0.1, 0.4, 0.1, 0.05);
+    }
+
+    // ── DeepSeek (`contains`, ORDER-SENSITIVE + explicit cache tiers) ───
+
+    /// matrix[55] price_deepseek_v4_order — ORDER-SENSITIVE: `deepseek-v4`
+    /// before `deepseek-v3`. v4 happens to share v3's numerics today, so a
+    /// reorder would not change the price — but this pins that they remain
+    /// identical (the chain intentionally lists them separately).
+    #[test]
+    fn price_deepseek_v4_order_before_v3() {
+        assert_pricing("deepseek-v4", 0.27, 1.10, 0.27, 0.07);
+    }
+
+    /// matrix[56] price_deepseek_v3 — `contains("deepseek-v3")`.
+    #[test]
+    fn price_deepseek_v3() {
+        assert_pricing("deepseek-v3", 0.27, 1.10, 0.27, 0.07);
+    }
+
+    /// matrix[57] price_deepseek_r1 — both `deepseek-r1` and
+    /// `deepseek-reasoner` alias to the R1 tier. Higher than v3/v4.
+    #[test]
+    fn price_deepseek_r1_and_reasoner_alias() {
+        assert_pricing("deepseek-r1", 0.55, 2.19, 0.55, 0.14);
+        assert_pricing("deepseek-reasoner", 0.55, 2.19, 0.55, 0.14);
+    }
+
+    /// matrix[58] price_deepseek_chat_fallthrough — `deepseek-chat` matches
+    /// none of the v4/v3/r1 specific branches and falls through to the bare
+    /// `contains("deepseek")` catch-all (v3-equivalent rate). ORDER-SENSITIVE:
+    /// the bare branch MUST come LAST among deepseek branches.
+    #[test]
+    fn price_deepseek_chat_bare_fallthrough() {
+        assert_pricing("deepseek-chat", 0.27, 1.10, 0.27, 0.07);
+    }
+
+    // ── Chinese OSS providers (`provider_match`, prefix/segment strategy) ─
+
+    /// matrix[59] price_glm — `provider_match("glm")` start-of-string.
+    /// generic cr = 0.5/2 = 0.25.
+    #[test]
+    fn price_glm() {
+        assert_pricing("glm-4-plus", 0.5, 2.0, 0.5, 0.25);
+    }
+
+    /// matrix[60] price_minimax — `provider_match("minimax")` start-of-string
+    /// (lowercased, so `MiniMax-...` also matches). cr = 0.6/2 = 0.3.
+    #[test]
+    fn price_minimax() {
+        assert_pricing("minimax-m2.7", 0.6, 2.4, 0.6, 0.3);
+        // Case-insensitive: chain lowercases first, so the real cased name
+        // `MiniMax-M2.7` resolves identically.
+        assert_pricing("MiniMax-M2.7", 0.6, 2.4, 0.6, 0.3);
+    }
+
+    /// matrix[61] price_kimi_moonshot — both `kimi` and `moonshot` prefixes
+    /// share the same tier (Moonshot is Kimi's vendor). cr = 0.6/2 = 0.3.
+    #[test]
+    fn price_kimi_and_moonshot() {
+        assert_pricing("kimi-k2.5", 0.6, 2.5, 0.6, 0.3);
+        assert_pricing("moonshot-v1", 0.6, 2.5, 0.6, 0.3);
+    }
+
+    /// matrix[62] price_provider_prefix_kimi — `openai/kimi-k2.5` resolves
+    /// via the `/kimi` provider-segment branch of `provider_match`. Pins
+    /// that a provider-prefixed OSS name still prices at its OWN tier
+    /// (NOT openai) — note this differs from the o-series quirk where
+    /// `google/o3` routes to the OPENAI price.
+    #[test]
+    fn price_provider_prefix_kimi_resolves_kimi_tier() {
+        assert_pricing("openai/kimi-k2.5", 0.6, 2.5, 0.6, 0.3);
+    }
+
+    /// matrix[63] price_my_kimi_clone_rejected — CRITICAL mid-word rejection:
+    /// `my-kimi-clone` has `kimi` in the MIDDLE (no start, no `/`/`:` sep),
+    /// so `provider_match` returns false -> None -> estimated-default sonnet
+    /// tier. Protects user-named models from silently billing at Kimi rate.
+    #[test]
+    fn price_my_kimi_clone_midword_rejected() {
+        assert!(
+            pricing_for_model("my-kimi-clone").is_none(),
+            "my-kimi-clone must NOT route to Kimi tier (provider_match mid-word reject)"
+        );
+    }
+
+    /// matrix[64] price_kimiclone_permissive — PINNED documented behaviour:
+    /// `kimiclone-foo` STARTS WITH `kimi`, so `provider_match`'s
+    /// `starts_with` branch fires and it prices at the Kimi tier. This is
+    /// intentionally permissive; pinned so a future tightening of
+    /// provider_match doesn't silently break real `kimi-...` names.
+    #[test]
+    fn price_kimiclone_starts_with_permissive() {
+        assert_pricing("kimiclone-foo", 0.6, 2.5, 0.6, 0.3);
+    }
+
+    /// matrix[65] price_qwen_digit_suffix — `qwen3.6-plus`: the family name
+    /// is immediately followed by a DIGIT (`3`). `provider_match` uses
+    /// `starts_with` so it matches; the boundary-based `has_word` would
+    /// REJECT this (digit is not a boundary). Pins the reason provider_match
+    /// is more permissive than has_word for version-suffixed names.
+    #[test]
+    fn price_qwen_digit_suffix() {
+        assert_pricing("qwen3.6-plus", 0.4, 1.6, 0.4, 0.2);
+    }
+
+    /// matrix[66] price_mimo_doubao — remaining two providers.
+    /// mimo generic(0.4,1.6) cr=0.2; doubao generic(0.3,1.2) cr=0.15.
+    #[test]
+    fn price_mimo_and_doubao() {
+        assert_pricing("mimo-7b", 0.4, 1.6, 0.4, 0.2);
+        assert_pricing("doubao-pro", 0.3, 1.2, 0.3, 0.15);
+    }
+
+    /// matrix[67] price_unknown_none — a model matching NO branch returns
+    /// None; the caller then appends ` pricing=estimated-default` and falls
+    /// back to default_sonnet_tier. Pins the fallthrough contract.
+    #[test]
+    fn price_unknown_returns_none_and_marks_default() {
+        assert!(
+            pricing_for_model("custom-model").is_none(),
+            "unknown model must return None"
+        );
+        let usage = TokenUsage {
+            input_tokens: 100,
+            output_tokens: 100,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+        };
+        let lines = usage.summary_lines_for_model("usage", Some("custom-model"));
+        assert!(
+            lines[0].contains("pricing=estimated-default"),
+            "unknown model summary must carry estimated-default marker"
+        );
+    }
+
+    // ── Cross-strategy boundary cases (added by T2) ─────────────────────
+
+    /// Added: pins that the o-series `has_word` branch does NOT swallow
+    /// the gpt-4o branch. `gpt-4o` contains the substring `o` but is matched
+    /// by `contains("gpt-4o")` (earlier) at $2.5, NOT by any o-series word.
+    /// Guards against a refactor that moves o-series before gpt families.
+    #[test]
+    fn price_gpt4o_not_captured_by_o_series() {
+        // gpt-4o resolves to the gpt-4o tier (2.5/10.0), NOT o4/o3/o1.
+        assert_pricing("gpt-4o", 2.5, 10.0, 2.5, 0.25);
+    }
+
+    /// Added: an o-series name with a provider prefix using `:` separator
+    /// (`proxy:o3`) — `has_word` treats `:` as a boundary, so it routes to
+    /// the o3 OpenAI tier. Complements the `/` case (matrix[51]).
+    #[test]
+    fn price_colon_prefixed_o3_routes_openai() {
+        assert_pricing("proxy:o3", 2.0, 8.0, 2.0, 0.2);
+    }
+
+    /// Added: `moonshot`-prefixed via provider segment `proxy:moonshot-v1`
+    /// resolves to the kimi/moonshot tier through provider_match's `:`
+    /// branch. Pins the colon-separator path of provider_match for OSS.
+    #[test]
+    fn price_colon_prefixed_moonshot_resolves_kimi_tier() {
+        assert_pricing("proxy:moonshot-v1", 0.6, 2.5, 0.6, 0.3);
+    }
+
+    // ── Direct unit tests for the two matcher primitives ────────────────
+
+    /// `has_word` boundary semantics, locked directly (start/end of string
+    /// and `-_/:` treated as boundaries; digits/letters are NOT boundaries).
+    #[test]
+    fn has_word_boundary_semantics() {
+        // Hits: start+end, after `-`, after `/`, after `:`, before `_`.
+        assert!(has_word("o3", "o3"), "bare needle == whole string");
+        assert!(has_word("o3-mini", "o3"), "trailing `-` is a boundary");
+        assert!(has_word("google/o3", "o3"), "leading `/` is a boundary");
+        assert!(has_word("proxy:o3", "o3"), "leading `:` is a boundary");
+        assert!(has_word("o3_x", "o3"), "trailing `_` is a boundary");
+        // Misses: digit/letter neighbours are NOT boundaries.
+        assert!(!has_word("o32", "o3"), "trailing digit is not a boundary");
+        assert!(!has_word("xo3", "o3"), "leading letter is not a boundary");
+        assert!(!has_word("o3x", "o3"), "trailing letter is not a boundary");
+        // Empty needle never matches.
+        assert!(!has_word("o3", ""), "empty needle never matches");
+    }
+
+    /// `provider_match` semantics, locked directly: start-of-string OR after
+    /// a `/`/`:` provider separator; mid-word and empty-prefix are rejected.
+    #[test]
+    fn provider_match_semantics() {
+        // Start-of-string (permissive — digit/letter suffix both OK).
+        assert!(provider_match("kimi-k2.5", "kimi"), "start-of-string match");
+        assert!(provider_match("qwen3.6", "qwen"), "digit suffix still matches");
+        assert!(
+            provider_match("kimiclone", "kimi"),
+            "starts_with is permissive even with letter suffix"
+        );
+        // Provider-segment separators.
+        assert!(provider_match("openai/kimi-x", "kimi"), "`/` segment match");
+        assert!(provider_match("proxy:moonshot", "moonshot"), "`:` segment match");
+        // Rejections.
+        assert!(
+            !provider_match("my-kimi-clone", "kimi"),
+            "mid-word (after `-`) is NOT a provider segment -> reject"
+        );
+        assert!(!provider_match("kimi-x", ""), "empty prefix always false");
     }
 }

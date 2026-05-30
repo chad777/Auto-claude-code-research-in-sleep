@@ -3768,11 +3768,12 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        agent_permission_policy, allowed_tools_for_subagent, execute_agent_with_spawn,
-        execute_tool, final_assistant_text, mvp_tool_specs, persist_agent_terminal_state,
-        resolve_reviewer_model, route_openai_compat_model, AgentInput, AgentJob,
-        SubagentToolExecutor,
+        agent_permission_policy, allowed_tools_for_subagent, build_agent_runtime,
+        execute_agent_with_spawn, execute_tool, final_assistant_text, mvp_tool_specs,
+        persist_agent_terminal_state, resolve_reviewer_model, reviewer_supports_reasoning_effort,
+        route_openai_compat_model, AgentInput, AgentJob, AnthropicClient, SubagentToolExecutor,
     };
+    use api::AuthSource;
     use runtime::{ApiRequest, AssistantEvent, ConversationRuntime, RuntimeError, Session};
     use serde_json::json;
 
@@ -5179,6 +5180,103 @@ printf 'pwsh:%s' "$1"
         }
     }
 
+    // v0.4.16 Phase 0 — env vars that govern the SUBAGENT auth path
+    // (AnthropicClient::from_env -> AuthSource resolution) and the
+    // provider-blind executor env that build_agent_runtime currently
+    // ignores. Captured + cleared so the subagent characterization tests
+    // run against a known-empty baseline and restore the developer's
+    // real shell on drop.
+    const SUBAGENT_AUTH_ENVS: &[&str] = &[
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_BASE_URL",
+        "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS",
+        "EXECUTOR_PROVIDER",
+        "EXECUTOR_API_KEY",
+        "EXECUTOR_BASE_URL",
+        // codex Phase-0 gap #3: clear OPENAI_API_KEY too. Without this, a P8
+        // regression that mis-routes a Category A/B (Anthropic / anthropic-
+        // compat) subagent into the OpenAI branch could still build Ok on a
+        // dev/CI box that happens to export OPENAI_API_KEY, hiding the
+        // misroute behind a false-green Ok-only assertion.
+        "OPENAI_API_KEY",
+    ];
+
+    struct SubagentEnvSnapshot {
+        vars: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl SubagentEnvSnapshot {
+        fn capture_and_clear() -> Self {
+            let vars = SUBAGENT_AUTH_ENVS
+                .iter()
+                .map(|n| (*n, std::env::var(n).ok()))
+                .collect();
+            for n in SUBAGENT_AUTH_ENVS {
+                std::env::remove_var(n);
+            }
+            Self { vars }
+        }
+    }
+
+    impl Drop for SubagentEnvSnapshot {
+        fn drop(&mut self) {
+            for (name, prior) in &self.vars {
+                match prior {
+                    Some(v) => std::env::set_var(name, v),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
+
+    /// Build a real `AgentJob` (the input to `build_agent_runtime`) without
+    /// going through `execute_agent_with_spawn`'s disk side-effects. We grab
+    /// one via the existing fake-spawn capture path so the manifest/prompt
+    /// shape stays in sync with production. Returns an `AgentJob` that points
+    /// at a temp store the caller is responsible for cleaning up.
+    //
+    // CLAWD_AGENT_STORE is a PROCESS-GLOBAL env var also mutated by the
+    // existing `agent_*` tests under `env_lock()`. Those tests use a DIFFERENT
+    // mutex than the subagent characterization tests (`env_lock_reviewer()`),
+    // so we must serialize on `env_lock()` here too while we touch the store,
+    // otherwise our `remove_var` races and clobbers a concurrent agent test's
+    // store path. Lock order is always reviewer-lock (held by caller) then
+    // env_lock (here) — no other test acquires them in the reverse order, so
+    // there is no deadlock cycle.
+    fn capture_agent_job(store_name: &str) -> (AgentJob, PathBuf) {
+        let _agent_guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = temp_path(store_name);
+        std::env::set_var("CLAWD_AGENT_STORE", &dir);
+        let captured = Arc::new(Mutex::new(None::<AgentJob>));
+        let captured_for_spawn = Arc::clone(&captured);
+        execute_agent_with_spawn(
+            AgentInput {
+                description: "char build_agent_runtime".to_string(),
+                prompt: "Do the delegated work.".to_string(),
+                subagent_type: Some("Explore".to_string()),
+                name: Some("char-runtime".to_string()),
+                model: None,
+            },
+            move |job| {
+                *captured_for_spawn
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(job);
+                Ok(())
+            },
+        )
+        .expect("Agent should capture the job");
+        std::env::remove_var("CLAWD_AGENT_STORE");
+        let job = captured
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .expect("spawn job should be captured");
+        (job, dir)
+    }
+
     #[test]
     fn route_openai_compat_model_picks_provider_from_name() {
         assert_eq!(route_openai_compat_model("gpt-5.5").0, "OPENAI_API_KEY");
@@ -5279,5 +5377,442 @@ printf 'pwsh:%s' "$1"
         assert!(super::reviewer_word_match("proxy:o4-preview", "o4"));
         // Digit-suffix collision — "o32-mini" must NOT count as an o3 model.
         assert!(!super::reviewer_word_match("o32-mini", "o3"));
+    }
+
+    // ===================================================================
+    // v0.4.16 Phase 0 — CHARACTERIZATION TESTS (reviewer routing + subagent)
+    //
+    // These lock down what `route_openai_compat_model`, `resolve_reviewer_model`,
+    // `reviewer_supports_reasoning_effort`, and `build_agent_runtime` actually
+    // do TODAY, BEFORE the P7 (provider routing) and P8 (subagent dispatch)
+    // refactors. They are intentionally strict: if a refactor changes any
+    // observed value, the test fails and the change must be deliberate.
+    //
+    // The most load-bearing locks here capture KNOWN, INTENTIONAL
+    // inconsistencies between the reviewer router (contains / starts_with)
+    // and the pricing table (provider_match word-boundary). Unifying the two
+    // would "fix" these and silently change routing — these tests forbid that
+    // from happening by accident.
+    // ===================================================================
+
+    // ---- A. reviewer route_openai_compat_model characterization -----------
+
+    // route_kimi_contains: "my-kimi" routes to KIMI because the reviewer
+    // router uses a bare `model.contains("kimi")`. This is the MAJOR known
+    // inconsistency: the pricing table's `provider_match` REJECTS the
+    // mid-word "my-kimi-clone" (-> None / sonnet default) because it requires
+    // a word boundary, while the reviewer router accepts it as Kimi. We lock
+    // BOTH halves of that divergence right next to each other so a future
+    // "unification" cannot quietly collapse them.
+    #[test]
+    fn char_route_kimi_contains_differs_from_pricing() {
+        // Reviewer side: contains("kimi") -> Kimi, no boundary required.
+        assert_eq!(
+            route_openai_compat_model("my-kimi"),
+            (
+                "KIMI_API_KEY",
+                "https://api.moonshot.cn/v1/chat/completions",
+                "kimi"
+            ),
+            "reviewer router uses contains() so mid-word 'my-kimi' -> Kimi"
+        );
+        // Same loose contains for the design's `my-kimi-clone` string: the
+        // reviewer router STILL classifies it as Kimi, whereas pricing's
+        // provider_match rejects it (locked separately in the pricing tests
+        // as price_my_kimi_clone_rejected -> None). This asymmetry is the
+        // point of the test.
+        assert_eq!(
+            route_openai_compat_model("my-kimi-clone").2,
+            "kimi",
+            "INTENTIONAL inconsistency: reviewer contains('kimi') accepts \
+             'my-kimi-clone' as Kimi even though pricing provider_match rejects it"
+        );
+        // moonshot is the other alias in the same contains() branch.
+        assert_eq!(route_openai_compat_model("moonshot-v1").0, "KIMI_API_KEY");
+
+        // codex Phase-0 gap #2: the `my-kimi` / `my-kimi-clone` cases above do
+        // NOT distinguish contains() from word_match() — `kimi` sits between
+        // `-` boundaries there, so word_match would ALSO match. To truly lock
+        // that the reviewer router is `contains` (so P7's word_match
+        // consolidation can't silently tighten it), assert a host with
+        // NON-boundary chars hugging the needle: contains matches, word_match
+        // would reject (`x`/`y` are not in the -_/: boundary set).
+        assert_eq!(
+            route_openai_compat_model("xxkimiyy").2,
+            "kimi",
+            "reviewer router must use contains() — 'xxkimiyy' has no boundary \
+             around 'kimi' yet still routes to Kimi"
+        );
+    }
+
+    // route_my_minimax_to_openai: MiniMax is matched with starts_with, NOT
+    // contains. So "my-minimax-clone" (minimax NOT at the front) falls
+    // through to the OpenAI else-branch. Locks the starts_with mid-word miss.
+    #[test]
+    fn char_route_minimax_startswith_and_midword_miss() {
+        // starts_with hit (both case variants are explicitly handled).
+        assert_eq!(
+            route_openai_compat_model("MiniMax-M2.7"),
+            (
+                "MINIMAX_API_KEY",
+                "https://api.minimax.chat/v1/chat/completions",
+                "minimax"
+            )
+        );
+        assert_eq!(
+            route_openai_compat_model("minimax-m2.7").0,
+            "MINIMAX_API_KEY",
+            "lowercase starts_with branch"
+        );
+        // starts_with MISS: minimax not at front -> falls through to OpenAI.
+        // NOTE asymmetry: kimi uses contains() (would match here) but minimax
+        // uses starts_with() (does not). Locked deliberately.
+        assert_eq!(
+            route_openai_compat_model("my-minimax-clone"),
+            (
+                "OPENAI_API_KEY",
+                "https://api.openai.com/v1/chat/completions",
+                "openai"
+            ),
+            "minimax starts_with() miss falls to OpenAI else-branch"
+        );
+    }
+
+    // route_glm_case: GLM is matched with contains("glm") || contains("GLM"),
+    // i.e. dual-case but NOT ascii-lowercased. Lock both cases route to GLM.
+    #[test]
+    fn char_route_glm_dual_case_contains() {
+        assert_eq!(
+            route_openai_compat_model("GLM-5"),
+            (
+                "GLM_API_KEY",
+                "https://open.bigmodel.cn/api/paas/v4/chat/completions",
+                "glm"
+            )
+        );
+        // lowercase contains branch
+        assert_eq!(route_openai_compat_model("glm-4-plus").0, "GLM_API_KEY");
+        // mixed-case substring still hits (contains is case-sensitive but the
+        // branch ORs both "glm" and "GLM"; a "Glm" mixed form matches neither,
+        // so it falls through — lock that too as the current behavior).
+        assert_eq!(
+            route_openai_compat_model("Glm-7").0,
+            "OPENAI_API_KEY",
+            "mixed-case 'Glm' matches neither 'glm' nor 'GLM' substring -> OpenAI \
+             (current behavior; only the two explicit cases are handled)"
+        );
+    }
+
+    // route_gemini / route_deepseek / route_else fallthrough.
+    #[test]
+    fn char_route_gemini_deepseek_and_else() {
+        assert_eq!(
+            route_openai_compat_model("gemini-2.5-pro"),
+            (
+                "GEMINI_API_KEY",
+                "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+                "gemini"
+            )
+        );
+        assert_eq!(
+            route_openai_compat_model("deepseek-chat"),
+            (
+                "DEEPSEEK_API_KEY",
+                "https://api.deepseek.com/v1/chat/completions",
+                "deepseek"
+            )
+        );
+        // else-branch: gpt / o3 / o4 all collapse to OpenAI.
+        for m in ["gpt-5.5", "o3", "o4", "totally-unknown-model"] {
+            assert_eq!(
+                route_openai_compat_model(m),
+                (
+                    "OPENAI_API_KEY",
+                    "https://api.openai.com/v1/chat/completions",
+                    "openai"
+                ),
+                "{m} should fall through to OpenAI else-branch"
+            );
+        }
+    }
+
+    // route ordering: a string containing BOTH "gemini" and a later keyword
+    // hits gemini first (it is the first arm). Lock the first-match order so a
+    // refactor that reorders arms is caught.
+    #[test]
+    fn char_route_first_arm_wins_ordering() {
+        // gemini arm precedes glm/minimax/kimi/deepseek.
+        assert_eq!(
+            route_openai_compat_model("gemini-glm-hybrid").2,
+            "gemini",
+            "gemini arm is checked first"
+        );
+        // glm arm precedes kimi: a name with both "glm" and "kimi" -> glm.
+        assert_eq!(
+            route_openai_compat_model("glm-kimi").2,
+            "glm",
+            "glm arm precedes the kimi arm"
+        );
+    }
+
+    // ---- resolve_reviewer_model: equality short-circuit (matrix gap) ------
+
+    // resolve_reviewer_equal_shortcircuit: when requested == configured, the
+    // function returns early WITHOUT consulting env keys or provider routing.
+    // Lock it with NO keys set (capture_and_clear) to prove the key/provider
+    // checks are skipped.
+    #[test]
+    fn char_resolve_reviewer_model_equality_short_circuit() {
+        let _g = env_lock_reviewer().lock().unwrap();
+        let _snap = ReviewerEnvSnapshot::capture_and_clear();
+        // No KIMI_API_KEY set, yet requested == configured -> still returned.
+        let model = resolve_reviewer_model(Some("kimi-k2.5"), "kimi-k2.5");
+        assert_eq!(
+            model, "kimi-k2.5",
+            "requested == configured short-circuits before the key/provider check"
+        );
+    }
+
+    // ---- reviewer_supports_reasoning_effort word-match parity ------------
+
+    // reviewer_word_match_prefix / midword: exercise the public wrapper
+    // reviewer_supports_reasoning_effort (which lowercases then word_matches
+    // o1/o3/o4 and contains-matches gpt-5.5/5.6/reasoner/thinking).
+    #[test]
+    fn char_reviewer_supports_reasoning_effort_boundaries() {
+        // word_match boundary hits via provider/colon prefixes.
+        assert!(reviewer_supports_reasoning_effort("openai/o3-mini"));
+        assert!(reviewer_supports_reasoning_effort("proxy:o4-preview"));
+        assert!(reviewer_supports_reasoning_effort("o1-preview"));
+        // mid-word reject: "o32-mini" is not an o3 model.
+        assert!(!reviewer_supports_reasoning_effort("o32-mini"));
+        // contains branches (case-insensitive via to_ascii_lowercase).
+        assert!(reviewer_supports_reasoning_effort("GPT-5.5"));
+        assert!(reviewer_supports_reasoning_effort("gpt-5.6-pro"));
+        assert!(reviewer_supports_reasoning_effort("deepseek-reasoner"));
+        assert!(reviewer_supports_reasoning_effort("glm-4.6-thinking"));
+        // codex Phase-0 gap #2 (round 2): contains-vs-word_match discriminators
+        // for the reviewer reasoning predicate. The cases above are mostly
+        // hyphen-bounded, so a word_match conversion would still pass them.
+        // These hosts hug the needle with NON-boundary chars (`x`/`y`): they
+        // match ONLY because gpt-5.5/gpt-5.6/reasoner/thinking are `contains`
+        // branches (o1/o3/o4 use reviewer_word_match). If P7 ever converts
+        // these to word_match, these flip to false and the assert fails.
+        assert!(reviewer_supports_reasoning_effort("xxgpt-5.5yy"));
+        assert!(reviewer_supports_reasoning_effort("xxgpt-5.6yy"));
+        assert!(reviewer_supports_reasoning_effort("xxreasoneryy"));
+        assert!(reviewer_supports_reasoning_effort("xxthinkingyy"));
+        // negatives
+        assert!(!reviewer_supports_reasoning_effort("gpt-4o"));
+        assert!(!reviewer_supports_reasoning_effort("gpt-5.4"));
+        assert!(!reviewer_supports_reasoning_effort("kimi-k2.5"));
+    }
+
+    // ===================================================================
+    // B. SUBAGENT (build_agent_runtime) characterization — Category A/B/C
+    //
+    // `build_agent_runtime` (tools/src/lib.rs) is PROVIDER-BLIND today: it
+    // unconditionally constructs an `AnthropicRuntimeClient`, which calls
+    // `AnthropicClient::from_env()` and NEVER reads EXECUTOR_PROVIDER /
+    // EXECUTOR_API_KEY / resolve_openai_executor_config. P8 will add provider
+    // dispatch; these tests lock the current behavior the refactor must not
+    // regress (A, B) and document the current-broken state (C).
+    //
+    // The auth BRANCH (x-api-key vs Bearer) is not observable through the
+    // built `ConversationRuntime` (its inner api_client is private with no
+    // accessor). We therefore lock the auth branch directly on
+    // `AnthropicClient::from_env().auth_source()` — the exact dependency
+    // `AnthropicRuntimeClient::new` consumes — and separately lock the
+    // Ok/Err structural outcome of `build_agent_runtime` itself.
+    // ===================================================================
+
+    // Category A auth branch: ANTHROPIC_API_KEY set (official/custom-url
+    // anthropic) -> AuthSource::ApiKey -> apply() emits `x-api-key`, NOT
+    // Bearer. This is the subagent path Category A users (and #158/#162
+    // anthropic+custom-url users) rely on.
+    #[test]
+    fn char_subagent_auth_anthropic_api_key_is_apikey_xheader() {
+        let _g = env_lock_reviewer().lock().unwrap();
+        let _snap = SubagentEnvSnapshot::capture_and_clear();
+        std::env::set_var("ANTHROPIC_API_KEY", "sk-ant-test");
+
+        let client = AnthropicClient::from_env().expect("api key present -> Ok");
+        assert_eq!(
+            client.auth_source(),
+            &AuthSource::ApiKey("sk-ant-test".to_string()),
+            "ANTHROPIC_API_KEY alone resolves to ApiKey (x-api-key header), not Bearer"
+        );
+    }
+
+    // Category B auth branch: ANTHROPIC_AUTH_TOKEN (+ ANTHROPIC_BASE_URL for
+    // a compat endpoint) and NO ANTHROPIC_API_KEY -> AuthSource::BearerToken
+    // -> Authorization: Bearer. This is the anthropic-compat / DeepSeek /
+    // MiniMax-compat subagent path that must keep working silently after P8.
+    #[test]
+    fn char_subagent_auth_anthropic_compat_is_bearer() {
+        let _g = env_lock_reviewer().lock().unwrap();
+        let _snap = SubagentEnvSnapshot::capture_and_clear();
+        std::env::set_var("ANTHROPIC_AUTH_TOKEN", "compat-bearer");
+        std::env::set_var("ANTHROPIC_BASE_URL", "https://api.deepseek.com/anthropic");
+
+        let client = AnthropicClient::from_env().expect("auth token present -> Ok");
+        assert_eq!(
+            client.auth_source(),
+            &AuthSource::BearerToken("compat-bearer".to_string()),
+            "ANTHROPIC_AUTH_TOKEN (no API key) resolves to BearerToken (Authorization: Bearer)"
+        );
+    }
+
+    // Combined-header state (documented intentional): both ANTHROPIC_API_KEY
+    // and ANTHROPIC_AUTH_TOKEN set -> ApiKeyAndBearer -> apply() emits BOTH
+    // x-api-key AND Bearer. Locks the not-either-or behavior the subagent
+    // would also inherit.
+    #[test]
+    fn char_subagent_auth_combined_api_key_and_bearer() {
+        let _g = env_lock_reviewer().lock().unwrap();
+        let _snap = SubagentEnvSnapshot::capture_and_clear();
+        std::env::set_var("ANTHROPIC_API_KEY", "sk-ant-test");
+        std::env::set_var("ANTHROPIC_AUTH_TOKEN", "also-bearer");
+
+        let client = AnthropicClient::from_env().expect("both present -> Ok");
+        assert_eq!(
+            client.auth_source(),
+            &AuthSource::ApiKeyAndBearer {
+                api_key: "sk-ant-test".to_string(),
+                bearer_token: "also-bearer".to_string(),
+            },
+            "both env vars set -> ApiKeyAndBearer (emits BOTH headers, not either-or)"
+        );
+    }
+
+    // Category A end-to-end structural: build_agent_runtime with
+    // ANTHROPIC_API_KEY set returns Ok (the runtime is constructed). Must
+    // stay Ok after P8 for anthropic executors. Note: AnthropicClient::from_env
+    // does no network I/O, so this is deterministic.
+    #[test]
+    fn char_build_agent_runtime_anthropic_api_key_builds_ok() {
+        let _g = env_lock_reviewer().lock().unwrap();
+        let _snap = SubagentEnvSnapshot::capture_and_clear();
+        std::env::set_var("ANTHROPIC_API_KEY", "sk-ant-test");
+
+        let (job, dir) = capture_agent_job("char-runtime-a");
+        let result = build_agent_runtime(&job);
+        assert!(
+            result.is_ok(),
+            "Category A: ANTHROPIC_API_KEY set -> build_agent_runtime returns Ok, got {:?}",
+            result.err()
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // Category B end-to-end structural: build_agent_runtime with
+    // ANTHROPIC_AUTH_TOKEN + ANTHROPIC_BASE_URL (anthropic-compat) returns Ok.
+    // Must stay Ok after P8.
+    #[test]
+    fn char_build_agent_runtime_anthropic_compat_builds_ok() {
+        let _g = env_lock_reviewer().lock().unwrap();
+        let _snap = SubagentEnvSnapshot::capture_and_clear();
+        std::env::set_var("ANTHROPIC_AUTH_TOKEN", "compat-bearer");
+        std::env::set_var("ANTHROPIC_BASE_URL", "https://api.deepseek.com/anthropic");
+
+        let (job, dir) = capture_agent_job("char-runtime-b");
+        let result = build_agent_runtime(&job);
+        assert!(
+            result.is_ok(),
+            "Category B: anthropic-compat env -> build_agent_runtime returns Ok, got {:?}",
+            result.err()
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // Category C (current-broken baseline) + PROVIDER-BLINDNESS lock.
+    //
+    // build_agent_runtime ignores EXECUTOR_PROVIDER / EXECUTOR_API_KEY
+    // entirely. With both ANTHROPIC_* cleared, setting EXECUTOR_PROVIDER=openai
+    // + EXECUTOR_API_KEY must produce the SAME outcome as having NO executor
+    // env at all — proving the function is provider-blind. This invariant is
+    // independent of any machine-local OAuth/Keychain fallback (both runs see
+    // the identical OAuth state), so it is deterministic across dev + CI.
+    //
+    // We assert outcome-equality (Ok-vs-Ok or Err-vs-Err), which is what the
+    // P8 refactor will deliberately BREAK for the openai case. After P8 the
+    // openai run should diverge (build an OpenAI-backed runtime) while the
+    // anthropic-blind run is unchanged. Today they must be identical.
+    #[test]
+    fn char_build_agent_runtime_is_provider_blind_for_openai() {
+        let _g = env_lock_reviewer().lock().unwrap();
+        let _snap = SubagentEnvSnapshot::capture_and_clear();
+        // No ANTHROPIC_* set; whatever OAuth/Keychain fallback exists is the
+        // SAME for both runs below.
+
+        // Run 1: provider-blind baseline (no executor env).
+        let (job1, dir1) = capture_agent_job("char-runtime-c1");
+        let blind_ok = build_agent_runtime(&job1).is_ok();
+        let _ = std::fs::remove_dir_all(dir1);
+
+        // Run 2: openai executor env present, but build_agent_runtime ignores it.
+        std::env::set_var("EXECUTOR_PROVIDER", "openai");
+        std::env::set_var("EXECUTOR_API_KEY", "sk-openai-exec");
+        std::env::set_var("EXECUTOR_BASE_URL", "https://api.openai.com/v1");
+        let (job2, dir2) = capture_agent_job("char-runtime-c2");
+        let openai_ok = build_agent_runtime(&job2).is_ok();
+        let _ = std::fs::remove_dir_all(dir2);
+
+        assert_eq!(
+            blind_ok, openai_ok,
+            "build_agent_runtime is PROVIDER-BLIND today: EXECUTOR_PROVIDER=openai must \
+             yield the SAME outcome as no executor env (it ignores EXECUTOR_* and \
+             EXECUTOR_API_KEY entirely). P8 will deliberately break this for openai."
+        );
+    }
+
+    // Category C error-message lock (conditional on no OAuth fallback).
+    //
+    // With NO ANTHROPIC_* env AND no usable saved/Keychain OAuth token,
+    // build_agent_runtime surfaces the Anthropic MissingApiKey message
+    // because the client is built blindly from Anthropic env — EXECUTOR_API_KEY
+    // is never consulted. We DO NOT force an Err (OAuth/Keychain can legally
+    // make it Ok on a dev machine with Claude Code installed); instead we lock
+    // the SHAPE: IF it errs, the error is the Anthropic auth message, never an
+    // OpenAI/executor one. This documents the current-broken Category C state.
+    // Two explicit arms (Err shape-lock + Ok OAuth-fallback doc) are kept on
+    // purpose as a characterization record; clippy would collapse to `if let`.
+    #[allow(clippy::single_match_else)]
+    #[test]
+    fn char_build_agent_runtime_category_c_error_shape() {
+        let _g = env_lock_reviewer().lock().unwrap();
+        let _snap = SubagentEnvSnapshot::capture_and_clear();
+        std::env::set_var("EXECUTOR_PROVIDER", "openai");
+        std::env::set_var("EXECUTOR_API_KEY", "sk-openai-exec");
+
+        let (job, dir) = capture_agent_job("char-runtime-c-err");
+        let result = build_agent_runtime(&job);
+        let _ = std::fs::remove_dir_all(dir);
+
+        match result {
+            Err(msg) => {
+                // Current-broken: the error path is the ANTHROPIC auth path,
+                // proving EXECUTOR_API_KEY was ignored. P8 fixes this.
+                assert!(
+                    msg.contains("ANTHROPIC_AUTH_TOKEN")
+                        || msg.contains("ANTHROPIC_API_KEY")
+                        || msg.to_lowercase().contains("oauth"),
+                    "Category C error must come from the Anthropic auth path, not the \
+                     unused EXECUTOR_API_KEY. got: {msg}"
+                );
+                assert!(
+                    !msg.contains("EXECUTOR_API_KEY") && !msg.contains("OPENAI_API_KEY"),
+                    "EXECUTOR_API_KEY/OPENAI_API_KEY must NOT appear — proves they are \
+                     ignored by the provider-blind subagent path. got: {msg}"
+                );
+            }
+            Ok(_) => {
+                // A dev machine with a valid saved/Keychain OAuth token builds
+                // an Anthropic runtime regardless of EXECUTOR_PROVIDER=openai —
+                // which is ITSELF the provider-blind / current-broken behavior
+                // (the openai executor key is silently unused). Acceptable; the
+                // provider-blindness invariant is locked separately above.
+            }
+        }
     }
 }

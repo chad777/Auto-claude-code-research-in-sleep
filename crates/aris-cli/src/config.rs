@@ -814,11 +814,10 @@ fn prompt_with_default(prompt: &str, default: &str) -> io::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
-    // Env mutation must be serialized across tests in this module — they all
-    // read/write the same process-global env vars.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    // Env mutation is serialized across the whole crate test binary via the
+    // shared `crate::env_test_guard()` (codex Phase-0 gap #1) so config.rs and
+    // openai_executor.rs env tests cannot race on EXECUTOR_*/OPENAI_API_KEY.
 
     struct EnvSnapshot {
         vars: Vec<(&'static str, Option<String>)>,
@@ -858,7 +857,7 @@ mod tests {
 
     #[test]
     fn anthropic_with_custom_base_url_sets_base_url_and_disables_betas() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = crate::env_test_guard();
         let _snap = EnvSnapshot::capture(EXECUTOR_ENV_VARS);
 
         let config = ArisConfig {
@@ -887,7 +886,7 @@ mod tests {
 
     #[test]
     fn anthropic_without_custom_base_url_leaves_betas_enabled() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = crate::env_test_guard();
         let _snap = EnvSnapshot::capture(EXECUTOR_ENV_VARS);
 
         let config = ArisConfig {
@@ -905,7 +904,7 @@ mod tests {
 
     #[test]
     fn anthropic_compat_with_base_url_sets_auth_token_base_url_and_disables_betas() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = crate::env_test_guard();
         let _snap = EnvSnapshot::capture(EXECUTOR_ENV_VARS);
 
         let config = ArisConfig {
@@ -934,7 +933,7 @@ mod tests {
 
     #[test]
     fn force_apply_executor_env_clears_stale_beta_disable_flag() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = crate::env_test_guard();
         let _snap = EnvSnapshot::capture(EXECUTOR_ENV_VARS);
 
         // Simulate a prior run that had a custom base URL and thus set the flag.
@@ -961,5 +960,448 @@ mod tests {
             std::env::var("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS").is_err(),
             "expected CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS to be cleared too"
         );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // v0.4.16 Phase 0 — CHARACTERIZATION (golden master) tests.
+    //
+    // These lock the CURRENT behavior of `apply_to_env_inner` before the
+    // P7 ProviderFamily refactor. They are NOT specifications of what the
+    // code SHOULD do — they pin what it ACTUALLY does today so any
+    // behavior change during the refactor is caught immediately. If one of
+    // these fails after a refactor, that is a REGRESSION, not a stale
+    // assertion: the env-writing contract these providers rely on changed.
+    //
+    // Env isolation: every test below takes crate::env_test_guard() + EnvSnapshot::capture
+    // (save/clear/restore) exactly like the pre-existing tests above.
+    // `apply_to_env_inner` reads only `&self` + process env (never disk),
+    // so no HOME/config-file isolation is needed.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// case: exec_anthropic_official_endpoint
+    /// Locks: executor_provider="anthropic" + base_url=None (official
+    /// api.anthropic.com path). The highest-priority Category-A invariant —
+    /// ANTHROPIC_API_KEY (x-api-key auth) is set, NO base URL override is
+    /// written, betas stay ON (CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS unset),
+    /// and EXECUTOR_PROVIDER is NOT set (so resolve_openai_executor_config
+    /// returns None → Anthropic client path).
+    #[test]
+    fn char_exec_anthropic_official_endpoint() {
+        let _g = crate::env_test_guard();
+        let _snap = EnvSnapshot::capture(EXECUTOR_ENV_VARS);
+
+        let config = ArisConfig {
+            executor_provider: Some("anthropic".into()),
+            executor_api_key: Some("K".into()),
+            executor_base_url: None,
+            ..Default::default()
+        };
+        config.force_apply_to_env();
+
+        assert_eq!(std::env::var("ANTHROPIC_API_KEY").ok().as_deref(), Some("K"));
+        // Official endpoint: no base URL, no beta-disable, betas remain ON.
+        assert!(std::env::var("ANTHROPIC_BASE_URL").is_err());
+        assert!(std::env::var("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS").is_err());
+        // anthropic path never sets EXECUTOR_PROVIDER → OpenAI resolver = None.
+        assert!(std::env::var("EXECUTOR_PROVIDER").is_err());
+        // anthropic path never sets ANTHROPIC_AUTH_TOKEN (that's the
+        // anthropic-compat Bearer path).
+        assert!(std::env::var("ANTHROPIC_AUTH_TOKEN").is_err());
+    }
+
+    /// case: exec_anthropic_custom_url_keeps_xapikey  🔴 HIGHEST-PRIORITY GUARD
+    /// Locks the #158/#162 regression: executor_provider="anthropic" with a
+    /// CUSTOM base_url must keep x-api-key auth (ANTHROPIC_API_KEY), and must
+    /// NOT silently switch to the anthropic-compat Bearer path
+    /// (ANTHROPIC_AUTH_TOKEN). Anthropic-format proxies (code.newcli.com/claude,
+    /// modelscope) accept x-api-key, NOT `Authorization: Bearer`. Custom URL
+    /// DOES set ANTHROPIC_BASE_URL and disables betas (third-party may reject
+    /// Anthropic beta flags). This is the single most refactor-fragile route.
+    #[test]
+    fn char_exec_anthropic_custom_url_keeps_xapikey() {
+        let _g = crate::env_test_guard();
+        let _snap = EnvSnapshot::capture(EXECUTOR_ENV_VARS);
+
+        let config = ArisConfig {
+            executor_provider: Some("anthropic".into()),
+            executor_api_key: Some("K".into()),
+            executor_base_url: Some("https://code.newcli.com/claude".into()),
+            ..Default::default()
+        };
+        config.force_apply_to_env();
+
+        // x-api-key auth preserved — the load-bearing assertion.
+        assert_eq!(std::env::var("ANTHROPIC_API_KEY").ok().as_deref(), Some("K"));
+        // Must NOT have flipped to Bearer (anthropic-compat) auth.
+        assert!(
+            std::env::var("ANTHROPIC_AUTH_TOKEN").is_err(),
+            "#158/#162 regression: anthropic+custom URL must NOT set ANTHROPIC_AUTH_TOKEN"
+        );
+        assert_eq!(
+            std::env::var("ANTHROPIC_BASE_URL").ok().as_deref(),
+            Some("https://code.newcli.com/claude")
+        );
+        assert_eq!(
+            std::env::var("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS")
+                .ok()
+                .as_deref(),
+            Some("1")
+        );
+        // Still Anthropic-client routed (no OpenAI EXECUTOR_PROVIDER).
+        assert!(std::env::var("EXECUTOR_PROVIDER").is_err());
+    }
+
+    /// case: exec_anthropic_compat_bearer
+    /// Locks the Bearer path: executor_provider="anthropic-compat" sets
+    /// ANTHROPIC_AUTH_TOKEN (Bearer) — NOT ANTHROPIC_API_KEY (x-api-key) —
+    /// plus base URL + beta-disable. This is the other side of the
+    /// x-api-key vs Bearer bisection that #158/#162 turns on.
+    #[test]
+    fn char_exec_anthropic_compat_bearer() {
+        let _g = crate::env_test_guard();
+        let _snap = EnvSnapshot::capture(EXECUTOR_ENV_VARS);
+
+        let config = ArisConfig {
+            executor_provider: Some("anthropic-compat".into()),
+            executor_api_key: Some("K".into()),
+            executor_base_url: Some("https://api.deepseek.com/anthropic".into()),
+            ..Default::default()
+        };
+        config.force_apply_to_env();
+
+        // Bearer token, NOT x-api-key.
+        assert_eq!(
+            std::env::var("ANTHROPIC_AUTH_TOKEN").ok().as_deref(),
+            Some("K")
+        );
+        assert!(
+            std::env::var("ANTHROPIC_API_KEY").is_err(),
+            "anthropic-compat must NOT set ANTHROPIC_API_KEY (x-api-key)"
+        );
+        assert_eq!(
+            std::env::var("ANTHROPIC_BASE_URL").ok().as_deref(),
+            Some("https://api.deepseek.com/anthropic")
+        );
+        assert_eq!(
+            std::env::var("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS")
+                .ok()
+                .as_deref(),
+            Some("1")
+        );
+        assert!(std::env::var("EXECUTOR_PROVIDER").is_err());
+    }
+
+    /// case: exec_anthropic_compat_no_baseurl_edge
+    /// Locks the corner where anthropic-compat has base_url=None: both the
+    /// ANTHROPIC_BASE_URL set AND the beta-disable are gated inside
+    /// `if let Some(url)`, so with no URL the token is still set (Bearer) but
+    /// betas stay ON and no base URL is written. Mirrors the official-edge
+    /// behavior but on the Bearer side.
+    #[test]
+    fn char_exec_anthropic_compat_no_baseurl_edge() {
+        let _g = crate::env_test_guard();
+        let _snap = EnvSnapshot::capture(EXECUTOR_ENV_VARS);
+
+        let config = ArisConfig {
+            executor_provider: Some("anthropic-compat".into()),
+            executor_api_key: Some("K".into()),
+            executor_base_url: None,
+            ..Default::default()
+        };
+        config.force_apply_to_env();
+
+        assert_eq!(
+            std::env::var("ANTHROPIC_AUTH_TOKEN").ok().as_deref(),
+            Some("K")
+        );
+        // base_url=None → both gated effects skipped.
+        assert!(std::env::var("ANTHROPIC_BASE_URL").is_err());
+        assert!(
+            std::env::var("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS").is_err(),
+            "betas-disable is gated on Some(url); with None it must stay unset"
+        );
+    }
+
+    /// case: exec_openai_family
+    /// Locks the OpenAI executor path: provider="openai" sets
+    /// EXECUTOR_PROVIDER=openai + EXECUTOR_API_KEY + EXECUTOR_BASE_URL, and
+    /// writes NO ANTHROPIC_* vars. EXECUTOR_PROVIDER=openai is the exact-match
+    /// gate that makes resolve_openai_executor_config return Some.
+    #[test]
+    fn char_exec_openai_family() {
+        let _g = crate::env_test_guard();
+        let _snap = EnvSnapshot::capture(EXECUTOR_ENV_VARS);
+
+        let config = ArisConfig {
+            executor_provider: Some("openai".into()),
+            executor_api_key: Some("K".into()),
+            executor_base_url: Some("https://api.openai.com/v1".into()),
+            ..Default::default()
+        };
+        config.force_apply_to_env();
+
+        assert_eq!(
+            std::env::var("EXECUTOR_PROVIDER").ok().as_deref(),
+            Some("openai")
+        );
+        assert_eq!(std::env::var("EXECUTOR_API_KEY").ok().as_deref(), Some("K"));
+        assert_eq!(
+            std::env::var("EXECUTOR_BASE_URL").ok().as_deref(),
+            Some("https://api.openai.com/v1")
+        );
+        // OpenAI path writes no Anthropic vars.
+        assert!(std::env::var("ANTHROPIC_API_KEY").is_err());
+        assert!(std::env::var("ANTHROPIC_AUTH_TOKEN").is_err());
+        assert!(std::env::var("ANTHROPIC_BASE_URL").is_err());
+    }
+
+    /// case: exec_custom_maps_to_openai
+    /// Locks the custom→openai collapse: provider="custom" is
+    /// runtime-indistinguishable from "openai" — it sets EXECUTOR_PROVIDER
+    /// to the literal "openai" (NOT "custom") plus EXECUTOR_API_KEY +
+    /// EXECUTOR_BASE_URL. (config.json keeps "custom" only for the setup
+    /// menu echo; at the env layer it is openai.)
+    #[test]
+    fn char_exec_custom_maps_to_openai() {
+        let _g = crate::env_test_guard();
+        let _snap = EnvSnapshot::capture(EXECUTOR_ENV_VARS);
+
+        let config = ArisConfig {
+            executor_provider: Some("custom".into()),
+            executor_api_key: Some("K".into()),
+            executor_base_url: Some("https://proxy.example.com/v1".into()),
+            ..Default::default()
+        };
+        config.force_apply_to_env();
+
+        assert_eq!(
+            std::env::var("EXECUTOR_PROVIDER").ok().as_deref(),
+            Some("openai"),
+            "custom must collapse to literal openai at the env layer"
+        );
+        assert_eq!(std::env::var("EXECUTOR_API_KEY").ok().as_deref(), Some("K"));
+        assert_eq!(
+            std::env::var("EXECUTOR_BASE_URL").ok().as_deref(),
+            Some("https://proxy.example.com/v1")
+        );
+        assert!(std::env::var("ANTHROPIC_API_KEY").is_err());
+        assert!(std::env::var("ANTHROPIC_AUTH_TOKEN").is_err());
+    }
+
+    /// case: force_clears_stale_beta_flag
+    /// Companion to the pre-existing force_apply_executor_env test, but via
+    /// ForceAll (force_apply_to_env). Locks that a prior run's stale
+    /// ANTHROPIC_BASE_URL + beta-disable flag are removed first, so the
+    /// official endpoint (base_url=None) runs with betas ON.
+    #[test]
+    fn char_force_clears_stale_beta_flag_forceall() {
+        let _g = crate::env_test_guard();
+        let _snap = EnvSnapshot::capture(EXECUTOR_ENV_VARS);
+
+        std::env::set_var("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", "1");
+        std::env::set_var("ANTHROPIC_BASE_URL", "https://old-proxy.example.com");
+
+        let config = ArisConfig {
+            executor_provider: Some("anthropic".into()),
+            executor_api_key: Some("K".into()),
+            executor_base_url: None,
+            ..Default::default()
+        };
+        config.force_apply_to_env();
+
+        assert!(std::env::var("ANTHROPIC_BASE_URL").is_err());
+        assert!(std::env::var("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS").is_err());
+        assert_eq!(std::env::var("ANTHROPIC_API_KEY").ok().as_deref(), Some("K"));
+    }
+
+    /// case: force_executor_only_preserves_reviewer_keys
+    /// Locks the executor/reviewer env isolation under ForceExecutorOnly
+    /// (force_apply_executor_env): a shell-provided OPENAI_API_KEY (the
+    /// reviewer key) must NOT be cleared when the user re-applies only the
+    /// executor auth. force_rev is false in this mode, so the reviewer-clear
+    /// block is skipped.
+    #[test]
+    fn char_force_executor_only_preserves_reviewer_keys() {
+        let _g = crate::env_test_guard();
+        // Capture executor vars AND OPENAI_API_KEY so we restore both.
+        let _snap = EnvSnapshot::capture(EXECUTOR_ENV_VARS);
+        let _rev_snap = EnvSnapshot::capture(&["OPENAI_API_KEY"]);
+
+        // Reviewer key supplied by the user's shell.
+        std::env::set_var("OPENAI_API_KEY", "reviewer-key");
+
+        let config = ArisConfig {
+            executor_provider: Some("anthropic".into()),
+            executor_api_key: Some("exec-key".into()),
+            executor_base_url: None,
+            ..Default::default()
+        };
+        config.force_apply_executor_env();
+
+        // Executor auth applied …
+        assert_eq!(
+            std::env::var("ANTHROPIC_API_KEY").ok().as_deref(),
+            Some("exec-key")
+        );
+        // … but the reviewer key survives (ForceExecutorOnly leaves it alone).
+        assert_eq!(
+            std::env::var("OPENAI_API_KEY").ok().as_deref(),
+            Some("reviewer-key"),
+            "ForceExecutorOnly must not clobber shell-provided reviewer OPENAI_API_KEY"
+        );
+    }
+
+    /// case: exec_openai_api_key_fallback (config-layer half)
+    /// Locks that the openai-provider env-writing uses EXECUTOR_API_KEY (the
+    /// resolver's OPENAI_API_KEY fallback is tested in openai_executor.rs).
+    /// Here we pin: a force-apply with provider=openai writes the key to
+    /// EXECUTOR_API_KEY, and an IfMissing apply with EXECUTOR_API_KEY already
+    /// set leaves the shell value untouched (shell wins).
+    #[test]
+    fn char_exec_openai_ifmissing_shell_wins() {
+        let _g = crate::env_test_guard();
+        let _snap = EnvSnapshot::capture(EXECUTOR_ENV_VARS);
+
+        // Shell already provided EXECUTOR_PROVIDER + key.
+        std::env::set_var("EXECUTOR_PROVIDER", "openai");
+        std::env::set_var("EXECUTOR_API_KEY", "shell-key");
+
+        let config = ArisConfig {
+            executor_provider: Some("openai".into()),
+            executor_api_key: Some("config-key".into()),
+            executor_base_url: Some("https://api.openai.com/v1".into()),
+            ..Default::default()
+        };
+        // IfMissing mode: shell-provided vars win, config does not overwrite.
+        config.apply_to_env();
+
+        assert_eq!(
+            std::env::var("EXECUTOR_API_KEY").ok().as_deref(),
+            Some("shell-key"),
+            "IfMissing must not overwrite a shell-provided EXECUTOR_API_KEY"
+        );
+        // base_url was unset in the shell, so IfMissing fills it from config.
+        assert_eq!(
+            std::env::var("EXECUTOR_BASE_URL").ok().as_deref(),
+            Some("https://api.openai.com/v1")
+        );
+    }
+
+    // ── setup_menu echo / exec_info mirror tests ──────────────────────────
+    //
+    // The setup wizard's `exec_info` tuple table and the `default_executor`
+    // menu-echo `match` live INLINE inside `run_interactive_setup`, which is
+    // interactive (reads stdin). They cannot be unit-tested directly without
+    // refactoring production code (out of scope for a characterization
+    // agent). The truly load-bearing thing for zero-regression is the RUNTIME
+    // env each menu choice produces — so the round-trip tests above already
+    // lock the openai/anthropic-compat env contracts those menus map to.
+    //
+    // The mirror helpers below replicate the production `default_executor`
+    // echo `match` VERBATIM so the menu→number routing is pinned. NOTE: these
+    // are mirror assertions, not auto-drift detectors — if production changes
+    // the table, a reviewer diffing the two catches it; the test itself only
+    // fails if the COPIED logic here is edited. They document current echo
+    // behavior (DISCREPANCY-aware, see report).
+
+    /// Replica of the production `default_executor` echo match
+    /// (config.rs run_interactive_setup, copied verbatim 2026-05-30).
+    fn echo_default_executor(provider: Option<&str>, base_url: Option<&str>) -> &'static str {
+        match provider {
+            Some("anthropic") => "1",
+            Some("anthropic-compat") => match base_url {
+                Some(u) if u.contains("deepseek") => "7",
+                _ => "1",
+            },
+            Some("custom") => "11",
+            Some("openai") => match base_url {
+                Some(u) if u.contains("googleapis") => "3",
+                Some(u) if u.contains("bigmodel") => "4",
+                Some(u) if u.contains("minimax") => "5",
+                Some(u) if u.contains("moonshot") => "6",
+                Some(u) if u.contains("xiaomimimo") => "8",
+                Some(u) if u.contains("dashscope") => "9",
+                Some(u) if u.contains("volces") => "10",
+                _ => "2",
+            },
+            _ => "1",
+        }
+    }
+
+    /// case: setup_menu_3_gemini / 4_glm / 5_minimax / 6_kimi / 7_deepseek /
+    /// 8_9_10_echo / 2_or_unknown_proxy_echo — all in one table-driven test.
+    /// Locks the executor menu-echo routing (provider + base_url substring →
+    /// menu number). Pins each provider's substring keyword and that
+    /// anthropic-compat+deepseek echoes "7" while anthropic-compat without a
+    /// deepseek URL falls back to "1".
+    #[test]
+    fn char_setup_menu_default_executor_echo() {
+        // (provider, base_url, expected_menu_number)
+        let cases: &[(Option<&str>, Option<&str>, &str)] = &[
+            // setup_menu_3_gemini: googleapis → "3"
+            (
+                Some("openai"),
+                Some("https://generativelanguage.googleapis.com/v1beta/openai"),
+                "3",
+            ),
+            // setup_menu_4_glm: bigmodel → "4"
+            (
+                Some("openai"),
+                Some("https://open.bigmodel.cn/api/paas/v4"),
+                "4",
+            ),
+            // setup_menu_5_minimax_openai: minimax → "5"
+            (Some("openai"), Some("https://api.minimax.chat/v1"), "5"),
+            // setup_menu_6_kimi: moonshot → "6"
+            (Some("openai"), Some("https://api.moonshot.cn/v1"), "6"),
+            // setup_menu_8_9_10_echo: xiaomimimo/dashscope/volces → 8/9/10
+            (
+                Some("openai"),
+                Some("https://token-plan-cn.xiaomimimo.com/v1"),
+                "8",
+            ),
+            (
+                Some("openai"),
+                Some("https://dashscope.aliyuncs.com/compatible-mode/v1"),
+                "9",
+            ),
+            (
+                Some("openai"),
+                Some("https://ark.cn-beijing.volces.com/api/v3"),
+                "10",
+            ),
+            // setup_menu_7_deepseek_compat: anthropic-compat + deepseek → "7"
+            (
+                Some("anthropic-compat"),
+                Some("https://api.deepseek.com/anthropic"),
+                "7",
+            ),
+            // anthropic-compat WITHOUT a deepseek URL → falls back to "1".
+            (
+                Some("anthropic-compat"),
+                Some("https://other-compat.example.com/anthropic"),
+                "1",
+            ),
+            // setup_menu_2_or_unknown_proxy_echo: openai + unmatched URL → "2"
+            (
+                Some("openai"),
+                Some("https://my-custom-openai-proxy.example.com/v1"),
+                "2",
+            ),
+            // openai + no URL → "2"
+            (Some("openai"), None, "2"),
+            // anthropic → "1"; custom → "11"; unknown/None → "1"
+            (Some("anthropic"), None, "1"),
+            (Some("anthropic"), Some("https://code.newcli.com/claude"), "1"),
+            (Some("custom"), None, "11"),
+            (None, None, "1"),
+        ];
+        for (provider, base_url, expected) in cases {
+            assert_eq!(
+                echo_default_executor(*provider, *base_url),
+                *expected,
+                "echo mismatch for provider={provider:?} base_url={base_url:?}"
+            );
+        }
     }
 }

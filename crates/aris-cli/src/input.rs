@@ -941,4 +941,44 @@ mod tests {
         ed.push_history("/help");
         assert_eq!(ed.history.len(), 1);
     }
+
+    // === v0.4.16 Phase 0 characterization: lock the IN-MEMORY push_history
+    // contract. Track A adds a disk-append to push_history; these pin that the
+    // in-memory Vec semantics (used by Up/Down navigation) stay byte-identical.
+
+    #[test]
+    fn push_history_stores_raw_untrimmed_content() {
+        // Current behaviour: the blank CHECK trims, but a non-blank entry is
+        // stored verbatim (surrounding whitespace preserved). The REPL pushes
+        // the raw Submit(input) string (main.rs:1170), so history holds raw
+        // content. Track A's secret-skip / disk write must not alter this.
+        let mut ed = make_editor();
+        ed.push_history("  hello world  ");
+        assert_eq!(ed.history.len(), 1);
+        assert_eq!(ed.history[0], "  hello world  ");
+    }
+
+    #[test]
+    fn push_history_does_not_dedup() {
+        // Current behaviour: no de-duplication. Pushing the same entry twice
+        // keeps two copies. (Persistence must preserve this; bash-style dedup
+        // would be a behaviour change, out of scope for v0.4.16.)
+        let mut ed = make_editor();
+        ed.push_history("/status");
+        ed.push_history("/status");
+        assert_eq!(ed.history.len(), 2);
+    }
+
+    #[test]
+    fn push_history_is_oldest_first() {
+        // Current behaviour: chronological order, index 0 = oldest, last =
+        // newest. Up-arrow walks backward from the end (input.rs:212-228), so
+        // this ordering is load-bearing. The persistence file format is
+        // oldest-first specifically to reproduce this on reload.
+        let mut ed = make_editor();
+        ed.push_history("first");
+        ed.push_history("second");
+        ed.push_history("third");
+        assert_eq!(ed.history, vec!["first", "second", "third"]);
+    }
 }

@@ -1219,6 +1219,10 @@ mod tests {
     use super::*;
     use runtime::{ContentBlock, ConversationMessage, MessageRole};
 
+    // Env-mutating tests below serialize via the crate-wide
+    // `crate::env_test_guard()` (codex Phase-0 gap #1) so they cannot race the
+    // config.rs env tests on EXECUTOR_*/OPENAI_API_KEY in a parallel run.
+
     #[test]
     fn convert_messages_drops_system_role_in_messages_array() {
         // Regression: before v0.4.2 the auto-compaction continuation message
@@ -1245,10 +1249,10 @@ mod tests {
 
     #[test]
     fn resolve_base_url_falls_back_for_empty_or_whitespace() {
-        use std::sync::Mutex;
-        // Serialize env mutation to avoid cross-test races.
-        static LOCK: Mutex<()> = Mutex::new(());
-        let _g = LOCK.lock().unwrap();
+        // Crate-wide env_test_guard() (not a per-test lock) so this cannot race
+        // the char_resolve_* / config.rs tests on EXECUTOR_*/OPENAI_API_KEY
+        // (codex Phase-0 gap #1).
+        let _g = crate::env_test_guard();
 
         let prior_provider = std::env::var("EXECUTOR_PROVIDER").ok();
         let prior_api_key = std::env::var("EXECUTOR_API_KEY").ok();
@@ -1546,5 +1550,256 @@ mod tests {
         // Blank / comment lines → None.
         assert_eq!(sse_data_payload(""), None);
         assert_eq!(sse_data_payload(": keep-alive"), None);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // v0.4.16 Phase 0 — CHARACTERIZATION (golden master) tests.
+    //
+    // These pin the CURRENT behavior of the executor predicates +
+    // resolve_openai_executor_config before the P7 ProviderFamily / P8
+    // subagent refactor. They lock today's routing so any drift during the
+    // refactor is a caught regression, not a silent behavior change.
+    // `word_match` / `supports_reasoning_effort` are pure; the resolve tests
+    // serialize + save/restore the EXECUTOR_* env vars they touch.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// case: reasoning_o3_mini / reasoning_provider_prefix_o3 /
+    /// reasoning_colon_prefix_o4 / reasoning_midword_o32_reject /
+    /// reasoning_gpt55 — table-driven over `supports_reasoning_effort`.
+    /// Locks which model strings the executor flags as reasoning-capable
+    /// (and thus attaches `reasoning_effort` for). The word-boundary set
+    /// (`-` `_` `/` `:` + string ends) is the contract; mid-word matches
+    /// (`o32-mini`) must NOT trip it.
+    #[test]
+    fn char_supports_reasoning_effort_routing() {
+        // o3 with trailing `-` boundary.
+        assert!(supports_reasoning_effort("o3-mini"));
+        // provider prefix `openai/o3-mini` — `/` is a boundary (P1.B).
+        assert!(supports_reasoning_effort("openai/o3-mini"));
+        // proxy colon prefix `proxy:o4` — `:` boundary + end-of-string.
+        assert!(supports_reasoning_effort("proxy:o4"));
+        // mid-word `o32-mini`: "o3" followed by a digit → NOT a boundary →
+        // must reject (this is the load-bearing negative).
+        assert!(!supports_reasoning_effort("o32-mini"));
+        // gpt-5.5 → matched via the `contains("gpt-5.5")` branch (NOT
+        // word_match — it's a plain substring check in the source).
+        assert!(supports_reasoning_effort("gpt-5.5"));
+
+        // Extra boundary pins to lock the full predicate shape:
+        // o1 family.
+        assert!(supports_reasoning_effort("o1"));
+        assert!(supports_reasoning_effort("o1-mini"));
+        // gpt-5.6 contains branch.
+        assert!(supports_reasoning_effort("gpt-5.6"));
+        // reasoner / thinking substring branches.
+        assert!(supports_reasoning_effort("deepseek-reasoner"));
+        assert!(supports_reasoning_effort("glm-4.6-thinking"));
+        // Case-insensitive (model is lowercased first).
+        assert!(supports_reasoning_effort("O3-MINI"));
+        // Plain non-reasoning models reject.
+        assert!(!supports_reasoning_effort("gpt-4o"));
+        assert!(!supports_reasoning_effort("claude-opus-4-7"));
+        // `gpt-5.5` is a substring check, so a mid-word host still matches
+        // (characterization: this is what the code DOES, contains() not
+        // word_match — pinning current behavior, not endorsing it).
+        assert!(supports_reasoning_effort("my-gpt-5.5-proxy"));
+        // codex gap #2: the case above is NOT a contains-vs-word_match
+        // discriminator — `-` is a word boundary, so word_match("gpt-5.5")
+        // would ALSO match "my-gpt-5.5-proxy". To truly lock that these are
+        // `contains` (so P7's word_match consolidation can't silently convert
+        // them), assert a host with NON-boundary chars hugging the needle:
+        // `contains` matches, `word_match` would REJECT (x/y are not in the
+        // -_/: boundary set). If this flips to false, someone changed the
+        // gpt-5.x / reasoner / thinking branches from contains to word_match.
+        assert!(
+            supports_reasoning_effort("xxgpt-5.5yy"),
+            "gpt-5.5 must match via contains(), not word_match() — no boundary around it here"
+        );
+        assert!(supports_reasoning_effort("xxgpt-5.6yy"));
+        assert!(supports_reasoning_effort("xxreasoneryy"));
+        assert!(supports_reasoning_effort("xxthinkingyy"));
+    }
+
+    /// case: reasoning_midword_o32_reject — isolated emphasis on the
+    /// digit-suffix boundary rejection (mirrors word_match_handles_provider_
+    /// prefixes but at the supports_reasoning_effort surface, which is the
+    /// actual capability gate the stream() body reads).
+    #[test]
+    fn char_reasoning_midword_o32_reject() {
+        assert!(
+            !supports_reasoning_effort("o32-mini"),
+            "o32 must not be misrouted as an o3 reasoning model"
+        );
+        // And the positive twin so the boundary's two sides are both pinned.
+        assert!(supports_reasoning_effort("o3-mini"));
+    }
+
+    /// case: resolve_returns_none_for_non_openai
+    /// Locks the EXACT-match gate: resolve_openai_executor_config returns
+    /// None for any EXECUTOR_PROVIDER value that is not exactly "openai"
+    /// (anthropic-compat / unset / arbitrary). This is the 1:1 contract with
+    /// main.rs that decides Anthropic-client vs OpenAI-client routing.
+    #[test]
+    fn char_resolve_returns_none_for_non_openai() {
+        let _g = crate::env_test_guard();
+
+        let prior_provider = std::env::var("EXECUTOR_PROVIDER").ok();
+        let prior_api_key = std::env::var("EXECUTOR_API_KEY").ok();
+
+        // Provide a key so the only thing under test is the provider gate.
+        std::env::set_var("EXECUTOR_API_KEY", "sk-test");
+
+        // anthropic-compat → None.
+        std::env::set_var("EXECUTOR_PROVIDER", "anthropic-compat");
+        assert!(resolve_openai_executor_config().is_none());
+
+        // arbitrary value → None.
+        std::env::set_var("EXECUTOR_PROVIDER", "anthropic");
+        assert!(resolve_openai_executor_config().is_none());
+
+        // empty string → None.
+        std::env::set_var("EXECUTOR_PROVIDER", "");
+        assert!(resolve_openai_executor_config().is_none());
+
+        // unset → None (the `.ok()?` short-circuit).
+        std::env::remove_var("EXECUTOR_PROVIDER");
+        assert!(resolve_openai_executor_config().is_none());
+
+        // exactly "openai" → Some (positive control).
+        std::env::set_var("EXECUTOR_PROVIDER", "openai");
+        assert!(resolve_openai_executor_config().is_some());
+
+        match prior_provider {
+            Some(v) => std::env::set_var("EXECUTOR_PROVIDER", v),
+            None => std::env::remove_var("EXECUTOR_PROVIDER"),
+        }
+        match prior_api_key {
+            Some(v) => std::env::set_var("EXECUTOR_API_KEY", v),
+            None => std::env::remove_var("EXECUTOR_API_KEY"),
+        }
+    }
+
+    /// case: resolve_exact_no_trim
+    /// Locks that the provider compare is byte-exact with NO trim/lowercase:
+    /// `" openai "` (surrounding spaces) does NOT match "openai" → None.
+    /// Pins the no-trim contract that main.rs's prediction must mirror.
+    #[test]
+    fn char_resolve_exact_no_trim() {
+        let _g = crate::env_test_guard();
+
+        let prior_provider = std::env::var("EXECUTOR_PROVIDER").ok();
+        let prior_api_key = std::env::var("EXECUTOR_API_KEY").ok();
+
+        std::env::set_var("EXECUTOR_API_KEY", "sk-test");
+
+        // Spaces around "openai" → exact compare fails → None.
+        std::env::set_var("EXECUTOR_PROVIDER", " openai ");
+        assert!(
+            resolve_openai_executor_config().is_none(),
+            "provider compare must be exact (no trim): ' openai ' != 'openai'"
+        );
+
+        // Different case → None (no lowercasing).
+        std::env::set_var("EXECUTOR_PROVIDER", "OpenAI");
+        assert!(resolve_openai_executor_config().is_none());
+
+        match prior_provider {
+            Some(v) => std::env::set_var("EXECUTOR_PROVIDER", v),
+            None => std::env::remove_var("EXECUTOR_PROVIDER"),
+        }
+        match prior_api_key {
+            Some(v) => std::env::set_var("EXECUTOR_API_KEY", v),
+            None => std::env::remove_var("EXECUTOR_API_KEY"),
+        }
+    }
+
+    /// case: exec_openai_api_key_fallback
+    /// Locks the api_key fallback chain in resolve_openai_executor_config:
+    /// EXECUTOR_API_KEY is preferred; when it is UNSET the resolver falls
+    /// back to OPENAI_API_KEY. An empty EXECUTOR_API_KEY is treated as set
+    /// (the `.or_else` only fires on the Err/unset arm), but the trailing
+    /// `.filter(|s| !s.is_empty())` then makes an empty value yield None —
+    /// pin both behaviors.
+    #[test]
+    fn char_resolve_openai_api_key_fallback() {
+        let _g = crate::env_test_guard();
+
+        let prior_provider = std::env::var("EXECUTOR_PROVIDER").ok();
+        let prior_exec_key = std::env::var("EXECUTOR_API_KEY").ok();
+        let prior_openai_key = std::env::var("OPENAI_API_KEY").ok();
+        let prior_base = std::env::var("EXECUTOR_BASE_URL").ok();
+
+        std::env::set_var("EXECUTOR_PROVIDER", "openai");
+        std::env::remove_var("EXECUTOR_BASE_URL");
+
+        // EXECUTOR_API_KEY UNSET, OPENAI_API_KEY set → fall back to R.
+        std::env::remove_var("EXECUTOR_API_KEY");
+        std::env::set_var("OPENAI_API_KEY", "R");
+        let cfg = resolve_openai_executor_config().expect("should resolve via OPENAI_API_KEY");
+        assert_eq!(cfg.api_key, "R");
+
+        // EXECUTOR_API_KEY set → it wins over OPENAI_API_KEY.
+        std::env::set_var("EXECUTOR_API_KEY", "E");
+        let cfg = resolve_openai_executor_config().expect("should resolve via EXECUTOR_API_KEY");
+        assert_eq!(cfg.api_key, "E");
+
+        // Both unset → None.
+        std::env::remove_var("EXECUTOR_API_KEY");
+        std::env::remove_var("OPENAI_API_KEY");
+        assert!(resolve_openai_executor_config().is_none());
+
+        // EXECUTOR_API_KEY empty → the `.or_else` does NOT fire (Ok("")), but
+        // the final `.filter(|s| !s.is_empty())` drops it → None.
+        // (characterization: locks that empty EXECUTOR_API_KEY does NOT fall
+        // through to OPENAI_API_KEY — current behavior.)
+        std::env::set_var("EXECUTOR_API_KEY", "");
+        std::env::set_var("OPENAI_API_KEY", "R2");
+        assert!(
+            resolve_openai_executor_config().is_none(),
+            "empty EXECUTOR_API_KEY currently yields None (does not fall back to OPENAI_API_KEY)"
+        );
+
+        match prior_provider {
+            Some(v) => std::env::set_var("EXECUTOR_PROVIDER", v),
+            None => std::env::remove_var("EXECUTOR_PROVIDER"),
+        }
+        match prior_exec_key {
+            Some(v) => std::env::set_var("EXECUTOR_API_KEY", v),
+            None => std::env::remove_var("EXECUTOR_API_KEY"),
+        }
+        match prior_openai_key {
+            Some(v) => std::env::set_var("OPENAI_API_KEY", v),
+            None => std::env::remove_var("OPENAI_API_KEY"),
+        }
+        match prior_base {
+            Some(v) => std::env::set_var("EXECUTOR_BASE_URL", v),
+            None => std::env::remove_var("EXECUTOR_BASE_URL"),
+        }
+    }
+
+    /// case: word_match boundary completeness — pins every boundary char the
+    /// executor's reasoning detection relies on, plus the negatives, at the
+    /// `word_match` surface directly. Complements the pre-existing
+    /// `word_match_handles_provider_prefixes` without overlapping its exact
+    /// asserts.
+    #[test]
+    fn char_word_match_boundary_chars() {
+        // All four boundary chars before the needle.
+        assert!(word_match("a-o3", "o3")); // dash
+        assert!(word_match("a_o3", "o3")); // underscore
+        assert!(word_match("a/o3", "o3")); // slash
+        assert!(word_match("a:o3", "o3")); // colon
+        // All four boundary chars after the needle.
+        assert!(word_match("o3-x", "o3"));
+        assert!(word_match("o3_x", "o3"));
+        assert!(word_match("o3/x", "o3"));
+        assert!(word_match("o3:x", "o3"));
+        // A boundary NOT in the set (`.` and space) does NOT count.
+        assert!(!word_match("o3.mini", "o3"));
+        assert!(!word_match("o3 mini", "o3"));
+        // Needle longer than haystack → false (length guard).
+        assert!(!word_match("o3", "o3-mini"));
+        // Empty needle → false.
+        assert!(!word_match("anything", ""));
     }
 }
