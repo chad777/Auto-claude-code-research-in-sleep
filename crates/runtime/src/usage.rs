@@ -280,26 +280,11 @@ fn generic_pricing(input: f64, output: f64) -> ModelPricing {
 /// match `gpt-5.4-nano` or `provider-prefixed-o3-foo` from earlier
 /// branches. Treats `-`, `_`, `/`, `:` and start-of-string as word
 /// boundaries.
+///
+/// v0.4.16 P7: forwards to the canonical [`crate::text_match::word_match`]
+/// (this was one of three verbatim copies; behavior is unchanged).
 fn has_word(haystack: &str, needle: &str) -> bool {
-    let bytes = haystack.as_bytes();
-    let nbytes = needle.as_bytes();
-    if nbytes.is_empty() || bytes.len() < nbytes.len() {
-        return false;
-    }
-    let is_boundary = |b: u8| matches!(b, b'-' | b'_' | b'/' | b':');
-    let mut i = 0;
-    while i + nbytes.len() <= bytes.len() {
-        if &bytes[i..i + nbytes.len()] == nbytes {
-            let before_ok = i == 0 || is_boundary(bytes[i - 1]);
-            let after_idx = i + nbytes.len();
-            let after_ok = after_idx == bytes.len() || is_boundary(bytes[after_idx]);
-            if before_ok && after_ok {
-                return true;
-            }
-        }
-        i += 1;
-    }
-    false
+    crate::text_match::word_match(haystack, needle)
 }
 
 impl TokenUsage {

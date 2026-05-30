@@ -3651,26 +3651,11 @@ fn reviewer_supports_reasoning_effort(model: &str) -> bool {
 /// Mirrors `runtime::usage::has_word` and `openai_executor::word_match`
 /// so reviewer capability detection stays consistent with executor +
 /// pricing table.
+///
+/// v0.4.16 P7: forwards to the canonical [`runtime::word_match`] (this was one
+/// of three verbatim copies; behavior is unchanged).
 fn reviewer_word_match(haystack: &str, needle: &str) -> bool {
-    let bytes = haystack.as_bytes();
-    let nbytes = needle.as_bytes();
-    if nbytes.is_empty() || bytes.len() < nbytes.len() {
-        return false;
-    }
-    let is_boundary = |b: u8| matches!(b, b'-' | b'_' | b'/' | b':');
-    let mut i = 0;
-    while i + nbytes.len() <= bytes.len() {
-        if &bytes[i..i + nbytes.len()] == nbytes {
-            let before_ok = i == 0 || is_boundary(bytes[i - 1]);
-            let after_idx = i + nbytes.len();
-            let after_ok = after_idx == bytes.len() || is_boundary(bytes[after_idx]);
-            if before_ok && after_ok {
-                return true;
-            }
-        }
-        i += 1;
-    }
-    false
+    runtime::word_match(haystack, needle)
 }
 
 /// Effort tier for reasoning-capable reviewer calls. Reads
