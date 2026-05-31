@@ -32,6 +32,14 @@
 >
 > 🌐 *Same workflow, different deliverable — [**ARIS-Homepage v1 live demo**](https://wanshuiyin.github.io/) (CV → fact-checked single-file academic homepage via `/homepage-generator`).*
 
+🛰 **社区好物 · [Claude Fleet](https://github.com/tianyilt/claude-fleet)**（by [@tianyilt](https://github.com/tianyilt)）—— 一个本地**只读**数据看板，同时盯住你开的一堆 **Claude Code / Codex** 窗口：triage（谁在干活 / 等你点权限 / 跑完了）· 一键 **Focus** 跳到对应终端 · ~50ms 全文搜所有 transcript · skill / memory 用量分析。像 ARIS 这种动辄并行一片 agent 的工作流特别合适。ARIS 也回馈了自带的 `focus-tty.sh`（[claude-fleet#1](https://github.com/tianyilt/claude-fleet/pull/1)）。**好用的话点个 ⭐**
+
+<p align="center">
+  <a href="https://github.com/tianyilt/claude-fleet">
+    <img src="https://raw.githubusercontent.com/tianyilt/claude-fleet/master/docs/screenshot-hero.png" alt="Claude Fleet — a dashboard for many concurrent Claude Code / Codex windows (triage, Focus, full-text search, skill/memory analytics)" width="100%">
+  </a>
+</p>
+
 🔥 [**ARIS-Code CLI — 独立安装版**](docs/ARIS-Code-README_CN.md) · [English](docs/ARIS-Code-README_EN.md) | [⬇️ Download](https://github.com/wanshuiyin/Auto-claude-code-research-in-sleep/releases/latest)
 
 > 📰 **ARIS-Code v0.4.5 → v0.4.15** (2026-05) — an eleven-release polish run: **new providers** (DeepSeek V4 Pro / Xiaomi MiMo / Qwen 3.6 / Doubao / Custom OpenAI-compatible / DashScope), **first-class reasoning + tool-use**, **stream + MCP reliability** (closes [#228](https://github.com/wanshuiyin/Auto-claude-code-research-in-sleep/issues/228) / [#151](https://github.com/wanshuiyin/Auto-claude-code-research-in-sleep/issues/151) / [#172](https://github.com/wanshuiyin/Auto-claude-code-research-in-sleep/issues/172) / [#249](https://github.com/wanshuiyin/Auto-claude-code-research-in-sleep/issues/249)), **security hardening** (system-prompt secret redaction; opt-in `sandbox.strictMode`, [#238](https://github.com/wanshuiyin/Auto-claude-code-research-in-sleep/issues/238)), **multi-provider pricing**, **skills bundle + drift-CI sync**, and assorted fixes ([#232](https://github.com/wanshuiyin/Auto-claude-code-research-in-sleep/issues/232) DeepSeek deprecation, PermissionMode silent-allow, hardcoded date, reviewer reset). Per-release detail below. Credits: [@GetIT-Sunday](https://github.com/GetIT-Sunday), [@Anduin9527](https://github.com/Anduin9527), [@GO-player-hhy](https://github.com/GO-player-hhy), [@Jxy-yxJ](https://github.com/Jxy-yxJ), [@screw-44](https://github.com/screw-44), [@StevenUST](https://github.com/StevenUST), [@opposj](https://github.com/opposj), [@ShijunLei-cn](https://github.com/ShijunLei-cn), [@algojogacor](https://github.com/algojogacor).
