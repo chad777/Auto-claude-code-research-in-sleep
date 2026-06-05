@@ -1555,6 +1555,65 @@ mod tests {
         assert!(super::should_retry_on_premature_eof(false, false, true, true, 1));
     }
 
+    // ---------------------------------------------------------------
+    // v0.4.17 Phase 0 — CHARACTERIZATION TEST (CL2 baseline)
+    //
+    // A5.2/CL2 will make Anthropic's `MessageDelta.stop_reason` participate
+    // in completion detection (symmetric to v0.4.15's OpenAI finish_reason).
+    // TODAY, `observed_terminal` flips ONLY on `MessageStop`: a `MessageDelta`
+    // carrying `stop_reason` is treated as protocol-only (NOT meaningful
+    // content) and does NOT mark the stream terminal. Consequence: a clean
+    // EOF after a stop_reason-bearing MessageDelta but WITHOUT a MessageStop
+    // is still retry-eligible (observed_terminal=false). This locks both
+    // facts so the CL2 change is visible and bounded.
+    #[test]
+    fn char_message_delta_with_stop_reason_is_not_meaningful_today() {
+        use crate::types::{MessageDelta, MessageDeltaEvent, StreamEvent, Usage};
+
+        // A MessageDelta that DOES carry a stop_reason ("end_turn"). Today
+        // this is classified as NOT meaningful content (protocol-only),
+        // exactly like a stop_reason-less delta.
+        let delta_with_stop = StreamEvent::MessageDelta(MessageDeltaEvent {
+            delta: MessageDelta {
+                stop_reason: Some("end_turn".to_string()),
+                stop_sequence: None,
+            },
+            usage: Usage {
+                input_tokens: 0,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+                output_tokens: 0,
+            },
+        });
+        assert!(
+            !super::event_is_meaningful_content(&delta_with_stop),
+            "MessageDelta with stop_reason must still be NON-meaningful today"
+        );
+    }
+
+    /// CL2 companion: because a stop_reason-bearing MessageDelta does not set
+    /// `observed_terminal`, a clean-EOF stream that only ever produced such a
+    /// delta (no MessageStop, no meaningful content) is STILL retry-eligible.
+    /// This pins `observed_terminal=false` as the retry-gate input that CL2
+    /// will change.
+    #[test]
+    fn char_clean_eof_after_stop_reason_delta_is_still_retry_eligible_today() {
+        // Scenario: MessageStart + a stop_reason-bearing MessageDelta were
+        // consumed (neither is "meaningful"), then a clean EOF with empty
+        // leftover. Because MessageStop was never seen, observed_terminal is
+        // false, so the premature-EOF retry fires.
+        assert!(
+            super::should_retry_on_premature_eof(
+                /* has_emitted_meaningful_content */ false,
+                /* observed_terminal */ false,
+                /* parser_errored */ false,
+                /* leftover_empty */ true,
+                /* stream_retries_remaining */ 2,
+            ),
+            "stop_reason in a MessageDelta does not yet count as terminal"
+        );
+    }
+
     /// v0.4.14 C11 — chunk-idle timeout env parser truth table. Pure
     /// helper avoids racing the global env var across parallel tests;
     /// `resolve_stream_idle_timeout()` is a thin env-read wrapper around

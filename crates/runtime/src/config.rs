@@ -1263,6 +1263,173 @@ mod tests {
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
 
+    // ---------------------------------------------------------------
+    // v0.4.17 Phase 0 — CHARACTERIZATION TESTS (hooks parse truth table)
+    //
+    // `optional_hook_commands` flattens both string-style and object-style
+    // hook arrays into a plain `Vec<String>`. Phase 2 (SCHEMA-1/2) replaces
+    // this with a richer struct that retains matcher/timeout/async. These
+    // tests lock the CURRENT (lossy) parse semantics so the migration can be
+    // proven to leave the resulting command lists unchanged.
+    // ---------------------------------------------------------------
+
+    /// String-style hook arrays round-trip verbatim into the command list.
+    #[test]
+    fn char_string_style_hooks_round_trip_verbatim() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claude");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+
+        fs::write(
+            home.join("settings.json"),
+            r#"{"hooks":{"PreToolUse":["echo a","echo b"],"PostToolUse":["echo c"]}}"#,
+        )
+        .expect("write string-style hooks");
+
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("string-style hooks should load");
+
+        assert_eq!(
+            loaded.hooks().pre_tool_use(),
+            &["echo a".to_string(), "echo b".to_string()]
+        );
+        assert_eq!(loaded.hooks().post_tool_use(), &["echo c".to_string()]);
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    /// Object-style flatten DROPS matcher and timeout, keeping only the
+    /// command string. Multiple sub-hooks under one matcher flatten in
+    /// order. This is the exact field-dropping Phase 2 will change.
+    #[test]
+    fn char_object_style_hooks_drop_matcher_and_timeout_fields() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claude");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+
+        fs::write(
+            home.join("settings.json"),
+            r#"{
+              "hooks": {
+                "PreToolUse": [
+                  {
+                    "matcher": "Bash|Edit",
+                    "hooks": [
+                      { "type": "command", "command": "first", "timeout": 42 },
+                      { "type": "command", "command": "second", "timeout": 7 }
+                    ]
+                  }
+                ]
+              }
+            }"#,
+        )
+        .expect("write object-style hooks");
+
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("object-style hooks should load");
+
+        // matcher "Bash|Edit" and timeouts 42/7 are GONE — only commands,
+        // in declaration order.
+        assert_eq!(
+            loaded.hooks().pre_tool_use(),
+            &["first".to_string(), "second".to_string()]
+        );
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    /// Non-`command` `type` sub-hooks are silently skipped; the default
+    /// `type` (absent) is treated AS `command`. Locks both branches of
+    /// `optional_hook_commands`'s type handling.
+    #[test]
+    fn char_non_command_hook_type_skipped_absent_type_kept() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claude");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+
+        fs::write(
+            home.join("settings.json"),
+            r#"{
+              "hooks": {
+                "PostToolUse": [
+                  {
+                    "matcher": "",
+                    "hooks": [
+                      { "type": "notification", "command": "ignored-non-command" },
+                      { "command": "kept-default-type" },
+                      { "type": "command", "command": "kept-explicit" }
+                    ]
+                  }
+                ]
+              }
+            }"#,
+        )
+        .expect("write mixed-type hooks");
+
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("mixed-type hooks should load");
+
+        // The `notification`-type entry is dropped; the type-absent entry is
+        // treated as a command and kept.
+        assert_eq!(
+            loaded.hooks().post_tool_use(),
+            &["kept-default-type".to_string(), "kept-explicit".to_string()]
+        );
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    /// Unknown event names (anything other than PreToolUse / PostToolUse)
+    /// are silently ignored: the parser only reads those two keys, so a
+    /// config with ONLY unknown events yields empty command lists and still
+    /// loads successfully (no error).
+    #[test]
+    fn char_unknown_hook_event_names_silently_ignored() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claude");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+
+        fs::write(
+            home.join("settings.json"),
+            r#"{
+              "hooks": {
+                "SessionStart": ["echo start"],
+                "UserPromptSubmit": ["echo prompt"],
+                "PostToolUseFailure": [
+                  { "matcher": "", "hooks": [ { "type": "command", "command": "echo fail" } ] }
+                ]
+              }
+            }"#,
+        )
+        .expect("write unknown-event hooks");
+
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("unknown-event hooks must still load without error");
+
+        assert!(
+            loaded.hooks().pre_tool_use().is_empty(),
+            "unknown events must not populate PreToolUse"
+        );
+        assert!(
+            loaded.hooks().post_tool_use().is_empty(),
+            "unknown events must not populate PostToolUse"
+        );
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
     #[test]
     fn parses_per_server_mcp_request_timeout() {
         // v0.4.13 P1.D: `requestTimeoutSecs` on a stdio MCP server

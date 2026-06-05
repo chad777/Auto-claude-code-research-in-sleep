@@ -5656,6 +5656,118 @@ mod tests {
         assert_eq!(names, vec!["read_file", "grep_search"]);
     }
 
+    // ---------------------------------------------------------------
+    // v0.4.17 Phase 0 — CHARACTERIZATION TESTS (filter_tool_specs semantics)
+    //
+    // T5/T8/RW5 change how the catalogue is built/filtered for MCP names.
+    // These lock the current filter semantics so the MCP additions can be
+    // proven to leave the non-MCP filtering path identical.
+    // ---------------------------------------------------------------
+
+    /// `filter_tool_specs(None)` returns the FULL catalogue unchanged
+    /// (no allowlist => every MVP tool passes), in canonical order.
+    #[test]
+    fn char_filter_tool_specs_none_returns_full_catalogue() {
+        let all = filter_tool_specs(None);
+        let names: Vec<&str> = all.iter().map(|s| s.name).collect();
+        assert_eq!(
+            names,
+            vec![
+                "bash",
+                "read_file",
+                "write_file",
+                "edit_file",
+                "glob_search",
+                "grep_search",
+                "WebFetch",
+                "WebSearch",
+                "TodoWrite",
+                "LlmReview",
+                "Skill",
+                "Agent",
+                "ToolSearch",
+                "NotebookEdit",
+                "Sleep",
+                "SendUserMessage",
+                "Config",
+                "StructuredOutput",
+                "REPL",
+                "PowerShell",
+            ],
+            "filter_tool_specs(None) must return the full ordered catalogue"
+        );
+    }
+
+    /// An empty allowlist filters EVERYTHING out (current behavior: an
+    /// allowlist that contains nothing matches nothing).
+    #[test]
+    fn char_filter_tool_specs_empty_allowlist_is_empty() {
+        let allowed: super::AllowedToolSet = std::collections::BTreeSet::new();
+        let filtered = filter_tool_specs(Some(&allowed));
+        assert!(
+            filtered.is_empty(),
+            "empty allowlist must filter out all tools"
+        );
+    }
+
+    /// Unknown names in the allowlist are silently ignored (no error, no
+    /// synthesized spec): only the intersection with the catalogue passes,
+    /// and the result preserves catalogue order — NOT allowlist order.
+    #[test]
+    fn char_filter_tool_specs_unknown_names_ignored_and_order_is_catalogue_order() {
+        let allowed: super::AllowedToolSet = ["totally_made_up", "grep_search", "bash"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let names: Vec<&str> = filter_tool_specs(Some(&allowed))
+            .iter()
+            .map(|s| s.name)
+            .collect();
+        // "totally_made_up" dropped; order follows mvp_tool_specs() not the
+        // allowlist (bash precedes grep_search in the catalogue).
+        assert_eq!(names, vec!["bash", "grep_search"]);
+    }
+
+    /// An `mcp__`-prefixed name in a hand-built allowlist is treated as
+    /// unknown by the CURRENT filter (it is not in the static catalogue)
+    /// and is dropped. T8 baseline, filter layer. Note: in the real CLI an
+    /// `mcp__` name never even reaches this filter — `normalize_allowed_tools`
+    /// rejects it at arg parsing (see
+    /// `char_normalize_allowed_tools_rejects_mcp_name`).
+    #[test]
+    fn char_filter_tool_specs_mcp_name_currently_dropped() {
+        let allowed: super::AllowedToolSet = ["mcp__codex__codex", "read_file"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let names: Vec<&str> = filter_tool_specs(Some(&allowed))
+            .iter()
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(names, vec!["read_file"]);
+    }
+
+    /// T8 baseline, arg-parsing layer (the REAL entry point): today
+    /// `--allowedTools mcp__codex__codex` is rejected outright by
+    /// `normalize_allowed_tools` because the name is not in the static
+    /// catalogue. Phase 1 T8 will deliberately flip this to deferred
+    /// validation (accept `mcp__` prefix at parse time, filter at dispatch).
+    #[test]
+    fn char_normalize_allowed_tools_rejects_mcp_name() {
+        let err = super::normalize_allowed_tools(&["mcp__codex__codex".to_string()])
+            .expect_err("mcp__ names are not in the static catalogue today");
+        assert!(
+            err.contains("unsupported tool in --allowedTools: mcp__codex__codex"),
+            "unexpected error shape: {err}"
+        );
+        // Known-good names still parse (guards against the rejection being
+        // a blanket failure rather than per-name validation).
+        let ok = super::normalize_allowed_tools(&["read_file".to_string()])
+            .expect("catalogue names parse")
+            .expect("non-empty input yields a set");
+        assert!(ok.contains("read_file"));
+    }
+
     #[test]
     fn shared_help_uses_resume_annotation_copy() {
         let help = commands::render_slash_command_help();
@@ -6324,6 +6436,86 @@ mod tests {
             session_end.len(),
             2,
             "SessionEnd should have exactly 2 matcher entries after 2 deploys"
+        );
+
+        std::fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    // ---------------------------------------------------------------
+    // v0.4.17 Phase 0 — CHARACTERIZATION TEST (meta_opt hook PARSE result)
+    //
+    // SCHEMA-1/2 will replace the flatten-to-Vec<String> with a richer
+    // RuntimeHookConfig that keeps matcher/timeout/async. This locks the
+    // CURRENT parse result of the EXACT object-style shape that
+    // `aris init` (ensure_hook_entry) writes for meta_opt hooks, fed
+    // through the real runtime::ConfigLoader:
+    //
+    //   * `aris init` writes 5 events, but the parser only reads PreToolUse
+    //     / PostToolUse keys. So PreToolUse stays empty (meta_opt writes no
+    //     PreToolUse), and PostToolUse flattens to a single command,
+    //     DROPPING matcher ("") / timeout (5) / async (true) — the exact
+    //     drop-field behavior Phase 2 will deliberately change.
+    //   * Unknown/extra events (PostToolUseFailure / UserPromptSubmit /
+    //     SessionStart / SessionEnd) are silently ignored by the parser.
+    // ---------------------------------------------------------------
+    #[test]
+    fn char_meta_opt_hook_shape_parses_to_command_dropping_matcher_and_timeout() {
+        let root = meta_opt_test_root();
+        let cache_dir = write_fake_cache(&root);
+        let home = root.join("home");
+        std::fs::create_dir_all(&home).expect("create home");
+
+        // Produce the REAL settings.json shape `aris init` writes.
+        deploy_meta_opt_hooks_to(&home, &cache_dir).expect("deploy should succeed");
+
+        let claude_dir = home.join(".claude");
+        let cwd = root.join("project");
+        std::fs::create_dir_all(&cwd).expect("create project cwd");
+
+        // Sanity-pin the written shape Phase 2 will migrate: object-style
+        // entry with matcher="" + async timeout=5 + async:true.
+        let settings_value: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(claude_dir.join("settings.json")).expect("read settings"),
+        )
+        .expect("settings parses");
+        let post_entry = settings_value
+            .pointer("/hooks/PostToolUse/0")
+            .expect("PostToolUse[0] entry");
+        assert_eq!(post_entry.pointer("/matcher").and_then(|v| v.as_str()), Some(""));
+        assert_eq!(
+            post_entry.pointer("/hooks/0/type").and_then(|v| v.as_str()),
+            Some("command")
+        );
+        assert_eq!(
+            post_entry.pointer("/hooks/0/timeout").and_then(|v| v.as_u64()),
+            Some(5)
+        );
+        assert_eq!(
+            post_entry.pointer("/hooks/0/async").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+
+        // Now load through the real runtime parser and lock the result.
+        let loaded = runtime::ConfigLoader::new(&cwd, &claude_dir)
+            .load()
+            .expect("config should load meta_opt hook shape");
+
+        // PreToolUse: empty (meta_opt writes no PreToolUse).
+        assert!(
+            loaded.hooks().pre_tool_use().is_empty(),
+            "PreToolUse must be empty for meta_opt config, got {:?}",
+            loaded.hooks().pre_tool_use()
+        );
+
+        // PostToolUse: flattened to a SINGLE command; matcher / timeout /
+        // async all DROPPED (this is the behavior Phase 2 changes).
+        let post = loaded.hooks().post_tool_use();
+        assert_eq!(post.len(), 1, "PostToolUse should flatten to one command");
+        assert!(
+            post[0].contains("aris-meta-opt-log-event.sh")
+                && post[0].starts_with("bash "),
+            "PostToolUse command should be the bash log_event invocation, got {}",
+            post[0]
         );
 
         std::fs::remove_dir_all(&root).expect("cleanup");

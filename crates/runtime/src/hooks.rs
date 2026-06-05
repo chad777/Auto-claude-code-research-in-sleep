@@ -337,6 +337,107 @@ mod tests {
             .any(|message| message.contains("allowing tool execution to continue")));
     }
 
+    // ---------------------------------------------------------------
+    // v0.4.17 Phase 0 — CHARACTERIZATION TESTS (hooks execution semantics)
+    //
+    // SCHEMA-3 adds matcher-based filtering and TIMEOUT-1/2 adds a per-hook
+    // timeout. These tests lock the CURRENT execution semantics:
+    //   * NO matcher filtering — every configured hook fires for EVERY tool
+    //     name (the runner does not consult any matcher today).
+    //   * non-0/2 exit codes Warn-and-continue (gap test: a Warn hook does
+    //     not stop a later hook from running).
+    //   * slow hooks are awaited to completion with NO timeout.
+    // ---------------------------------------------------------------
+
+    /// No matcher filtering: the runner fires a configured PreToolUse hook
+    /// for an arbitrary/never-seen tool name. (Phase 2 SCHEMA-3 will gate on
+    /// a matcher; today the tool name is ignored for the fire/skip decision.)
+    #[test]
+    fn char_pre_tool_use_fires_for_any_tool_name_no_matcher_filter() {
+        let runner = HookRunner::new(RuntimeHookConfig::new(
+            vec![shell_snippet("printf 'fired'")],
+            Vec::new(),
+        ));
+
+        // A tool name that no matcher would plausibly target still fires.
+        let result = runner.run_pre_tool_use("SomeNeverConfiguredToolXYZ", r#"{"k":"v"}"#);
+
+        assert_eq!(result, HookRunResult::allow(vec!["fired".to_string()]));
+    }
+
+    /// Same for PostToolUse: unconditional firing regardless of tool name.
+    #[test]
+    fn char_post_tool_use_fires_for_any_tool_name_no_matcher_filter() {
+        let runner = HookRunner::new(RuntimeHookConfig::new(
+            Vec::new(),
+            vec![shell_snippet("printf 'post-fired'")],
+        ));
+
+        let result =
+            runner.run_post_tool_use("ZZZ_unknown_tool", r#"{"k":"v"}"#, "out", false);
+
+        assert_eq!(result, HookRunResult::allow(vec!["post-fired".to_string()]));
+    }
+
+    /// Gap test for the non-0/2 Warn-continue contract (hooks.rs:179): a
+    /// hook exiting with code 1 produces a Warn (not a Deny) AND does not
+    /// prevent a subsequent hook from running and contributing its message.
+    #[test]
+    fn char_non_zero_non_two_exit_warns_and_continues_to_next_hook() {
+        let runner = HookRunner::new(RuntimeHookConfig::new(
+            vec![
+                shell_snippet("printf 'warn-hook'; exit 1"),
+                shell_snippet("printf 'ran-after-warn'"),
+            ],
+            Vec::new(),
+        ));
+
+        let result = runner.run_pre_tool_use("Read", r#"{"path":"x"}"#);
+
+        assert!(!result.is_denied(), "exit 1 must NOT deny");
+        // The warning from the first hook is present...
+        assert!(
+            result
+                .messages()
+                .iter()
+                .any(|m| m.contains("allowing tool execution to continue")),
+            "warning message missing: {:?}",
+            result.messages()
+        );
+        // ...and the SECOND hook still ran (Warn does not short-circuit).
+        assert!(
+            result.messages().iter().any(|m| m == "ran-after-warn"),
+            "second hook should still run after a Warn, got {:?}",
+            result.messages()
+        );
+    }
+
+    /// Slow hooks are awaited to completion with NO timeout: a hook that
+    /// sleeps 0.2s makes the call take at least that long. (Phase 2
+    /// TIMEOUT-1/2 introduces a per-hook timeout; this locks the current
+    /// "wait forever" behavior.) Unix-only: relies on fractional `sleep`.
+    #[cfg(not(windows))]
+    #[test]
+    fn char_slow_hook_is_awaited_with_no_timeout() {
+        use std::time::Instant;
+
+        let runner = HookRunner::new(RuntimeHookConfig::new(
+            vec![shell_snippet("sleep 0.2; printf 'slow done'")],
+            Vec::new(),
+        ));
+
+        let start = Instant::now();
+        let result = runner.run_pre_tool_use("Bash", r#"{"command":"true"}"#);
+        let elapsed = start.elapsed();
+
+        assert_eq!(result, HookRunResult::allow(vec!["slow done".to_string()]));
+        assert!(
+            elapsed.as_millis() >= 200,
+            "slow hook must be awaited fully (>=200ms); took {}ms",
+            elapsed.as_millis()
+        );
+    }
+
     #[cfg(windows)]
     fn shell_snippet(script: &str) -> String {
         script.replace('\'', "\"")

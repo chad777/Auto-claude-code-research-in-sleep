@@ -1512,6 +1512,47 @@ mod tests {
         assert_eq!(p2[0].0, "x");
     }
 
+    // ---------------------------------------------------------------
+    // v0.4.17 Phase 0 — CHARACTERIZATION TEST (OE6 baseline)
+    //
+    // A5.3/OE6 will make `accumulate_tool_call` fall back to `id` when the
+    // streaming delta omits `index`. This fixture locks the CURRENT
+    // (buggy-but-known) behavior: a delta WITHOUT `index` defaults to slot
+    // 0, so when slot 0 is already occupied by a different tool, the
+    // index-less delta CLOBBERS / MERGES INTO slot 0 rather than landing in
+    // its own slot. Phase 3 must change this on purpose; the test makes the
+    // change visible and bounded.
+    #[test]
+    fn char_accumulate_tool_call_missing_index_merges_into_slot_zero() {
+        use serde_json::json;
+        let mut pending: Vec<(String, String, String)> = Vec::new();
+
+        // Slot 0 established by a properly-indexed first tool call.
+        accumulate_tool_call(
+            &mut pending,
+            &json!({"index": 0, "id": "call_A", "function": {"name": "alpha", "arguments": "{\"a\":1}"}}),
+        );
+
+        // A SECOND, conceptually-distinct tool call arrives WITHOUT an
+        // `index`. Today it defaults to slot 0 and overwrites id/name +
+        // appends its arguments onto slot 0 — there is NO id-based fallback
+        // that would give it a separate slot.
+        accumulate_tool_call(
+            &mut pending,
+            &json!({"id": "call_B", "function": {"name": "beta", "arguments": "{\"b\":2}"}}),
+        );
+
+        // Current behavior: still ONE slot; call_A was clobbered by call_B's
+        // id/name, and the arguments concatenated into the same slot.
+        assert_eq!(pending.len(), 1, "missing-index delta must NOT open a new slot today");
+        assert_eq!(pending[0].0, "call_B", "id overwritten to the index-less call");
+        assert_eq!(pending[0].1, "beta", "name overwritten to the index-less call");
+        assert_eq!(
+            pending[0].2, "{\"a\":1}{\"b\":2}",
+            "arguments concatenated into slot 0 (the clobber that OE6 will fix)"
+        );
+    }
+
     // OE3 (#249): SSE `data:` payload parsing tolerates missing space.
     #[test]
     fn sse_data_payload_tolerates_missing_space() {

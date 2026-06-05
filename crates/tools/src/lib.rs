@@ -3824,6 +3824,177 @@ mod tests {
         assert!(error.contains("unsupported tool"));
     }
 
+    // ---------------------------------------------------------------
+    // v0.4.17 Phase 0 — CHARACTERIZATION TESTS (tool directory truth)
+    //
+    // These lock the *current* (HEAD=81e5652) MVP tool catalogue so the
+    // v0.4.17 MCP wiring (T1/T2/T3/T5/T6/RW5) can prove it only ADDS the
+    // `mcp__` dispatch surface without disturbing the static catalogue.
+    // ---------------------------------------------------------------
+
+    /// Locks the EXACT count and ordered name list of `mvp_tool_specs()`.
+    /// T1 (RuntimeToolSpec) must leave this static list byte-for-byte
+    /// identical; any drift here is a deliberate catalogue change.
+    #[test]
+    fn char_mvp_tool_specs_exact_count_and_ordered_names() {
+        let names: Vec<&str> = mvp_tool_specs().iter().map(|spec| spec.name).collect();
+        assert_eq!(
+            names,
+            vec![
+                "bash",
+                "read_file",
+                "write_file",
+                "edit_file",
+                "glob_search",
+                "grep_search",
+                "WebFetch",
+                "WebSearch",
+                "TodoWrite",
+                "LlmReview",
+                "Skill",
+                "Agent",
+                "ToolSearch",
+                "NotebookEdit",
+                "Sleep",
+                "SendUserMessage",
+                "Config",
+                "StructuredOutput",
+                "REPL",
+                "PowerShell",
+            ],
+            "MVP tool catalogue name list / order changed"
+        );
+        assert_eq!(mvp_tool_specs().len(), 20, "MVP tool count changed");
+    }
+
+    /// Every ToolSpec's `input_schema` serializes to a JSON object (the
+    /// invariant T2's `mcp_tool_specs` net-min-schema must preserve for MCP
+    /// tools, and that provider request construction relies on).
+    #[test]
+    fn char_every_input_schema_serializes_to_json_object() {
+        for spec in mvp_tool_specs() {
+            let serialized = serde_json::to_value(&spec.input_schema)
+                .unwrap_or_else(|e| panic!("schema for {} must serialize: {e}", spec.name));
+            assert!(
+                serialized.is_object(),
+                "input_schema for {} is not a JSON object",
+                spec.name
+            );
+            assert_eq!(
+                serialized["type"], "object",
+                "input_schema top-level `type` for {} is not \"object\"",
+                spec.name
+            );
+        }
+    }
+
+    /// Representative deep-snapshot #1 — `bash`: name + description keyword
+    /// + schema top-level keys + the `command` required field.
+    #[test]
+    fn char_bash_spec_shape() {
+        let spec = mvp_tool_specs()
+            .into_iter()
+            .find(|s| s.name == "bash")
+            .expect("bash spec present");
+        assert_eq!(spec.name, "bash");
+        assert!(
+            spec.description.contains("shell command"),
+            "bash description drifted: {}",
+            spec.description
+        );
+        let schema = spec.input_schema.as_object().expect("bash schema object");
+        let mut top_keys: Vec<&str> = schema.keys().map(String::as_str).collect();
+        top_keys.sort_unstable();
+        assert_eq!(
+            top_keys,
+            vec!["additionalProperties", "properties", "required", "type"],
+            "bash schema top-level keys drifted"
+        );
+        assert_eq!(spec.input_schema["required"], json!(["command"]));
+        assert_eq!(spec.input_schema["additionalProperties"], json!(false));
+        assert_eq!(spec.required_permission, super::PermissionMode::DangerFullAccess);
+    }
+
+    /// Representative deep-snapshot #2 — `read_file`: the canonical
+    /// read-only file tool.
+    #[test]
+    fn char_read_file_spec_shape() {
+        let spec = mvp_tool_specs()
+            .into_iter()
+            .find(|s| s.name == "read_file")
+            .expect("read_file spec present");
+        assert_eq!(spec.name, "read_file");
+        assert!(
+            spec.description.contains("Read a text file"),
+            "read_file description drifted: {}",
+            spec.description
+        );
+        let schema = spec
+            .input_schema
+            .as_object()
+            .expect("read_file schema object");
+        let mut top_keys: Vec<&str> = schema.keys().map(String::as_str).collect();
+        top_keys.sort_unstable();
+        assert_eq!(
+            top_keys,
+            vec!["additionalProperties", "properties", "required", "type"],
+            "read_file schema top-level keys drifted"
+        );
+        assert_eq!(spec.input_schema["required"], json!(["path"]));
+        assert_eq!(spec.required_permission, super::PermissionMode::ReadOnly);
+    }
+
+    /// Representative deep-snapshot #3 — `Agent`: the subagent-spawning
+    /// tool. T6 keeps subagents OFF the MCP path, so locking Agent's shape
+    /// here pins the surface that test must reason about.
+    #[test]
+    fn char_agent_spec_shape() {
+        let spec = mvp_tool_specs()
+            .into_iter()
+            .find(|s| s.name == "Agent")
+            .expect("Agent spec present");
+        assert_eq!(spec.name, "Agent");
+        assert!(
+            spec.description.contains("agent"),
+            "Agent description drifted: {}",
+            spec.description
+        );
+        let schema = spec.input_schema.as_object().expect("Agent schema object");
+        let mut top_keys: Vec<&str> = schema.keys().map(String::as_str).collect();
+        top_keys.sort_unstable();
+        assert_eq!(
+            top_keys,
+            vec!["additionalProperties", "properties", "required", "type"],
+            "Agent schema top-level keys drifted"
+        );
+        assert_eq!(spec.input_schema["required"], json!(["description", "prompt"]));
+        assert_eq!(spec.required_permission, super::PermissionMode::DangerFullAccess);
+    }
+
+    /// BASELINE for T3/T6: an `mcp__`-prefixed name routed through the
+    /// static `execute_tool` match today returns the `unsupported tool`
+    /// error verbatim. v0.4.17 T3 intercepts MCP names ABOVE this layer
+    /// (in `CliToolExecutor::execute`), so `execute_tool` itself must keep
+    /// returning unsupported — that is the structural guarantee subagents
+    /// never reach MCP. Locking the exact message form is load-bearing.
+    #[test]
+    fn char_execute_tool_mcp_prefixed_name_is_unsupported() {
+        let err = execute_tool("mcp__fake__tool", &json!({}))
+            .expect_err("mcp-prefixed name must be unsupported at the static layer");
+        assert_eq!(err, "unsupported tool: mcp__fake__tool");
+    }
+
+    /// BASELINE for T3/T6 (companion): a plain unknown name also returns the
+    /// same `unsupported tool: <name>` form. Locks the precise message shape
+    /// (prefix + interpolated name) so the v0.4.17 changes are provably
+    /// scoped to MCP-prefixed names only.
+    #[test]
+    fn char_execute_tool_unknown_name_message_form() {
+        let err = execute_tool("nonexistent", &json!({}))
+            .expect_err("unknown tool must be unsupported");
+        assert_eq!(err, "unsupported tool: nonexistent");
+    }
+
     #[test]
     fn web_fetch_returns_prompt_aware_summary() {
         let server = TestServer::spawn(Arc::new(|request_line: &str| {

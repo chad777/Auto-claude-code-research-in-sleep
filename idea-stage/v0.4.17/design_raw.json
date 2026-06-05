@@ -1,0 +1,795 @@
+{
+  "summary": "v0.4.17 全范围只读调查: MCP 接线 / P8 full routing / hook schema / P2 长尾 / issue sweep",
+  "agentCount": 6,
+  "logs": [
+    "派 6 个只读调查 agent: MCP-runtime / tool-dispatch / P8 / hook / 长尾 / issue sweep",
+    "6 agent 调查完成,返回原始材料给主 agent 做 synthesis + codex 审"
+  ],
+  "result": {
+    "mcpInfra": {
+      "summary": "MCP runtime 地基已经相当完整:crates/runtime/src/mcp_stdio.rs (2524 行) 实现了 stdio spawn、Content-Length 帧编解码、initialize/tools/list/tools/call/resources/list/resources/read 五个协议方法、per-server requestTimeoutSecs (v0.4.13)、id 关联校验、notification (id 缺失/null) 跳过、死进程 try_wait 探测 + 透明 respawn (v0.4.10 M3)。但是 McpServerManager 是一座孤岛——除了 mcp_stdio.rs 内部的 #[cfg(test)] 和 lib.rs:65-68 的 re-export,全仓没有任何构造/调用点;aris doctor (main.rs:5279-5291) 仅 rc.mcp().servers().len() 计数后打印 \"v0.4.16 落地\" 的黄色警告,从不 spawn。要让 MCP 工具真正被模型调用,缺口全在\"接线\":CliToolExecutor (main.rs:4888) 是同步的、execute_tool (tools/lib.rs:410) 是写死的 match、工具目录 (main.rs:4138 / tools/lib.rs:2107) 只来自 mvp_tool_specs(),ToolSpec.name 还是 &'static str——MCP 动态工具名塞不进去。另外两个协议正确性缺口:initialize 后从不发 notifications/initialized;read_frame header parser 大小写敏感 + 仅认 CRLF + Content-Length 无上限。",
+      "current_state": [
+        {
+          "area": "McpStdioProcess 能力清单 (完整)",
+          "evidence": "crates/runtime/src/mcp_stdio.rs:606-912 — spawn() 设 stdin/stdout piped、stderr inherit(:613);initialize(:857)/list_tools(:865)/call_tool(:873)/list_resources(:881)/read_resource(:889) 五方法齐;request() 核心(:753-847) 含 tokio timeout 包整个 send+read、id 关联校验(:834)、任意失败 kill().await respawn;try_wait()(:853) 给 manager 探活"
+        },
+        {
+          "area": "MCP 协议方法实现/缺失",
+          "evidence": "已实现: initialize/tools/list/tools/call/resources/list/resources/read (mcp_stdio.rs:857-895)。缺失: prompts/list, prompts/get, logging/setLevel, completion/complete, roots, ping;最关键缺失 = initialize 成功后从不发 notifications/initialized 通知(grep 全 runtime/src/*.rs 无 send_notification/notify/notifications/initialized,exit 1)。spec 要求 client 在收到 initialize result 后发此通知,严格 server 不收到会拒绝后续请求"
+        },
+        {
+          "area": "per-server timeout 与 notification skip (v0.4.13 已就绪)",
+          "evidence": "mcp_stdio.rs:603 request_timeout_override_secs 字段;mcp_request_timeout()(:961-975) 优先级 per-server>env MCP_REQUEST_TIMEOUT_SECS>300s,clamp 1..=1800;notification 跳过逻辑在 request() 读循环(:785-809),frame_id None/Null 时 eprintln 后 continue"
+        },
+        {
+          "area": "config 解析 (完整)",
+          "evidence": "McpStdioServerConfig 字段 command/args/env/request_timeout_secs (config.rs:104-115);parse_mcp_server_config (config.rs:616-654) 按 type 字段分流,stdio 分支(:624-629) 解 requestTimeoutSecs;merge_mcp_servers(config.rs:467-492) 从 root['mcpServers'] 解;ConfigLoader.discover()(config.rs:214-241) 路径: ~/.claude.json(legacy)→ config_home/settings.json → cwd/.claude.json → cwd/.claude/settings.json → cwd/.claude/settings.local.json;load()(:243-276) 逐文件 merge_mcp_servers 后落入 McpConfigCollection"
+        },
+        {
+          "area": "McpServerManager 零外部调用 (孤岛验证通过)",
+          "evidence": "grep McpServerManager/from_runtime_config/discover_tools 跨 aris-cli/tools/commands/api crate exit 2 (无匹配);唯一非测试引用是 lib.rs:65-68 re-export。aris doctor MCP section: main.rs:5250-5274 'Codex MCP' 检查直接读 ~/.claude.json(注意是 .claude.json 不是 settings.json);main.rs:5276-5291 Check 6 仅 rc.mcp().servers().len()>0 时打印 'currently only stdio test/diagnostics' + 'Full tool dispatch lands in v0.4.16' 黄字,从不构造 manager"
+        },
+        {
+          "area": "M6 header parser 缺陷",
+          "evidence": "mcp_stdio.rs:673-702 read_frame(): 终止条件 line=='\\r\\n'(:684) 仅认 CRLF,LF-only 行(\\n)永远不等于 '\\r\\n' 会无限读到 EOF;strip_prefix('Content-Length:')(:687) 大小写精确,'content-length:' 或带前导空格的 ' Content-Length:' 不匹配 → content_length=None → 报 missing header(:696);parse::<usize>(:690) 无上限,恶意 server 报 Content-Length: 999999999999 会让 vec![0u8; len](:699) OOM"
+        },
+        {
+          "area": "工具目录/dispatch 架构 (MCP 接线的真正缺口)",
+          "evidence": "ToolSpec.name 是 &'static str (tools/lib.rs:55) — 动态 MCP 名塞不进;mvp_tool_specs()(tools/lib.rs:63) 硬编码 vec;主 loop 工具目录 main.rs:4138-4147 = filter_tool_specs(mvp_tool_specs())(main.rs:570);execute_tool(tools/lib.rs:410-435) 同步写死 match,_ => 'unsupported tool';CliToolExecutor::execute(main.rs:4888-4922) 同步签名,直接 execute_tool,无 tokio runtime/无 manager 字段;构造点 main.rs:3978 CliToolExecutor::new(allowed_tools, emit_output) 也无 manager 注入位"
+        },
+        {
+          "area": "qualified tool name 命名约定 (已就绪)",
+          "evidence": "runtime/src/mcp.rs:25-37 mcp_tool_prefix='mcp__<normalized_server>__', mcp_tool_name 拼 prefix+normalized_tool;normalize_name_for_mcp(:7-23) 把非 [a-zA-Z0-9_-] 替为 _。manager discover_tools 已用 mcp_tool_name 建 tool_index (mcp_stdio.rs:407)"
+        },
+        {
+          "area": "subagent 路径平行未接线",
+          "evidence": "tools/lib.rs 内有平行的 AnthropicRuntimeClient(:2084) 给 Agent 子代理用,工具目录 tool_specs_for_allowed_tools(:2248)=mvp_tool_specs() 过滤,同样无 MCP;execute_tool_search(:2378) 的 pending_mcp_servers 字段(:2390)恒为 None — 是预留的 MCP-via-ToolSearch 钩子但未实装"
+        }
+      ],
+      "work_items": [
+        {
+          "id": "RW1",
+          "title": "initialize 握手后补发 notifications/initialized",
+          "detail": "在 McpStdioProcess 加 send_notification(method, params) (复用 write_jsonrpc_message,但消息体无 id,用一个 #[serde] 结构或 raw json {jsonrpc:'2.0', method:'notifications/initialized'})。在 McpServerManager::ensure_server_ready 的 initialize 成功分支后 (mcp_stdio.rs:584 server.initialized=true 之前) 调用 process.notify_initialized()。这是 MCP spec 强制步骤,严格 server (含官方 SDK server) 在未收到该通知前会拒绝 tools/list。",
+          "files": [
+            "crates/runtime/src/mcp_stdio.rs"
+          ],
+          "effort": "small / 1-2h",
+          "risk": "现有测试 server (fake-mcp-server.py 等) 不检查该通知,所以不会破坏既有 11 个 manager/process 测试;但要确认 notification 写入不期待响应 (不要走 request() 的读循环)"
+        },
+        {
+          "id": "RW2",
+          "title": "read_frame header parser 容错 (M6)",
+          "detail": "mcp_stdio.rs:673-702: (a) 终止判断改 line.trim_end_matches(['\\r','\\n']).is_empty() 以兼容 LF-only;(b) Content-Length 匹配改大小写不敏感: line.split_once(':') 后 key.trim().eq_ignore_ascii_case('content-length');(c) 加上限常量 MAX_CONTENT_LENGTH (如 64MiB),parsed>MAX 时返回 InvalidData 而非 vec![0u8; len] OOM。注意现有测试 server 都发标准 'Content-Length: N\\r\\n\\r\\n',改动须保持对这些的兼容。",
+          "files": [
+            "crates/runtime/src/mcp_stdio.rs"
+          ],
+          "effort": "small / 1-2h",
+          "risk": "trim 逻辑不能误吞掉 header 行内合法内容;上限值要足够大不切真实 agent 大响应 (codex 工具结果可能数 MB)"
+        },
+        {
+          "id": "RW3",
+          "title": "ToolSpec 支持动态名 + MCP tool 描述符类型",
+          "detail": "ToolSpec.name 现为 &'static str (tools/lib.rs:55),MCP 名是运行时 String。两条路: (A) 引入新枚举/结构 RuntimeToolSpec { name: String, description: String, input_schema: Value } 用于 LLM 请求构造,mvp 的 &'static 转成它;(B) 把 ToolSpec.name 改 Cow<'static,str>。推荐 A,改动面小、不动既有 64 golden test 锁定的 mvp_tool_specs() 真值。新增 fn 把 ManagedMcpTool (mcp_stdio.rs:206) 转 RuntimeToolSpec: 用 tool.qualified_name 做 name、tool.tool.description、tool.tool.input_schema (None 时给空 object schema)。",
+          "files": [
+            "crates/tools/src/lib.rs",
+            "crates/aris-cli/src/main.rs"
+          ],
+          "effort": "medium / 0.5d",
+          "risk": "main.rs:4141 和 tools/lib.rs:2110 两处 ToolDefinition 构造都吃 spec.name.to_string(),改类型要同步;permission_policy (main.rs:4924) / agent_permission_policy (tools/lib.rs:2030) 也遍历 spec.name 注册权限 — MCP 工具需要一个默认 PermissionMode (建议 DangerFullAccess 或新增 mcp 专用,且默认走权限确认)"
+        },
+        {
+          "id": "RW4",
+          "title": "在 CliToolExecutor 持有 McpServerManager + tool_index 并改异步 dispatch",
+          "detail": "CliToolExecutor (main.rs:4872) 增字段 mcp_manager: Option<McpServerManager> 和 mcp_runtime: tokio::runtime::Runtime (因为 ToolExecutor::execute 是同步签名,manager.call_tool 是 async,需 block_on);execute() (main.rs:4889) 在现有 execute_tool 的 _ 分支前先判断 tool_name.starts_with('mcp__'),命中则 self.mcp_runtime.block_on(manager.call_tool(tool_name, Some(input_value))),把 McpToolCallResult.content 拼成文本返回。构造点 main.rs:3978 改为传入预构造的 manager。注意 manager 需要 &mut(call_tool 签名 &mut self),CliToolExecutor::execute 已是 &mut self 没问题。",
+          "files": [
+            "crates/aris-cli/src/main.rs"
+          ],
+          "effort": "large / 1-1.5d",
+          "risk": "ToolExecutor trait 是同步的 — block_on 嵌套在已有外层 tokio runtime (ExecutorClient 用 self.runtime.block_on, main.rs:4152) 内可能 panic 'Cannot start a runtime from within a runtime';须确认 tool dispatch 调用栈是否已在 tokio 上下文 (若是,需用 tokio::task::block_in_place 或独立 runtime/线程)。这是最大回归雷"
+        },
+        {
+          "id": "RW5",
+          "title": "启动时 discover_tools 注入 LLM 工具目录 (eager) + 缓存",
+          "detail": "build_conversation_runtime (main.rs:3954) 内: 若 rc.mcp().servers() 非空,构造 McpServerManager::from_runtime_config,block_on discover_tools() 拿 Vec<ManagedMcpTool>,转 RuntimeToolSpec 缓存进 CliToolExecutor 和供 main.rs:4138 工具目录拼接 (mvp + mcp)。tool_index 已在 manager 内 (mcp_stdio.rs:315),call 时直接用 qualified_name 路由,无需 executor 侧再存。建议 eager (启动 discover 一次) 而非 lazy,因为 LLM 请求构造时就要完整工具目录;discover 失败的 server 走降级 (见 RW6)。",
+          "files": [
+            "crates/aris-cli/src/main.rs"
+          ],
+          "effort": "medium / 0.5d",
+          "risk": "discover_tools 会 spawn 所有 stdio server 并 initialize,启动延迟增加 (每 server 一次 initialize+tools/list);agent-style server (codex) 启动慢。考虑只在 mcp_server_count>0 时做,且不阻塞首个 prompt 太久。tools/list 结果目前每次 discover 都重查 (mcp_stdio.rs:485 clear_routes 后重建),无跨进程持久缓存 — 单 session 内 manager 持有即可"
+        },
+        {
+          "id": "RW6",
+          "title": "server 失败降级 + stderr 日志策略",
+          "detail": "discover_tools (mcp_stdio.rs:359) 现在任一 server initialize/list 失败就整体 Err 返回 (:390/:400),会让所有 MCP 工具都不可用。改为 per-server try: 收集成功 server 的工具,失败 server 记 warning 并跳过 (类似 unsupported_servers 的 UnsupportedMcpServer 模式, mcp_stdio.rs:213)。stderr 现在是 Stdio::inherit() (mcp_stdio.rs:613) — server stderr 直接混进 aris 终端输出,嘈杂;建议改 Stdio::piped() + 后台 drain 到 debug 日志,或保留 inherit 但文档说明。",
+          "files": [
+            "crates/runtime/src/mcp_stdio.rs",
+            "crates/aris-cli/src/main.rs"
+          ],
+          "effort": "medium / 0.5d",
+          "risk": "改 discover_tools 错误语义会动现有测试 manager_discovers_tools_from_stdio_config 等的预期 (它们假定全成功);stderr piped 后若不及时 drain,管道满会让 server 写阻塞 → 与 v0.4.13 修的 stdin 阻塞同类雷"
+        },
+        {
+          "id": "RW7",
+          "title": "doctor MCP section 升级 (去掉 v0.4.16 占位警告)",
+          "detail": "main.rs:5276-5291 的 'Full tool dispatch lands in v0.4.16' 黄字现已过时 (HEAD=v0.4.16)。接线完成后改为: 实际 spawn 每个 stdio server 跑 initialize + tools/list,报告每 server 工具数 / 失败原因 (复用 RW6 的 per-server 结果);non-stdio server 报 unsupported (manager.unsupported_servers(), mcp_stdio.rs:355)。另注意 doctor 'Codex MCP' 检查 (main.rs:5253) 读的是 ~/.claude.json,而 ConfigLoader 读 settings.json + .claude.json 两套 — 两处路径不一致需统一或文档说明。",
+          "files": [
+            "crates/aris-cli/src/main.rs"
+          ],
+          "effort": "small / 2-3h",
+          "risk": "doctor 里 spawn server 会有副作用 (启动外部进程),要 timeout 保护 + 跑完 shutdown (manager.shutdown, mcp_stdio.rs:472);若 server 配置错误不能让 doctor 卡死"
+        },
+        {
+          "id": "RW8",
+          "title": "subagent (tools/lib.rs) 路径同步接线 (可选,与 P8 协同)",
+          "detail": "tools/lib.rs 的 AnthropicRuntimeClient(:2084)+tool_specs_for_allowed_tools(:2248) 是子代理独立工具目录,同样无 MCP。execute_tool_search 的 pending_mcp_servers 字段(:2390) 是预留钩子。若要子代理也能用 MCP 工具,需把 RW3/RW4 的机制平移到 tools crate;但子代理在独立进程/线程,manager 不能直接共享。建议 v0.4.17 先只做主 loop (RW1-7),子代理 MCP 标注 deferred。",
+          "files": [
+            "crates/tools/src/lib.rs"
+          ],
+          "effort": "large / 1d+",
+          "risk": "与 v0.4.16 deferred 的 OpenAI subagent routing (P8) 耦合;子代理跨进程难共享 manager,可能要每子代理独立 spawn MCP server (资源翻倍)"
+        }
+      ],
+      "regression_risks": [
+        "RW4 嵌套 tokio runtime: ToolExecutor::execute 同步签名内 block_on(manager.call_tool) 若已在 tokio 上下文会 panic 'Cannot start a runtime from within a runtime' — 须先查清 CliToolExecutor::execute 调用栈是否在 ExecutorClient::stream 的 block_on 内 (main.rs:4152),大概率需 block_in_place 或独立线程/runtime",
+        "RW3 改 ToolSpec.name 类型 (&'static str→String/Cow) 会触及 v0.4.16 的 64 golden 测试锁定的 mvp_tool_specs() 真值、permission_policy (main.rs:4924)、agent_permission_policy (tools/lib.rs:2033) — 推荐新增 RuntimeToolSpec 而非改 ToolSpec 本体以零回归",
+        "RW6 改 discover_tools 错误语义 (整体 Err→per-server 降级) 会动 mcp_stdio.rs 既有测试 manager_discovers_tools_from_stdio_config / manager_routes_tool_calls_to_correct_server 的全成功假设",
+        "MCP 工具走权限系统: mvp 工具有 required_permission (ToolSpec.required_permission, tools/lib.rs:58),MCP 工具无 — 若默认 DangerFullAccess 会绕过 sandbox/permission gate,可能让任意 MCP server 在 read-only 模式下执行副作用操作 (安全雷,与 v0.4.14 S9 同类敏感)",
+        "eager discover (RW5) 增加启动延迟: 每 stdio server 一次 spawn+initialize+tools/list,agent-style server (codex 启动 60-180s) 会拖慢首个 prompt;需异步/lazy 或超时保护",
+        "stderr Stdio::inherit→piped (RW6) 若不及时 drain,管道缓冲满会让 server 写阻塞 — 与 v0.4.13 修的 stdin 写阻塞 (mcp_stdio.rs:765 注释) 同类死锁",
+        "MCP 工具名前缀 mcp__ 与 allowed_tools 过滤交互: filter_tool_specs (main.rs:570) / CliToolExecutor allowed check (main.rs:4890) 按精确 contains 过滤,动态 mcp__ 名是否进 allowed set 需明确策略 (否则要么全禁要么全放)"
+      ],
+      "characterization_tests": [
+        "锁定当前 doctor MCP 输出: mcpServers.len()>0 时打印黄字 'currently only stdio test/diagnostics' + 'Full tool dispatch lands in v0.4.16' (main.rs:5286-5290),接线后此文案必改,先快照",
+        "锁定 mvp_tool_specs() 当前工具集与 execute_tool dispatch 的 19 个 case (tools/lib.rs:411-433) + _ => 'unsupported tool: {name}' (:434),确保接线后非 MCP 工具行为字节不变",
+        "锁定 config 解析: settings.json/.claude.json 五路径 discover 顺序 (config.rs:219-240) + mcpServers 各 type 解析真值 (已有 config.rs tests :1100-1320),含 requestTimeoutSecs round-trip",
+        "锁定 McpServerManager 现有 11 个测试全绿 (mcp_stdio.rs:1363-2522): discover/route/respawn/timeout/id-mismatch/notification-skip — 任何 RW1/RW2/RW6 改动后这些必须仍 PASS",
+        "锁定 read_frame 对标准 'Content-Length: N\\r\\n\\r\\n' + 测试 server 大小写 (fake server 用 'Content-Length:' 大写发, 但读 header 时 line.lower().startswith — server 侧已大小写不敏感) 的兼容,RW2 改动不得破坏 round_trips_initialize / lists_tools 等",
+        "新增 characterization: filter_tool_specs / tool_specs_for_allowed_tools 当前对 mcp__ 前缀名的过滤行为 (现在 mvp 里没有 mcp__ 名,等价于全部被 allowed_tools.contains 拒绝),锁定基线再改"
+      ],
+      "open_questions": [
+        "CliToolExecutor::execute (同步 trait) 的调用栈是否已在 tokio runtime 上下文? 决定 RW4 用 block_on / block_in_place / 独立线程 — 需读 runtime crate 的 ConversationRuntime::run 看 tool dispatch 在不在 async 块内 (本次调查未深入 conversation.rs 的 run loop)",
+        "MCP 工具应映射到哪个 PermissionMode? 默认放行 (DangerFullAccess) 还是默认走权限确认? 与 sandbox.strictMode (v0.4.12 #238) 如何交互 — MCP server 是 aris 进程外的子进程,sandbox 管不到它",
+        "工具目录是否要做 ToolSearch deferred 化? pending_mcp_servers 字段 (tools/lib.rs:2390) 暗示原设计想让 MCP 工具走 deferred/ToolSearch 懒加载而非全量塞进首个请求 (避免 token 膨胀);若 server 工具多 (codex/oracle 各数个 + filesystem 等),eager 全量可能撑大 system/tools payload",
+        "non-stdio transport (sse/http/ws/sdk/claudeai-proxy) 何时支持? 目前 McpServerManager::from_servers (mcp_stdio.rs:330-344) 只收 Stdio,其余全进 unsupported_servers;Codex MCP / Oracle MCP 用户是 stdio 还是 http? 影响 v0.4.17 是否够用",
+        "doctor 'Codex MCP' 检查读 ~/.claude.json (main.rs:5253) 与 ConfigLoader 读 settings.json+.claude.json 两套路径不一致,是否需统一? Codex MCP 实际配在哪个文件 (用户 CLAUDE.md 说 claude mcp add codex -s user → ~/.claude.json)",
+        "tools/list 结果是否需要跨 session 持久缓存? 当前只在单 session 的 manager 实例内活,每次 aris 启动重 discover — 对慢启动 server 是否要加磁盘缓存 + 失效策略"
+      ]
+    },
+    "toolDispatch": {
+      "summary": "tools 侧的工具系统由三部分组成,全部基于一个静态的 `mvp_tool_specs() -> Vec<ToolSpec>` 清单(tools/lib.rs:63)和一个自由函数 `execute_tool(name, input)` 的 match dispatch(tools/lib.rs:410)。关键阻塞点是 `ToolSpec.name: &'static str`(tools/lib.rs:55)——无法承载运行期发现的 MCP 工具名;但下游 API 层 `ToolDefinition.name: String`(api/types.rs:165)和 `PermissionPolicy`(运行期 BTreeMap)都已是动态友好的。MCP 基础设施(McpServerManager / discover_tools / call_tool / ManagedMcpTool / mcp__server__tool 命名 + sanitization)在 runtime/mcp_stdio.rs + mcp.rs 里已经完整实现并 pub 导出,但目前完全没有接进 CLI runtime——只在测试里用。`tools` crate 单向依赖 `runtime`(Cargo.toml 已有),所以 tools 侧可直接 use runtime 的 MCP 类型,无需新加依赖。接线最干净的注入点是 main.rs:3946 `build_runtime`(14 处调用,全在 LiveCli),它一处同时构造了广告侧(ExecutorClient)、dispatch 侧(CliToolExecutor)、ACL 侧(permission_policy)三个协作者——这就是 A1(runtime/manager 持有)与 A2(tools dispatch)的会合点。execute 是 sync,manager 是 async,需用测试里已验证的 tokio Runtime + block_on 桥接。",
+      "current_state": [
+        {
+          "area": "静态工具清单 ToolSpec / mvp_tool_specs",
+          "evidence": "crates/tools/src/lib.rs:53-59 (ToolSpec 定义, name 为 &'static str), :63-408 (mvp_tool_specs() 硬编码 20 个 ToolSpec: bash/read_file/write_file/edit_file/glob_search/grep_search/WebFetch/WebSearch/TodoWrite/LlmReview/Skill/Agent/ToolSearch/NotebookEdit/Sleep/SendUserMessage/Config/StructuredOutput/REPL/PowerShell)"
+        },
+        {
+          "area": "execute_tool dispatch (工具名→handler 映射)",
+          "evidence": "crates/tools/src/lib.rs:410-436 自由函数 `pub fn execute_tool(name: &str, input: &Value) -> Result<String, String>` 是一个 match,末尾 `_ => Err(format!(\"unsupported tool: {name}\"))`。注意它是模块级自由函数,不是 CliToolExecutor 的方法"
+        },
+        {
+          "area": "CliToolExecutor 实际位置(不在 tools crate)",
+          "evidence": "crates/aris-cli/src/main.rs:4872-4922 `struct CliToolExecutor { renderer, emit_output, allowed_tools: Option<AllowedToolSet> }` + `impl ToolExecutor`,其 execute (4889) 先查 allowed_tools(4890-4898),再 `execute_tool(tool_name, &value)`(4901)。ToolExecutor trait 在 crates/runtime/src/conversation.rs:54-56,`fn execute(&mut self, tool_name, input) -> Result<String, ToolError>` 是 SYNC"
+        },
+        {
+          "area": "工具向模型 advertise 的路径(API 请求 tools 数组)",
+          "evidence": "系统提示不枚举工具(prompt.rs 仅泛指 tools)。唯一广告通道是 API tools 数组: Anthropic 主会话 crates/aris-cli/src/main.rs:4138-4147 (filter_tool_specs -> ToolDefinition); OpenAI 主会话 crates/aris-cli/src/openai_executor.rs:457-463 + convert_tool_spec_openai (:1191-1200); 过滤器 crates/aris-cli/src/main.rs:570-575 filter_tool_specs"
+        },
+        {
+          "area": "工具 schema 序列化进 request",
+          "evidence": "ToolDefinition 在 crates/api/src/types.rs:163-169, name 为 String(owned), input_schema 为 serde_json::Value。MessageRequest.tools: Option<Vec<ToolDefinition>> (types.rs:54)。即 API 层已是动态友好,瓶颈仅在 ToolSpec.name 的 &'static str"
+        },
+        {
+          "area": "MCP 基础设施(已实现, 未接线)",
+          "evidence": "crates/runtime/src/mcp_stdio.rs:312-317 McpServerManager{servers,tool_index,...}; :359-431 async discover_tools()->Vec<ManagedMcpTool>; :433-470 async call_tool(qualified_name, args)->McpToolCallResult; :206-211 ManagedMcpTool{server_name,qualified_name,raw_name,tool}; :288-292 ToolRoute。全部 pub 导出于 crates/runtime/src/lib.rs:63-69"
+        },
+        {
+          "area": "MCP 工具名 + sanitization(冲突防护已有)",
+          "evidence": "crates/runtime/src/mcp.rs:7-23 normalize_name_for_mcp (非 [a-zA-Z0-9_-] 全转 _); :26-28 mcp_tool_prefix = `mcp__{server}__`; :31-37 mcp_tool_name = prefix+normalized_tool。tool_index 用 qualified_name 做 key(mcp_stdio.rs:407-414),server 名清洗后冲突由 BTreeMap key 唯一性兜底"
+        },
+        {
+          "area": "MCP 当前唯一接触点 = doctor 警告",
+          "evidence": "crates/aris-cli/src/main.rs:5276-5291 Check 6: mcp().servers().len()>0 时打印黄色警告 '⚠ MCP servers configured (N) but currently only stdio test/diagnostics.' + 'Full tool dispatch into LLM context lands in v0.4.16.' —— 文案说 v0.4.16,但实际未实现,接线后须改"
+        },
+        {
+          "area": "依赖方向 + manager 持有可行性",
+          "evidence": "crates/tools/Cargo.toml: tools 依赖 runtime + api(单向, runtime 不依赖 tools, 无环)。所以 ToolSpec/execute_tool 可直接 use runtime::{McpServerManager, ManagedMcpTool, mcp_tool_name}。但 McpServerManager 是 async 且 &mut self,CliToolExecutor.execute 是 sync,需 tokio Runtime block_on 桥接(测试模式见 mcp_stdio.rs:1369/1663/1700)"
+        },
+        {
+          "area": "子代理独立广告 + dispatch 路径",
+          "evidence": "crates/tools/src/lib.rs:2084-2223 子代理自己的 AnthropicRuntimeClient(tools crate 内),:2107 用 tool_specs_for_allowed_tools 广告; :2225-2246 SubagentToolExecutor.execute 同样查 allowed_tools(2237)再调 execute_tool(2244); :1949-2010 allowed_tools_for_subagent 按 subagent_type 给静态工具白名单(无 MCP)。build_agent_runtime 在 :1885-1923"
+        },
+        {
+          "area": "权限默认档(新工具 ACL 行为)",
+          "evidence": "crates/runtime/src/permissions.rs:81-86 required_mode_for: 不在 tool_requirements map 里的工具默认返回 DangerFullAccess。permission_policy (main.rs:4924-4930) 仅注册 mvp_tool_specs 的工具。故未注册的 MCP 工具默认需 DangerFullAccess: 在 read-only/workspace-write 模式下会被 deny 或要求 prompt(authorize 逻辑 permissions.rs:89-146)"
+        },
+        {
+          "area": "中央接线点 build_runtime",
+          "evidence": "crates/aris-cli/src/main.rs:3946-3984 build_runtime 一处同时建 ExecutorClient(广告)+CliToolExecutor(dispatch, :3978)+permission_policy(ACL, :3979)。14 个调用点全在 LiveCli(grep 命中 1269/1563/1851/2020/2264/...)。LiveCli struct 在 :1242-1252, 目前不持有 McpServerManager"
+        }
+      ],
+      "work_items": [
+        {
+          "id": "T1",
+          "title": "ToolSpec 解除 &'static str 约束以承载动态 MCP 工具名",
+          "detail": "把 crates/tools/src/lib.rs:54-59 的 ToolSpec.name/description 从 &'static str 改为 String(或新增一个 owned 变体 / 用 Cow<'static,str>)。所有 mvp_tool_specs() 里的字面量(:65-407, ~20 处)需补 .to_string() 或用 Cow::Borrowed。下游消费点 main.rs:4142/4143 spec.name.to_string()、openai_executor.rs:1195/1196、tools/lib.rs:2110/2111 已经 .to_string()/借用,改 owned 后大多只需去掉 .to_string() 或改为 .clone()。权衡: Cow<'static,str> 改动面最小(静态字面量仍零拷贝, 动态 MCP 名走 Owned)。这是 A1/A2 共同前置, 必须先做",
+          "files": [
+            "crates/tools/src/lib.rs"
+          ],
+          "effort": "medium (2-3h, 改动散布在 20 个 ToolSpec 字面量 + 4 处消费点)",
+          "risk": "ToolSpec derive(PartialEq,Eq) 不受影响; 但 mvp_tool_specs 现在每次 alloc String, 热路径 filter_tool_specs 每 turn 调一次, 性能可忽略。回归点: 任何按 &'static str 匹配 spec.name 的代码(grep 确认无)"
+        },
+        {
+          "id": "T2",
+          "title": "新增 mcp_tool_specs(manager) 构造函数把 ManagedMcpTool 转成 ToolSpec",
+          "detail": "在 tools/lib.rs 新增 `pub fn mcp_tool_specs(tools: &[runtime::ManagedMcpTool]) -> Vec<ToolSpec>`: 对每个 tool 用 tool.qualified_name 作 ToolSpec.name(已是 mcp__server__tool 形式), tool.tool.description.unwrap_or_default() 作 description, tool.tool.input_schema.clone().unwrap_or(json!({\"type\":\"object\"})) 作 input_schema, required_permission 统一给 PermissionMode::DangerFullAccess(见 T5 决策)。A1 侧负责 discover 后把 Vec<ManagedMcpTool> 传过来。约定: A1 提供 manager.discover_tools() 的结果(已含 qualified_name), A2 只做 ManagedMcpTool->ToolSpec 纯转换, 不碰 manager 生命周期",
+          "files": [
+            "crates/tools/src/lib.rs"
+          ],
+          "effort": "small (1h)",
+          "risk": "input_schema 为 None 时给空 object schema 兜底(部分 MCP server 不返回 schema); 描述为 None 时给空串。MCP server 返回的 schema 可能含 OpenAI/Anthropic 不接受的字段(如 $schema), 但当前主会话直接透传 spec.input_schema, 不校验, 风险低"
+        },
+        {
+          "id": "T3",
+          "title": "execute_tool 增加 MCP 路由分支(经 manager.call_tool)",
+          "detail": "execute_tool (tools/lib.rs:410) 的 match 在 `_` 兜底前加: 若 name.starts_with(\"mcp__\") 则路由到 MCP 调用。因 execute_tool 是无状态自由函数, 无法直接持有 async manager —— 方案: 让 CliToolExecutor (main.rs:4872) 持有 manager(见 T4), 在 CliToolExecutor.execute (main.rs:4901) 调 execute_tool 前先拦截 mcp__ 前缀, 走 self.mcp_manager.call_tool。即 MCP dispatch 不进 tools crate 的 execute_tool, 而在 CliToolExecutor 层分流。这样 tools crate 的 execute_tool 保持纯 sync 静态工具。A1↔A2 约定: A1 提供 `McpServerManager` 持有 + 一个 sync 包装方法 call_tool_blocking(qualified_name, args)->Result<String,String>(内部 block_on + 把 McpToolCallResult.content 展平成文本)",
+          "files": [
+            "crates/aris-cli/src/main.rs",
+            "crates/tools/src/lib.rs"
+          ],
+          "effort": "medium (3-4h, 含 McpToolCallResult content 展平 + is_error 映射)",
+          "risk": "McpToolCallResult.is_error(mcp_stdio.rs:146) 须映射成 ToolError; content(Vec<McpToolCallContent>) 须展平(text 类型取 data.text, 其他序列化)。block_on 嵌套: 若已在 tokio runtime 内调 block_on 会 panic, 须用独立 Runtime 或 Handle::block_on——AnthropicRuntimeClient 已各自持有独立 Runtime(main.rs:4075), CliToolExecutor 需自带一个或共享 manager 的"
+        },
+        {
+          "id": "T4",
+          "title": "CliToolExecutor 持有 McpServerManager 并在 build_runtime 注入",
+          "detail": "CliToolExecutor (main.rs:4872-4885) 加字段 mcp_manager: Option<Arc<Mutex<McpServerManager>>> 或 Option<McpManagerHandle>(A1 定义的 sync 句柄)。build_runtime (main.rs:3946-3984) 新增参数接收 A1 在 LiveCli::new(main.rs:1261) 里 discover 好的 manager, 传给 CliToolExecutor::new(:3978)。同时把 MCP ToolSpec 合并进广告: ExecutorClient 构造(:3955-3971)需让 Anthropic/OpenAI client 也拿到 mcp_tool_specs —— 即 AnthropicRuntimeClient(main.rs:4074)/OpenAIRuntimeClient 加 extra_tools: Vec<ToolSpec> 字段, 在 stream 时 append 到 filter_tool_specs 结果后(main.rs:4138 / openai_executor.rs:457)。A1↔A2 约定: A1 负责 manager 的 new/discover/shutdown 生命周期 + Arc<Mutex> 共享; A2 负责把 mcp ToolSpec 灌进两个 executor 的广告 + CliToolExecutor 的 dispatch",
+          "files": [
+            "crates/aris-cli/src/main.rs",
+            "crates/aris-cli/src/openai_executor.rs"
+          ],
+          "effort": "large (5-6h, build_runtime 14 处调用点签名都要改 + 两个 executor 加字段 + LiveCli 持有)",
+          "risk": "build_runtime 14 个调用点(main.rs:1269/1563/1851/2020/2264/2289/2324/2396/2435/2472/2527/2617/2637/+LiveCli)全要传 manager, 改动面大; plan-mode 切换(:2435/2472)重建 runtime 时不能丢 manager 已 discover 的工具(否则每次切档重连 MCP server)。Arc<Mutex> 跨 CliToolExecutor 与 A1 持有者共享, 注意 block_on 持锁不要死锁"
+        },
+        {
+          "id": "T5",
+          "title": "MCP 工具的 ACL 权限注册",
+          "detail": "permission_policy (main.rs:4924-4930) 目前只注册 mvp_tool_specs。MCP 工具不在 map 里时 required_mode_for(permissions.rs:81-86)默认 DangerFullAccess —— 即 read-only 模式被 deny、workspace-write 模式要 prompt。决策建议: 把 MCP ToolSpec(T2 产出, required_permission=DangerFullAccess)也 fold 进 permission_policy, 显式声明而非靠默认, 让 doctor/审计可见。即 permission_policy(mode) 改为接收 extra_specs: &[ToolSpec] 并一起 with_tool_requirement。默认 DangerFullAccess 是保守正确选择(MCP 工具副作用未知)",
+          "files": [
+            "crates/aris-cli/src/main.rs"
+          ],
+          "effort": "small (1-2h)",
+          "risk": "若默认 DangerFullAccess, 用户在 workspace-write 模式每次 MCP 调用都会被 prompt 打断, 体验差但安全。可考虑加 config 让用户为特定 server 降档, 但 v0.4.17 先不做(YAGNI)。回归点: permission_policy() 当前无参, 14 个 build_runtime 调用间接受影响"
+        },
+        {
+          "id": "T6",
+          "title": "Subagent 暂不接 MCP(显式不给, 最小验证)",
+          "detail": "SubagentToolExecutor(tools/lib.rs:2225-2246)与子代理 AnthropicRuntimeClient(:2084)是独立路径, allowed_tools_for_subagent(:1949-2010)给的全是静态工具白名单。建议 v0.4.17 明确不给子代理 MCP 工具: 即 build_agent_runtime(:1885)不注入 mcp_tool_specs, allowed_tools 不含 mcp__ 前缀。理由: 子代理本就 Anthropic-only(P8 gate :1901)、tool 集受控, 先验证主会话 MCP 闭环最小。文档/注释里标注这是有意决策。A1↔A2 约定: A1 的 manager 只挂到主 LiveCli, 不传给 build_agent_runtime",
+          "files": [
+            "crates/tools/src/lib.rs"
+          ],
+          "effort": "small (0.5h, 主要是加注释 + 不做的确认, 顺带在 allowed_tools_for_subagent 注释说明)",
+          "risk": "几乎无。后续若要给子代理 MCP, 需把 manager 句柄传进 build_agent_runtime 并改 SubagentToolExecutor 同样分流——但那时子代理的独立 AnthropicRuntimeClient 广告路径也要灌 mcp specs, 工作量翻倍, 故 v0.4.17 不做"
+        },
+        {
+          "id": "T7",
+          "title": "更新 doctor MCP 警告文案",
+          "detail": "main.rs:5283-5291 的 Check 6: 接线后把 '⚠ MCP servers configured (N) but currently only stdio test/diagnostics.' + 'Full tool dispatch into LLM context lands in v0.4.16.' 改为正面状态 —— 例如 discover 成功则打印 'OK (N servers, M tools available to the model)', 失败/未支持传输则列出 unsupported_servers(McpServerManager.unsupported_servers(), mcp_stdio.rs:355)。可调 manager 实际 discover 计数。注意 doctor 是单独命令路径(run_doctor :5133), 不走 LiveCli, 需自己 new manager + block_on discover",
+          "files": [
+            "crates/aris-cli/src/main.rs"
+          ],
+          "effort": "small (1-2h)",
+          "risk": "doctor 里 discover 会真的 spawn MCP server 子进程(慢/可能失败), 须 try/超时兜底, 不能让 doctor 卡死。stdio-only(mcp_stdio.rs:331)外的 transport 仍 unsupported, 文案要如实反映"
+        }
+      ],
+      "regression_risks": [
+        "ToolSpec.name 从 &'static str 改 String/Cow 是 breaking 改动, 触及 mvp_tool_specs 20 个字面量 + 4 个广告/dispatch 消费点(main.rs:4142, openai_executor.rs:1195, tools/lib.rs:2110, filter_tool_specs:570), 任一遗漏即编译失败——属可控的编译期回归",
+        "build_runtime 有 14 个调用点(全在 LiveCli), 新增 manager 参数会让签名全改; plan-mode 进/出(main.rs:2435/2472/2527)重建 runtime 时若不复用同一 manager, 会重复 spawn/重连 MCP server, 引入延迟与子进程泄漏",
+        "block_on 嵌套 panic: CliToolExecutor.execute 是 sync, 但若它在某个已运行的 tokio runtime 上下文里被调(主会话 stream 的 block_on 内?需确认 run_turn 调 execute 时是否在 async 上下文), 再 block_on 会 panic 'Cannot start a runtime from within a runtime'。证据: ConversationRuntime.run_turn(conversation.rs:282)调 execute 是在同步循环里, executor.stream 各自 block_on 后返回, 故 execute 不在 async 上下文——但需 A1 实现 manager 句柄时复核",
+        "MCP 工具默认 DangerFullAccess(permissions.rs:85)会在 workspace-write 模式下对每次 MCP 调用弹 prompt, 可能被误判为功能退化; read-only 模式会直接 deny 所有 MCP 工具",
+        "MCP server 返回的 input_schema 可能含 Anthropic/OpenAI tools API 不接受的 JSON Schema 字段, 主会话当前透传不校验(main.rs:4144), 可能导致 400; 需 A2 在 mcp_tool_specs(T2)做最小净化或 A1 在 discover 时校验",
+        "子代理路径(SubagentToolExecutor + tools-crate AnthropicRuntimeClient)与主会话是两套独立广告/dispatch 代码, 若未来要给子代理 MCP, 改动会双倍且易遗漏; v0.4.17 显式不接(T6)避免半接线状态",
+        "MCP 工具名 qualified_name 经 normalize_name_for_mcp(mcp.rs:7)清洗后, 不同 server 的同名工具靠 mcp__server__ 前缀区分, 但若两个 server 名清洗后碰撞(如 'a-b' 与 'a_b' 都->'a_b'), tool_index BTreeMap(mcp_stdio.rs:408)会后者覆盖前者——A1 侧 discover 时应检测 server 名碰撞"
+      ],
+      "characterization_tests": [
+        "锁定当前静态工具广告: 给定 allowed_tools=None, filter_tool_specs(main.rs:570)返回的 ToolSpec 列表恰好是 mvp_tool_specs 的 20 个工具(名字 + 顺序), 接线后 MCP 工具只能 append 在尾部不能扰乱原有",
+        "锁定 execute_tool 对未知工具的兜底: execute_tool(\"mcp__foo__bar\", ...)当前返回 Err('unsupported tool: mcp__foo__bar')(tools/lib.rs:434), 接线后该前缀须改由 CliToolExecutor 拦截、不再落到此分支",
+        "锁定权限默认: 对一个不在 tool_requirements map 的工具名, required_mode_for 返回 DangerFullAccess(permissions.rs:81-86); authorize 在 read-only 下 deny、workspace-write 下走 prompt 分支(permissions.rs:120-137)——MCP 工具接线后须保持该默认或显式注册",
+        "锁定 subagent 工具白名单: allowed_tools_for_subagent('Explore'/'Plan'/'Verification'/默认)(tools/lib.rs:1949)返回的集合不含任何 mcp__ 前缀工具, 接线后 T6 须保持子代理无 MCP",
+        "锁定 doctor 行为: mcp().servers().len()==0 时 Check 6 完全不打印(main.rs:5283 的 if 守卫), 接线后无 MCP 配置的用户仍不应被打扰",
+        "锁定两个 executor 广告一致性: Anthropic(main.rs:4138)与 OpenAI(openai_executor.rs:457)都从 filter_tool_specs 取同一份 specs, 接线后 MCP specs 须同样灌进两条路径, 不能只接一个 provider(否则 OpenAI-family 主会话看不到 MCP 工具)"
+      ],
+      "open_questions": [
+        "A1 侧约定: McpServerManager 的共享形态是 Arc<Mutex<McpServerManager>> 还是一个独立 sync 句柄类型(内部封装独立 tokio Runtime + block_on)? A2 倾向后者——让 CliToolExecutor 持有一个 sync 的 call_tool_blocking(name,args)->Result<String,String>, 把 async/锁/content 展平全藏在 A1 那边, A2 不碰 tokio。需 A1 确认接口签名",
+        "discover_tools 在何时调用: LiveCli::new(main.rs:1261)启动时一次性 discover(简单但启动慢/阻塞), 还是 lazy 首次用到 MCP 工具时? 一次性 discover 才能在启动就把 MCP ToolSpec 灌进广告——倾向启动时 discover, 但要超时兜底",
+        "MCP server discover 失败(server 起不来/超时)时的降级策略: 是 fail-loud 阻止启动, 还是 warn 后跳过该 server 继续(主会话不带这些工具)? 倾向后者, 与现有 unsupported_servers 软失败一致",
+        "input_schema 净化责任归属: MCP server 返回的 schema 含非法字段时, 由 A2 在 mcp_tool_specs(T2)兜底净化, 还是 A1 在 discover 时校验丢弃坏工具? 建议 A2 做最小净化(至少保证是 object schema)",
+        "plan-mode 切档(main.rs:2435/2472/2527)重建 build_runtime 时, manager 是否必须跨重建复用(避免重连)? 若 LiveCli 持有 manager 而 build_runtime 只借用引用/Arc clone, 则天然复用——需在 T4 设计时确认 build_runtime 不 move manager",
+        "MessageRequest tools 数组的工具数量上限: 加上 N 个 MCP 工具后会不会撞 provider 的 tool 数量/总 token 上限? 现有 20 个静态工具 + 用户大量 MCP 工具可能超限, 是否需要 ToolSearch 式的 deferred 机制(只广告 mcp 工具名, 按需 fetch schema)? v0.4.17 可能先不做但要记录"
+      ]
+    },
+    "p8": {
+      "summary": "P8 full-routing 蓝图 (p8_design.json 的 deferred 字段, 5 步) 对照 v0.4.16 HEAD (81e5652) 代码逐条仍然成立, 仅个别行号需修正: resolve_openai_executor_config 实际在 357-377 (config struct 379-383), 不是蓝图说的 357-383。核心架构前提全部验证通过: ConversationRuntime<C,T> 的 C 是 ApiClient 泛型 (conversation.rs:116/129-132), main.rs:4047 的 ExecutorClient enum 静态分发 ApiClient 已是生产验证的复刻模板, tools crate 已依赖 api+reqwest(native-tls,blocking)+tokio 且无任何对 bin 的反向依赖 (零新依赖即可塞 SubagentExecutorClient::OpenAI)。最大的实施风险/未决项: 当前 OpenAIRuntimeClient::stream (437-1053) 是一个把 SSE 解析 + UI 渲染 + reqwest 流式 IO 全部内联在一个 block_on 闭包里的 600 行函数, 直接对 response.chunk() 字节操作, 没有任何\"喂 SSE 字符串→Vec<AssistantEvent>\"的纯入口, 因此 behavior-parity fixture 测试不能直接套用现有测试 (现有测试只覆盖了 stream_eof_action / accumulate_tool_call / sse_data_payload 等纯 helper, 整条 stream() 从未被 SSE 字节流端到端测过)。下沉到 api 时必须先重构出一个吃 &[u8]/字符串 chunk 的纯 SSE-driver, 才能既做 parity 又保住 C6/C11/stream_options/tool_calls/reasoning 五块逻辑。C 类两个 characterization 测试已经是 v0.4.16 加的 fail-loud 版 (名字就叫 char_build_agent_runtime_rejects_openai_*), full routing 后要从\"验报错\"翻转成\"验 OpenAI 分支构造成功\"。",
+      "current_state": [
+        {
+          "area": "resolver + config (蓝图 357-383, 实际 357-383 含 struct)",
+          "evidence": "crates/aris-cli/src/openai_executor.rs:357 pub fn resolve_openai_executor_config()->Option<OpenAIExecutorConfig> (body 357-377, EXACT match provider!=\"openai\" return None at 359-361, api_key fallback EXECUTOR_API_KEY||OPENAI_API_KEY at 363-366, base_url trim+default at 370-374); struct OpenAIExecutorConfig {api_key,base_url} 379-383。纯 env 零依赖, 蓝图说的 357-383 范围正确(resolver 357-377 + struct 379-383)。"
+        },
+        {
+          "area": "OpenAIRuntimeClient::stream 整体结构 (单函数 437-1053, ~617 行, #[allow(clippy::too_many_lines)])",
+          "evidence": "crates/aris-cli/src/openai_executor.rs:437 fn stream(); body 全部在 531 self.runtime.block_on(async{...}) 闭包内, 直接对 response.chunk() 字节流操作 (718/752), 无纯 SSE 入口。纯逻辑可下沉段: 438-527 (system_prompt/messages/tools/reasoning_effort body 组装, 调 convert_messages_openai 451/convert_tool_spec_openai 461/supports_reasoning_effort 508/reasoning_effort 511), 825-983 SSE 行解析与事件累积。"
+        },
+        {
+          "area": "stream() UI 耦合点 (必须留在 bin 壳)",
+          "evidence": "openai_executor.rs:8 use crate::render::{MarkdownStreamState,TerminalRenderer}; 655-663 stdout/io::sink + emit_output 三元 + TerminalRenderer::new() + MarkdownStreamState::default(); 851-855/942-948/1001-1005 markdown_stream.push/flush + write!(out) 渲染; eprintln! 警告在 518/578/605/636/730/773/807/976 (warn/retry log) — 全部是 stderr 副作用。flush_pending_tools(1056) 也 write!(out,format_tool_call_start)。这些是 headless 化时必须剥离/参数化为 sink+callback 的点。"
+        },
+        {
+          "area": "五块关键逻辑精确行号",
+          "evidence": "C6 whole-stream restart: budget=stream_retry_budget()@678(def 142-148), Ok(None) EOF 分支 stream_eof_action@764-799(def 194-207), Err chunk 分支 801-823, 均调 stream_restart_send@735/777/811(def 295-352)。C11 idle timeout: idle_timeout=api::resolve_stream_idle_timeout()@683, tokio::time::timeout 包 chunk@719-751。stream_options 400 回退: 598-612 (is_stream_options_unknown_field_error@600 def 52-94, body.remove(\"stream_options\")@603-604, attempt-1@610)。tool_calls index 累积: accumulate_tool_call@958(def 257-275 slot idx→(id,name,args) 增量), flush_pending_tools@846/980/996。reasoning_content: supports_reasoning_content_replay@450(def 114-122), capture@931-937, cache 写入+truncate+evict@1014-1049, on_session_compacted clear@424-434。"
+        },
+        {
+          "area": "api crate 结构与依赖 (蓝图说新 OpenAiClient 放这, 复用类型)",
+          "evidence": "crates/api/src/: client.rs(61KB)/error.rs/lib.rs/sse.rs/types.rs。lib.rs:6-18 导出 AnthropicClient/AuthSource/MessageStream + resolve_stream_idle_timeout + types(MessageRequest/MessageResponse/StreamEvent/...). Cargo.toml: reqwest 0.12 default-features=false features=[json,native-tls] + tokio[io-util,macros,net,rt-multi-thread,time] + runtime — 够 OpenAI client 用 (OpenAIRuntimeClient 只需 reqwest+tokio+serde_json)。注意: api 现有 MessageRequest/StreamEvent 是 ANTHROPIC 格式 (client.rs:13 + sse.rs Anthropic SSE), OpenAI client 产 runtime::AssistantEvent 而非 api 类型, 所以 OpenAiClient 应直接产 Vec<AssistantEvent> (与现 OpenAIRuntimeClient 一致), 不复用 api::MessageRequest。api crate 当前不依赖 runtime 之外的东西, 已 use runtime。"
+        },
+        {
+          "area": "build_agent_runtime fail-loud guard (v0.4.16 加, 待替换)",
+          "evidence": "crates/tools/src/lib.rs:1885 fn build_agent_runtime(job)->Result<ConversationRuntime<AnthropicRuntimeClient,SubagentToolExecutor>,String>; guard 1901-1906 if std::env::var(\"EXECUTOR_PROVIDER\").as_deref()==Ok(\"openai\") return Err(\"...Anthropic-family...v0.4.17...\"); 唯一构造点 AnthropicRuntimeClient::new@1914 + ConversationRuntime::new@1916。返回类型写死 AnthropicRuntimeClient, full routing 必须改成 ConversationRuntime<SubagentExecutorClient,SubagentToolExecutor>。"
+        },
+        {
+          "area": "ConversationRuntime<C,T> 泛型 + ApiClient trait (enum 可塞)",
+          "evidence": "crates/runtime/src/conversation.rs:116 pub struct ConversationRuntime<C,T>; 129-132 impl<C,T> where C:ApiClient,T:ToolExecutor; trait ApiClient @39-52 (fn stream@40 + fn on_session_compacted default no-op@51); AssistantEvent enum @24-37 已 derive Debug/Clone/PartialEq/Eq(23) → parity 可直接 assert_eq! Vec。enum 实现 ApiClient 即可当 C。"
+        },
+        {
+          "area": "main.rs ExecutorClient enum (复刻模板)",
+          "evidence": "crates/aris-cli/src/main.rs:4047 enum ExecutorClient{Anthropic(AnthropicRuntimeClient),OpenAI(openai_executor::OpenAIRuntimeClient)}; 4052-4072 impl ApiClient (静态分发 stream 4053-4058 + on_session_compacted 4060-4071, Anthropic 臂 no-op/OpenAI 臂 c.on_session_compacted)。构造 3955-3971: if resolve_openai_executor_config().is_some() → OpenAI 臂 else Anthropic 臂。这是 SubagentExecutorClient 的 1:1 模板, 静态分发不引 dyn。"
+        },
+        {
+          "area": "C 类 characterization 测试现状 (待翻转)",
+          "evidence": "crates/tools/src/lib.rs:5742 char_build_agent_runtime_rejects_openai_provider (baseline run 不强制 Ok/Err 5752-5757; set EXECUTOR_PROVIDER=openai 5761→ 断言 Err 含 Anthropic-family+v0.4.17 5770-5776); 5785 char_build_agent_runtime_rejects_openai_with_credential_free_message (断言 Err 5796-5802 + 反泄漏 !contains ANTHROPIC_API_KEY/EXECUTOR_API_KEY/OPENAI_API_KEY/sk-openai-exec 5805-5812)。名字已是蓝图 deferred 提到的最终名。"
+        },
+        {
+          "area": "A/B characterization 测试 (零回归保持绿)",
+          "evidence": "crates/tools/src/lib.rs: 3 auth 测试 char_subagent_auth_anthropic_api_key_is_apikey_xheader@5641 / _anthropic_compat_is_bearer@5659 / _combined@5678 (直接断 AnthropicClient::from_env().auth_source(), 不调 build_agent_runtime); 2 build_ok char_build_agent_runtime_anthropic_api_key_builds_ok@5700 / _anthropic_compat_builds_ok@5719。capture_and_clear()@5215 清 SUBAGENT_AUTH_ENVS(5194-含 EXECUTOR_PROVIDER@5199/EXECUTOR_API_KEY@5200/EXECUTOR_BASE_URL@5201) → A/B 运行时 EXECUTOR_PROVIDER unset → guard 不触发。"
+        },
+        {
+          "area": "零回归机制源头 (apply_to_env)",
+          "evidence": "crates/aris-cli/src/config.rs:144-145 只在 provider==\"openai\"||\"custom\" 时 set EXECUTOR_PROVIDER=\"openai\"; force_exec 时 113-115 先 remove_var EXECUTOR_PROVIDER/API_KEY/BASE_URL; anthropic 走 153 分支永不进 144。证实 A/B 用户 EXECUTOR_PROVIDER 必 unset/清空, full routing 的 provider 分支对 A/B 恒走 Anthropic 臂。"
+        },
+        {
+          "area": "crate 边界 + 依赖充分性 (零新依赖)",
+          "evidence": "tools/Cargo.toml: 已依赖 api(path) + runtime + reqwest 0.12 default-features=false features=[blocking,native-tls] + tokio features=[rt-multi-thread] + serde_json; tools/src/lib.rs:9-14 已 use api::{AnthropicClient,MessageRequest,StreamEvent as ApiStreamEvent,...}, 14 use reqwest::blocking::Client, 2085 tokio::runtime::Runtime。api/tools/runtime 三个 Cargo.toml 均无 aris-cli 反向依赖 (grep 为空) → OpenAI client 下沉到 api 后 tools 加 enum 臂零新依赖。AllowedToolSet=BTreeSet<String> 仅是 main.rs:81 类型别名 (易迁移); filter_tool_specs@main.rs:570 是纯 ToolSpec 逻辑; TerminalRenderer@render.rs:218 / MarkdownStreamState@render.rs:600 (push@606/flush@615) 是 bin-only UI, 是 headless 边界。"
+        }
+      ],
+      "work_items": [
+        {
+          "id": "P8.1",
+          "title": "下沉 resolver + config + 纯 helper 到 api crate",
+          "detail": "把 resolve_openai_executor_config (openai_executor.rs:357-377) + struct OpenAIExecutorConfig (379-383) + 纯 env/纯逻辑 helper 搬到 api crate 新模块 (建议 crates/api/src/openai.rs)。一并下沉: supports_reasoning_effort(41-50)/supports_reasoning_content_replay(114-122)/reasoning_effort(128-134)/stream_retry_budget(142-148)/stream_chunk_error_is_retryable(152-158)/StreamEofAction+stream_eof_action(162-207)/stream_error_detail(214-241)/choice_finish_reason(246-251)/accumulate_tool_call(257-275)/sse_data_payload(284-286)/is_stream_options_unknown_field_error(52-94)/convert_messages_openai(1074-1189)/convert_tool_spec_openai(1191-1200)。word_match 已转发 runtime::word_match(102-104)直接用 runtime。DEFAULT_OPENAI_BASE_URL/MAX_REASONING_* 常量(18/25/31)同迁。这些函数已被现有单元测试覆盖(openai_executor.rs:1311-1559 word_match/is_stream_options/stream_eof/choice_finish/accumulate/sse_data + char_resolve_* 1628-1769), 把测试一并搬过去当 parity 锚点。注意 filter_tool_specs(main.rs:570)留 bin (它依赖 mvp_tool_specs 与 AllowedToolSet); convert_tool_spec_openai 输入是 tools::ToolSpec, api 需能拿到 ToolSpec (api 当前不依赖 tools — 改用 api 内已有的 ToolDefinition, 或让 convert 接受 (name,description,schema) 三元组以避免 api→tools 依赖)。",
+          "files": [
+            "crates/aris-cli/src/openai_executor.rs",
+            "crates/api/src/openai.rs",
+            "crates/api/src/lib.rs",
+            "crates/api/Cargo.toml"
+          ],
+          "effort": "medium / 0.75-1 人日",
+          "risk": "convert_tool_spec_openai 依赖 tools::ToolSpec 会引入 api→tools 反向依赖 (当前 tools→api, 不能成环)。必须改成不依赖 tools 的签名 (传 name/description/serde_json::Value schema)。reasoning_effort/stream_retry_budget 读多个 ARIS_* env, 下沉后行为须逐字不变 (现有 char_ 测试锁住)。"
+        },
+        {
+          "id": "P8.2",
+          "title": "重构 stream() 出纯 SSE-driver, 建 headless api::OpenAiClient",
+          "detail": "在 api crate 新建 OpenAiClient (复刻 openai_executor.rs:385-420 字段+new, 但去掉 emit_output/allowed_tools 这两个纯 UI/工具过滤参数, 或保留 allowed_tools 但 tools spec 由调用方传入)。核心: 把 stream()@437-1053 拆成 (a) body 组装(438-529, 纯)+ (b) reqwest 主发送重试循环(531-653, IO 但无渲染)+ (c) 一个纯 SSE-driver fn drive_sse(chunk: &str, state: &mut StreamState)->Vec<AssistantEvent> 把 825-983 的行解析逻辑(observed_done/finish_reason/usage/choices/delta/tool_calls/reasoning)抽成吃字符串 chunk 的纯函数 + (d) MessageStop 兜底(990-1007 去掉 markdown flush)+ (e) reasoning cache(1014-1049, 纯)。关键: 现 stream() 把 write!(out)/markdown_stream.push 与 events.push 交织(942-950/851-856), 必须把渲染剥成调用方注入的回调或事件后置渲染 —— headless client 只产 Vec<AssistantEvent>, 不碰 stdout。C6 restart(735/777/811→stream_restart_send)、C11 idle timeout(719-751)、stream_options 回退(598-612)保留在 (b) 的 IO 层。新 client::stream 产纯 Vec<AssistantEvent>。",
+          "files": [
+            "crates/api/src/openai.rs",
+            "crates/aris-cli/src/openai_executor.rs"
+          ],
+          "effort": "large / 1.5-2 人日",
+          "risk": "最高风险项。现 stream() 把字节流读取(response.chunk)、SSE 行解析、markdown 渲染、事件累积、retry 全揉在一个 617 行 block_on 闭包里, 无纯入口。剥离渲染时极易改动事件产出顺序/时机 (例如 flush_pending_tools@980 在 finish_reason 时打印 tool-call start 行并 push ToolUse — 渲染与事件强耦合)。idle_timeout 的 nothing_emitted_yet 闭包(687-694)依赖 events/pending_tools/current_reasoning 三态, 重构后语义须一致。必须 P8.5 的 parity 测试兜底。"
+        },
+        {
+          "id": "P8.3",
+          "title": "tools 侧建 SubagentExecutorClient enum + 改 build_agent_runtime",
+          "detail": "在 crates/tools/src/lib.rs 新增 enum SubagentExecutorClient { Anthropic(AnthropicRuntimeClient), OpenAI(api::OpenAiClient) } + impl ApiClient (1:1 复刻 main.rs:4052-4072: stream 静态分发, on_session_compacted Anthropic no-op / OpenAI 转发)。改 build_agent_runtime(1885-1923): 返回类型 1887 改 ConversationRuntime<SubagentExecutorClient,SubagentToolExecutor>; 删 1901-1906 fail-loud guard, 换成 if let Some(cfg)=api::resolve_openai_executor_config(){SubagentExecutorClient::OpenAI(api::OpenAiClient::new(cfg,model,...))} else {SubagentExecutorClient::Anthropic(AnthropicRuntimeClient::new(model,allowed_tools.clone())?)} (镜像 main.rs:3955-3971)。subagent 的 tool spec 由 tools::tool_specs_for_allowed_tools(已存在, 见 2107)提供给 OpenAI client, 而非 bin 的 filter_tool_specs/AllowedToolSet。零新依赖 (tools 已有 api+reqwest+tokio)。",
+          "files": [
+            "crates/tools/src/lib.rs"
+          ],
+          "effort": "small / 0.5 人日",
+          "risk": "返回类型变更会波及 build_agent_runtime 所有调用点 (run_agent_job 链)与测试里直接调 build_agent_runtime 的地方 (5706/5726/5750/5765/5792)。SubagentExecutorClient 必须真正 ConsumeOpenAI cfg, 否则又静默回 Anthropic。on_session_compacted 转发不能漏 (subagent 也会 auto-compact, reasoning cache 索引漂移)。"
+        },
+        {
+          "id": "P8.4",
+          "title": "bin 侧 OpenAIRuntimeClient 改成 api::OpenAiClient 的薄 UI 壳, 验主会话零回归",
+          "detail": "把 openai_executor.rs 的 OpenAIRuntimeClient 改成: 内部持一个 api::OpenAiClient, 自己只负责把 headless 产出的 Vec<AssistantEvent> 用 TerminalRenderer/MarkdownStreamState 渲染到 stdout (emit_output 控制) + format_tool_call_start 打印 tool-call start 行。或者更稳妥: headless client 暴露一个接受 'on_text_delta'/'on_tool_start' 回调的 stream 变体, bin 壳注入渲染回调, 保证 token 实时流式渲染(不是等 Vec 攒完再渲)。main.rs:3957 ExecutorClient::OpenAI 构造不变, 但 OpenAIRuntimeClient::new 内部委托 api::OpenAiClient::new。验 REPL 主会话: OpenAI 家族 executor 真跑一轮, 流式渲染/工具调用/reasoning/cost 与 v0.4.16 逐字一致。",
+          "files": [
+            "crates/aris-cli/src/openai_executor.rs",
+            "crates/aris-cli/src/main.rs"
+          ],
+          "effort": "medium / 0.75-1 人日",
+          "risk": "主会话流式 UX 是 v0.4.15 刚因 #249 稳定的热点。若 headless 化成'攒完再渲', 会破坏 token 实时输出体验(回归)。必须保实时渲染 → headless client 需回调式而非纯 Vec 返回, 增加接口设计复杂度。eprintln warn(518/578/605/636/730/773/807/976)归属须明确(留 bin 还是 headless 发?建议 headless 不 eprintln, 改返回结构化 warning 让 bin 决定)。"
+        },
+        {
+          "id": "P8.5",
+          "title": "behavior-parity 测试 + 翻转 C 类 characterization + e2e",
+          "detail": "Parity 方案细化(关键前提: 现无 SSE 端到端 fixture, 见 regression_risks): (1) 迁移期保留旧 OpenAIRuntimeClient::stream 的 SSE 解析逻辑作对照 —— 但因其无纯入口, 实操是先在 P8.2 抽出纯 drive_sse(chunk_str,&mut state), 给旧逻辑也补一个等价纯版本, 然后构造 SSE fixture 字符串(覆盖: 纯文本 delta / 多 chunk tool_calls index 累积 / reasoning_content / [DONE] 结尾 vs finish_reason-only 结尾(#249 MiniMax 形态) / mid-stream error envelope / usage chunk / data:{无空格}(OE3)), 喂新旧两版纯 driver 断言 assert_eq! Vec<AssistantEvent> 逐元素相等(AssistantEvent derive Eq, conversation.rs:23)。fixture 自造(参考 api/src/sse.rs:112-206 的 Anthropic fixture 写法, 但用 OpenAI chat.completions chunk 格式)。(2) 翻转 C 类: char_build_agent_runtime_rejects_openai_provider(lib.rs:5742) 改名/改语义为'set EXECUTOR_PROVIDER=openai+EXECUTOR_API_KEY → build_agent_runtime is_ok + 内部是 OpenAI 臂'(现 5770-5776 的 expect Err 翻成 expect Ok); char_..._credential_free_message(5785) 整个删除或改成'OpenAI 子代理构造成功'测试。(3) A/B 五个测试(5641/5659/5678/5700/5719)零改动保持绿(capture_and_clear 清 EXECUTOR_PROVIDER, 仍走 Anthropic 臂)。(4) e2e: EXECUTOR_PROVIDER=openai 真起一个子代理跑通一轮。",
+          "files": [
+            "crates/api/src/openai.rs",
+            "crates/tools/src/lib.rs"
+          ],
+          "effort": "medium / 1 人日",
+          "risk": "parity fixture 若覆盖不全(漏 finish_reason-only/error-envelope/tool_calls 跨 chunk 这些 #249/OE2-7 边界), 重构 regression 会漏检。'保留旧版对照'实操困难 —— 旧 stream() 没纯入口, 等于要为旧逻辑也写一份纯 driver 才能 diff, 工作量被低估。C 类翻转后若忘了断言'内部确为 OpenAI 臂'(enum 无 Debug, 见 5768 注释), 可能又静默回 Anthropic 而测试仍绿。"
+        }
+      ],
+      "regression_risks": [
+        "主会话 OpenAI 流式 UX 回归 (最高优先): OpenAIRuntimeClient::stream(437-1053) 是 v0.4.15 因 #249 刚稳定的代码, P8.2/P8.4 要把它的 SSE 解析下沉 api 并把渲染剥成 UI 壳。若 headless 化成'Vec 攒完再渲染', token 实时流式输出体验破坏 (write!(out)+flush 现在与每个 TextDelta 同步, 见 942-948)。必须保回调式实时渲染。",
+        "事件产出顺序/时机漂移: flush_pending_tools(1056) 在 finish_reason 时既打印 tool-call start 行(1063)又 push ToolUse(1066), 渲染与事件强耦合。剥离时极易改变 ToolUse 在 events 中的位置或 MessageStop 兜底逻辑(990-1007), 这会破坏下游 conversation 循环对工具调用的解析。",
+        "#249 / OE2-7 边界逻辑丢失: finish_reason-only 终止(无 [DONE], MiniMax 形态, stream_eof_action@194-207 + observed_finish_reason@705/926)、mid-stream error envelope(873-877)、data:{无空格}(sse_data_payload@284)、tool_calls 跨 chunk index 累积(accumulate_tool_call@257)这五块是 v0.4.15 反复修的 landmine, 重构若 parity fixture 不覆盖会静默回归到 #249 之前。",
+        "build_agent_runtime 返回类型变更(1887)波及全部调用链(run_agent_job→spawn 闭包→persist_agent_terminal_state)与测试 5706/5726/5750/5765/5792, 漏改一处编译错或语义错。",
+        "SubagentExecutorClient 静默回退: 若 P8.3 的 enum 构造没真正 consume resolve_openai_executor_config 的 cfg(像 v0.4.16 之前那样), 会重新静默用 Anthropic 凭据计费 —— 正是 fail-loud guard 当初要堵的洞。且 enum 无 Debug(见 lib.rs:5768 注释), 测试难直接断言走了哪个臂。",
+        "api→tools 反向依赖成环: convert_tool_spec_openai(1191)输入 tools::ToolSpec, 下沉 api 后若直接依赖 tools 会与现有 tools→api 成循环依赖, 编译失败。必须改签名解耦。",
+        "subagent auto-compaction reasoning cache: on_session_compacted(424-434)清 reasoning cache, SubagentExecutorClient 的 OpenAI 臂必须转发(像 main.rs:4069), 漏掉会让子代理 compaction 后 reasoning 索引漂移、replay 错位。"
+      ],
+      "characterization_tests": [
+        "Phase 0 先建当前缺失的 SSE 端到端锚点 (这是 full routing 的前置, 现在完全没有): 为 OpenAIRuntimeClient::stream 的 SSE 解析逻辑写一组 fixture-based characterization 测试 —— 喂 OpenAI chat.completions SSE 字符串, 断言产出的 Vec<AssistantEvent> 精确等于当前 v0.4.16 行为。fixture 至少覆盖: (a) 纯文本多 delta + [DONE]; (b) tool_calls 跨多 chunk index 累积(0 号与 1 号槽交错); (c) reasoning_content delta (kimi/deepseek-r1 形态); (d) finish_reason='stop'-only 无 [DONE] (#249 MiniMax); (e) mid-stream error envelope(OE4); (f) data:{无空格}(OE3); (g) usage chunk 带 prompt_tokens_details.cached_tokens; (h) finish_reason='length'/'content_filter' 警告路径。锚点建在 crates/api/src/openai.rs(下沉后)或先在 openai_executor.rs。",
+        "锁现有纯 helper 行为不变 (已存在, 下沉时一并搬): openai_executor.rs:1311 word_match_handles_provider_prefixes / 1332 is_stream_options_unknown_field_error_classification / 1363 stream_eof_action_truth_table / 1395 stream_error_detail_classification / 1444 choice_finish_reason_handles_delta_less_and_empty / 1475 accumulate_tool_call_builds_and_concatenates / 1517 sse_data_payload_tolerates_missing_space / 1559 char_supports_reasoning_effort_routing / 1628-1769 char_resolve_* (resolver env 解析)。",
+        "锁 build_agent_runtime A/B 路径不变 (tools/lib.rs:5641/5659/5678 auth + 5700/5719 build_ok): 这 5 个 full routing 后零改动必须仍绿 (capture_and_clear 清 EXECUTOR_PROVIDER → 走 Anthropic 臂)。",
+        "锁 main.rs ExecutorClient 主会话路由不变 (作为 SubagentExecutorClient 模板的等价性): 确认 main.rs:3955-3971 的 if resolve_openai_executor_config().is_some() 分发与 P8.3 新建的 SubagentExecutorClient 构造逻辑一致, 用同一套 fixture 验两条路径产出相同 AssistantEvent。"
+      ],
+      "open_questions": [
+        "headless api::OpenAiClient 的输出接口: 纯 Vec<AssistantEvent> 返回 (简单, 但 bin 壳要等攒完才渲染, 破坏实时流式) vs 回调式 (on_text_delta/on_tool_start, 保实时渲染但接口复杂)。Anthropic 侧 AnthropicRuntimeClient(tools 与 main 各一份)是纯 Vec 返回(events 攒完, 见 lib.rs:2135/main.rs:4115)—— OpenAI 主会话当前是边解析边 write!(out) 实时渲染(942-948), 与 Anthropic 的 Vec 模式不同。下沉时是否要把 OpenAI 也降级成 Vec 模式以统一? 会不会回归实时性? 需主 agent 拍板。",
+        "convert_tool_spec_openai 解耦方案: 下沉 api 后避免 api→tools 成环, 是 (a) 改签名接 (name,&str,serde_json::Value) 三元组, 调用方组装; 还是 (b) 复用 api 已有的 ToolDefinition(client.rs:13 已导出)做中间类型? 后者更省事但 OpenAI 的 function-calling JSON shape 与 Anthropic ToolDefinition 不同, 需确认。",
+        "eprintln 警告(8 处: 518/578/605/636/730/773/807/976)在 headless client 里的归属: headless 不应直接 eprintln(库不该假设 stderr)。改成返回结构化 warning/log 回调让 bin 决定? 还是 P8.4 阶段保留在 bin 壳的 retry IO 层(那部分 IO 本就可能留 bin)? 影响 P8.2 拆分边界。",
+        "AnthropicRuntimeClient 当前有两份独立实现 (tools/lib.rs:2084 与 main.rs:4074, 字段/stream 逻辑不同 —— tools 版无 emit_output, main 版有完整渲染)。SubagentExecutorClient::Anthropic 用的是 tools 版。full routing 是否顺便统一两份 Anthropic client, 还是只动 OpenAI 侧? 建议本版只动 OpenAI, 不碰 Anthropic 双份(降风险), 但要在计划里写明。",
+        "p8_design.json 蓝图行号已有 1 处轻微偏差(resolver 实为 357-377 而非 357-383, struct 单独 379-383), 主 agent 写实施计划时应以本报告校验后的行号为准; HEAD 后续若有 commit 需重新核行号。"
+      ]
+    },
+    "hooks": {
+      "summary": "A4 调查完成。hook 系统现状:解析阶段 (config.rs:805-864 `optional_hook_commands`) 把 Claude Code object-style hook `{matcher, hooks:[{type,command,timeout,async}]}` 暴力 flatten 成纯 `Vec<String>` command 列表,丢弃 matcher / timeout / async / 非-command type 三个字段;只识别 PreToolUse 和 PostToolUse 两个 event(config.rs:510-513,HookEvent enum hooks.rs:8-12)。执行阶段 (hooks.rs) 用同步 std::process::Command + child.wait_with_output() (line 288),完全没有 timeout,也没有 matcher 匹配——所有 hook 对所有工具无差别触发。timeout enforce 必须从零加:tokio(time+process feature)在 runtime crate 已就绪 (Cargo.toml:14),但 hooks.rs 当前是纯同步且被同步的 conversation.rs:run_turn (非 async fn) 调用,所以要么把 hook 执行改成 tokio block_on 子 runtime(仿 bash.rs:103-104),要么用 std 线程 + recv_timeout + child.kill()。kill 参考 mcp_stdio.rs:819/823 的 kill().await 模式。向后兼容关键:aris init 写的 meta-opt hook (main.rs:3399-3422) 是 object-style 含 timeout:5/async:true,且覆盖 SessionStart/SessionEnd/PostToolUseFailure/UserPromptSubmit 等 runtime 当前根本不解析的 event——改 schema 时这些 event 必须继续被静默接受(不能 parse error),否则破坏 aris init 产物。",
+      "current_state": [
+        {
+          "area": "object-style hook 解析:flatten 丢字段",
+          "evidence": "crates/runtime/src/config.rs:805-864 optional_hook_commands —— line 819 `let mut commands = Vec::new()`; line 826-830 取 item.as_object() 但从不读 matcher;line 831-840 进入 nested hooks 数组;line 847-853 读 type 且 `if hook_type != \"command\" { continue }`(丢弃非 command type);line 854-859 只 push command 字符串;timeout/async 字段从未被读取。返回 `Vec<String>`"
+        },
+        {
+          "area": "RuntimeHookConfig 数据模型本身就只能装 command 字符串",
+          "evidence": "crates/runtime/src/config.rs:66-70 `struct RuntimeHookConfig { pre_tool_use: Vec<String>, post_tool_use: Vec<String> }`;getter config.rs:392-400 返回 `&[String]`。没有任何字段承载 matcher/timeout/async"
+        },
+        {
+          "area": "只支持 2 个 hook event",
+          "evidence": "crates/runtime/src/config.rs:510-513 parse_optional_hooks_config 只 call optional_hook_commands 两次(PreToolUse / PostToolUse);crates/runtime/src/hooks.rs:8-21 HookEvent enum 仅 PreToolUse/PostToolUse。其他 event(SessionStart/Stop/UserPromptSubmit/PostToolUseFailure 等)在 runtime 侧完全不解析——但因为 parse 是按 key 取(config.rs:810 `object.get(key)`),未知 event key 被静默忽略,不报错"
+        },
+        {
+          "area": "hook 执行是同步,无 timeout,无 matcher 过滤",
+          "evidence": "crates/runtime/src/hooks.rs:2 `use std::process::Command`(非 tokio);hooks.rs:152-205 run_command 同步;hooks.rs:282-289 output_with_stdin 用 child.spawn() + write_all(stdin) + child.wait_with_output()——无 timeout 包裹,hook 卡住会无限阻塞整个 turn。run_commands(hooks.rs:95-150)对 commands 列表全部无差别执行,没有任何 tool_name vs matcher 的匹配逻辑"
+        },
+        {
+          "area": "hook 结果如何影响工具执行(block / 注入 context)",
+          "evidence": "crates/runtime/src/conversation.rs:271-272 run_pre_tool_use 后 `if pre_hook_result.is_denied()` → 返回 is_error:true 的 ToolResult,工具不执行(deny=exit code 2,hooks.rs:181);conversation.rs:286 merge_hook_feedback 把 hook stdout 注入 tool output;conversation.rs:288-298 post hook 同理,denied 时 set is_error。exit 0=allow+注入 stdout,exit 2=deny,其他 code=warn 继续(hooks.rs:179-196)"
+        },
+        {
+          "area": "run_turn 是同步 fn(影响 timeout 实现方式)",
+          "evidence": "crates/runtime/src/conversation.rs:195 `pub fn run_turn(...)` 非 async;hook 调用点 conversation.rs:271/290 是同步调用。对比 bash.rs:103-104 用 `Builder::new_current_thread().enable_all().build()` + `runtime.block_on(...)` 把同步入口桥接到 async"
+        },
+        {
+          "area": "tokio 在 runtime crate 已可用(time+process)",
+          "evidence": "crates/runtime/Cargo.toml:14 `tokio = { version = \"1\", features = [\"io-util\",\"macros\",\"process\",\"rt\",\"rt-multi-thread\",\"time\"] }`——timeout 与 tokio::process::Command::kill().await 所需 feature 都已开"
+        },
+        {
+          "area": "kill 参考模式(v0.4.10 M3 同源)",
+          "evidence": "crates/runtime/src/mcp_stdio.rs:812-832 `tokio::time::timeout(timeout, send_then_read).await` 超时分支 line 822-823 `Err(_elapsed) => { let _ = self.child.kill().await; ... }`;bash.rs:114-136 的 timeout 分支则不显式 kill(依赖 tokio Child kill_on_drop)"
+        },
+        {
+          "area": "aris init 写的 meta-opt hook shape(兼容性消费者)",
+          "evidence": "crates/aris-cli/src/main.rs:3399-3422 ensure_hook_entry 写 `{\"matcher\":\"\",\"hooks\":[{\"type\":\"command\",\"command\":\"bash <path>\",\"timeout\":5,\"async\":true}]}`(async_run 分支)或不带 async(line 3411-3421);覆盖 event main.rs:3255-3261 = PostToolUse/PostToolUseFailure/UserPromptSubmit/SessionStart/SessionEnd + SessionEnd 额外 check_ready(无 async,line 3411)。注意:这些 event 大多 runtime 不解析,但 settings.json 里实际存在"
+        },
+        {
+          "area": "另一处也解析 object-style hook(prompt summary)",
+          "evidence": "crates/runtime/src/prompt.rs:759-795 render_hooks_summary 独立解析:string-style(line 779 matcher.as_str())和 object-style(line 783-789 取 matcher_obj.get(\"hooks\").as_array() 计数)。改 schema 时这个 summary 也要保持能数对 hook 数量"
+        },
+        {
+          "area": "对照 Claude Code 官方 schema(保真目标)",
+          "evidence": "官方 schema:hooks.{PreToolUse,PostToolUse,UserPromptSubmit,Notification,Stop,SubagentStop,PreCompact,SessionStart,SessionEnd}: [{matcher: <tool-name-regex>, hooks: [{type:\"command\", command, timeout(秒)}]}]。matcher 是工具名正则(对 PreToolUse/PostToolUse 生效;对 SessionStart 等无 tool 的 event 通常为空)。当前实现保真度:event 名只 2/9,matcher 0%,timeout 0%,type 仅 command"
+        }
+      ],
+      "work_items": [
+        {
+          "id": "SCHEMA-1",
+          "title": "扩展 RuntimeHookConfig 数据模型承载 matcher + timeout(不再 flatten 成 Vec<String>)",
+          "detail": "把 config.rs:66-70 的 `RuntimeHookConfig { pre_tool_use: Vec<String>, post_tool_use: Vec<String> }` 改成保留结构,如新增 `struct HookSpec { matcher: Option<String>, command: String, timeout_secs: Option<u64> }`(async 字段可先解析存下但仍同步执行,或显式记录为 known-unsupported)。getter pre_tool_use()/post_tool_use() (config.rs:392-400) 需新增返回 &[HookSpec] 的变体或改签名。保留旧 Vec<String> getter 做兼容(给现有调用方/测试)。new() (config.rs:384-390) 与 with_hooks (config.rs:347) 同步更新",
+          "files": [
+            "crates/runtime/src/config.rs"
+          ],
+          "effort": "medium 2-3h",
+          "risk": "RuntimeHookConfig 是 pub 且被 hooks.rs:51/56、conversation.rs:124/170、config.rs:1018/1260 测试、conversation.rs:770/836 测试引用,改字段/签名会波及多处;PartialEq/Eq derive(config.rs:66)要保持。建议加新结构而非破坏性改 Vec<String>"
+        },
+        {
+          "id": "SCHEMA-2",
+          "title": "解析器保留 matcher / timeout,继续静默接受非-command type 与未知 event",
+          "detail": "改 config.rs:805-864 optional_hook_commands:line 826-859 解析 nested hook 时除了 command,把同 object 的 matcher(来自外层 item_object,line 826)、timeout(nested_object.get(\"timeout\").as_u64())一并存进 HookSpec。`type != command`(line 851)仍 continue 丢弃(保真:Claude Code 当前也只有 command type)。async 字段读出后记录但执行层暂不实现真异步(避免 scope 爆炸)。parse_optional_hooks_config (config.rs:501-515) 保持只 dispatch PreToolUse/PostToolUse,未知 event key 继续被静默忽略——这是 aris init 写 SessionStart 等 event 不报错的根因,绝不能改成严格校验",
+          "files": [
+            "crates/runtime/src/config.rs"
+          ],
+          "effort": "medium 2h",
+          "risk": "string-style hook(config.rs:821-824)必须继续支持(matcher=None, timeout=None);现有测试 config.rs:1216 loads_object_style_claude_code_hooks_as_commands 断言 pre_tool_use()==[\"echo pre\"],改签名后断言要更新但语义(command 提取)必须不变"
+        },
+        {
+          "id": "SCHEMA-3",
+          "title": "执行层接入 matcher(工具名匹配)过滤",
+          "detail": "hooks.rs:95-150 run_commands 当前对所有 command 无差别执行。加 matcher 语义:对每个 HookSpec,若 matcher 非空,按 Claude Code 语义对 tool_name 做正则/精确匹配(官方是 regex,如 \"Bash\"、\"Edit|Write\"、\"\"=match all),不匹配则跳过该 hook。matcher 空串或 None = match all(对齐 aris init 写的 matcher:\"\")。run_pre_tool_use/run_post_tool_use(hooks.rs:66-93)签名已有 tool_name,直接可用",
+          "files": [
+            "crates/runtime/src/hooks.rs"
+          ],
+          "effort": "medium 2h",
+          "risk": "正则匹配引入需决定是否加 regex crate(检查 runtime Cargo.toml 是否已有;若无,先用精确匹配 + 简单 alternation 避免新依赖)。现有 hook 测试(hooks.rs:297-338)用 matcher=None 路径,行为须不变;meta-opt hook matcher 全是 \"\"(main.rs:3401/3413),必须 match all"
+        },
+        {
+          "id": "TIMEOUT-1",
+          "title": "hook 执行加 per-hook timeout(default 30s,timeout 字段覆盖,单位秒)",
+          "detail": "核心改 hooks.rs:282-289 output_with_stdin。两条路线:(A) 把 hook 执行改 tokio——用 tokio::process::Command,在 run_command(hooks.rs:152)外层包 tokio::time::timeout,因 run_turn(conversation.rs:195)是同步,需仿 bash.rs:103-104 建 current_thread runtime 后 block_on(注意:conversation.rs 整个 turn 同步,每次 hook 建 runtime 开销可接受,或在 HookRunner 持有一个 runtime);(B) 保持 std,用 child.spawn() + 独立线程 wait + std::sync::mpsc recv_timeout,超时则 child.kill()。default 30s,HookSpec.timeout_secs(SCHEMA-2 解析的)Some 时覆盖。timeout 单位是秒(对齐 Claude Code 与 aris init 的 timeout:5)",
+          "files": [
+            "crates/runtime/src/hooks.rs",
+            "crates/runtime/src/conversation.rs"
+          ],
+          "effort": "large 4-5h",
+          "risk": "(1) output_with_stdin(hooks.rs:282-289)当前先 write_all 全部 stdin 再 wait_with_output——hook 若边读 stdin 边写大量 stdout 会管道死锁,加 timeout 才暴露/缓解此问题;(2) 同步→async 桥接若每 hook 建 runtime,注意不要在已有 tokio runtime 内嵌套 block_on(panic);需确认 run_turn 调用链是否已在 runtime 上下文;(3) timeout 默认值改变 hook 行为,需 characterization test 锁旧的'无限等待'是否有用户依赖(基本无)"
+        },
+        {
+          "id": "TIMEOUT-2",
+          "title": "超时后 kill 子进程(对照 v0.4.10 M3 kill().await)",
+          "detail": "TIMEOUT-1 超时分支必须 kill 子进程,否则孤儿进程泄漏。tokio 路线:仿 mcp_stdio.rs:819-823 `let _ = child.kill().await`(kill().await 而非 start_kill 以 reap 进程);std 线程路线:`let _ = child.kill()`(对照 tools/src/lib.rs:3251)。超时后 HookCommandOutcome 应映射为 Warn(继续工具执行,对齐 hooks.rs:198-203 failed-to-start 的 Warn 处理)还是 Deny 需明确——建议 Warn + 明确 timeout 消息(仿 mcp_stdio.rs:824-830 的 TimedOut 文案),不要因 hook 超时就 block 工具(除非用户语义要求)",
+          "files": [
+            "crates/runtime/src/hooks.rs"
+          ],
+          "effort": "small 1h(依附 TIMEOUT-1)",
+          "risk": "kill 后还需 wait/reap 防 zombie(tokio kill().await 已 reap;std kill() 后要 child.wait());Windows 下 kill 语义差异(hooks.rs:232-237 已有 #[cfg(windows)] cmd /C 分支,kill 需同样跨平台)"
+        }
+      ],
+      "regression_risks": [
+        "改 RuntimeHookConfig 字段/getter 签名(config.rs:66-70/392-400)会波及 hooks.rs:51/56、conversation.rs:124/170、lib.rs:54 re-export 及至少 4 处测试(config.rs:1018/1260、conversation.rs:770/836),漏改即编译失败",
+        "解析器若对未知 event(SessionStart/SessionEnd/PostToolUseFailure/UserPromptSubmit)改成严格报错,会直接破坏 aris init 产物(main.rs:3255-3261 写这些 event 到 settings.json),且老用户 settings.json 加载失败 → 整个 config load fail。必须保持 config.rs:810 `object.get(key)` 的静默忽略语义",
+        "string-style hook(纯 command 字符串数组,config.rs:821-824 + 测试 config.rs:965/975/1018)是最老的兼容形态,任何重构都必须让 matcher=None/timeout=None 的 HookSpec 正常工作",
+        "timeout 默认 30s 会改变'hook 永远不超时'的旧行为;若有用户的 hook 设计成长时间运行(如交互式确认),30s 会误杀。需文档说明 + timeout 字段可设大值",
+        "matcher 过滤上线后,之前'所有 hook 对所有工具触发'的行为变成'按 matcher 过滤'——若老用户依赖无 matcher 的 object-style hook 被当 match-all,需确认 matcher 缺省=match all(对齐 aris init 的 matcher:\"\")",
+        "prompt.rs:759-795 render_hooks_summary 是独立的第二解析路径,schema 改动后 summary 计数逻辑(line 783-789)需与新解析对齐,否则 system prompt 显示的 hook 数与实际加载数不符",
+        "output_with_stdin(hooks.rs:282-289)write-before-read 管道死锁:加 timeout 后死锁会变成超时+kill,但若改 async 需同时并发读 stdout/写 stdin 才真正修死锁——只加 timeout 不改 IO 模型只是缓解"
+      ],
+      "characterization_tests": [
+        "锁定当前 flatten 行为:object-style `{matcher:\"Bash\", hooks:[{type:command, command, timeout:5, async:true}]}` 当前被 flatten 成 command 字符串、matcher/timeout/async 被丢弃(config.rs:1216 已有此测试,改 schema 前先确认它跑过,改后更新断言但保留'command 被正确提取'的核心断言)",
+        "锁定未知 event 静默忽略:写一个含 SessionStart/SessionEnd/PostToolUseFailure/UserPromptSubmit 的 settings.json(完全模拟 aris init main.rs:3255-3261 产物),断言 config load 成功且 pre_tool_use()/post_tool_use() 不受影响——这是 aris init 兼容的护栏",
+        "锁定 string-style hook:`hooks.PreToolUse: [\"echo base\"]`(config.rs:965/1018 已覆盖)load 后 == [\"echo base\"],重构后必须等价",
+        "锁定 hook deny/allow/warn 三态:hooks.rs:297-338 已有 exit 0 allow+stdout、exit 2 deny、exit 1 warn 三测试,改执行层(TIMEOUT-1)后这三个必须仍 pass",
+        "锁定 deny 阻断工具执行:conversation.rs:737 denies_tool_use_when_pre_tool_hook_blocks(工具注册了 panic,deny 时不应执行)必须仍 pass",
+        "锁定 post hook feedback 注入:conversation.rs:798 appends_post_tool_hook_feedback_to_tool_result 必须仍 pass",
+        "新增 timeout 锁定测试:一个 sleep 超过 timeout 的 hook 应在 ~timeout 秒内返回(而非无限等待),子进程被 kill,outcome 是 Warn 且工具继续执行",
+        "新增 per-hook timeout 覆盖测试:HookSpec 带 timeout:1 的 hook vs default 30s,验证字段覆盖默认值",
+        "aris init 端:main.rs:6132/6196/6283 已有 deploy_meta_opt_hooks_to 测试(创建/merge 不 clobber/幂等),改 schema 解析后这些产出的 settings.json 必须仍能被 config loader 正常加载(可加一个端到端测试:deploy 后立即 load)"
+      ],
+      "open_questions": [
+        "hook timeout 超时后的语义:应 Warn(继续工具执行,我倾向此,对齐 hooks.rs:198 failed-to-start 的 Warn)还是 Deny(阻断工具)?Claude Code 官方行为是 timeout 不阻断、记 warning。需主 agent 拍板",
+        "matcher 匹配用正则还是精确/alternation?官方是正则(如 \"Edit|Write\")。引入 regex crate 会加依赖——需确认 runtime/Cargo.toml 是否已传递依赖 regex,或先实现精确+\\| alternation 子集",
+        "async:true 字段(aris init main.rs:3407 写了)是否在 v0.4.17 真实现异步(fire-and-forget 不阻塞 turn)?还是先解析存下、执行仍同步、文档标记 known-unsupported?真异步 fire-and-forget 与 PreToolUse 的 deny 语义冲突(异步 hook 无法 block),scope 可能要推到 v0.5.0",
+        "是否本轮扩展支持的 event 数(SessionStart/Stop/UserPromptSubmit 等)?当前只 PreToolUse/PostToolUse。aris init 已写 5 个 event 但 runtime 不消费——是否要让 runtime 真正触发 SessionStart/SessionEnd?这涉及在 conversation/REPL 生命周期里加 event 触发点,scope 比单纯 schema 保真大",
+        "同步→async 桥接方式:HookRunner 持有长生命周期 tokio runtime,还是每次 hook 建 current_thread runtime(仿 bash.rs:103)?需确认 run_turn 调用链是否已运行在 tokio runtime 内(若是,嵌套 block_on 会 panic,必须用 std 线程方案)"
+      ]
+    },
+    "longtail": {
+      "summary": "四项均为小件,可独立实施。(A5.1) api crate 的 read_api_key_* 测试本地红 CI 绿,根因是 from_env_or_saved (client.rs:373) 在 macOS 上 fallback 到 load_keychain_oauth_token (client.rs:404) 读开发机真实 Claude Code Keychain 凭据;最小修法是加环境变量 gate (推荐 ARIS_DISABLE_KEYCHAIN) 而非 #[cfg(test)],因为 Keychain fallback 有两个调用点 (client.rs:394, 485) 且测试通过 super::read_api_key 走真实路径。(A5.2) CL2 Anthropic 侧 stop_reason 与 OpenAI finish_reason 不对称:client.rs 只把 MessageStop 当 terminal (observed_terminal 仅在 837/879 行 set),MessageDelta.stop_reason (types.rs:260) 完全不参与完成判定;但 Anthropic 路径本来就 lenient (clean-EOF 不 retry 除非 nothing emitted),所以这是健壮性对称而非阻塞 bug——只有不发 message_stop 的 anthropic-compat 代理才可能受益。(A5.3) OE6=accumulate_tool_call (openai_executor.rs:257) 按 index 累积、id 仅覆盖,真并行工具调用时 index 缺失 unwrap_or(0) 会撞车 (测试 1506-1508 已自认 fragile);OE5=usage fallback (890-908) 只读 prompt_tokens/completion_tokens 标准字段,缺 input_tokens/output_tokens 等变体;OE8=SSE event: 字段在 833/840 行被直接 skip。三项均为健壮性增强,无已知触发 provider。(A5.4) slash 入历史:run_repl 中 slash command 在 main.rs:1190 提前 continue,绕过 1197 的 append_entry + 1198 的 push_history;最小 diff 是在 slash 分支 continue 前补两行调用,但需注意 v0.4.16 push_history 契约测试 (input.rs:1266) 及 design_raw.json 明确写\"绝不持久化 slash 命令\",改动会违反既定契约。",
+      "current_state": [
+        {
+          "area": "A5.1 Keychain fallback 调用点",
+          "evidence": "crates/api/src/client.rs:404 fn load_keychain_oauth_token() 调 security find-generic-password -s \"Claude Code-credentials\" (407-413);被两处调用:from_env_or_saved (client.rs:394) 和 resolve_startup_auth_source (client.rs:485)"
+        },
+        {
+          "area": "A5.1 测试走真实路径",
+          "evidence": "crates/api/src/client.rs:583 #[cfg(test)] fn read_api_key 调 AuthSource::from_env_or_saved();测试 read_api_key_requires_presence (1089) 移除 ANTHROPIC_* + CLAUDE_CONFIG_HOME 后期望 MissingApiKey,但 macOS 上 Keychain fallback 仍返回真实 token → 本地红;CI 无 Keychain entry → 绿"
+        },
+        {
+          "area": "A5.1 CHANGELOG 自述",
+          "evidence": "CHANGELOG.md:83-86 明确 'they read the machine's real macOS Keychain OAuth credential, so they fail locally...CI is unaffected — the real fix needs a Keychain gate, not just a config-dir override'"
+        },
+        {
+          "area": "A5.2 Anthropic terminal 只认 MessageStop",
+          "evidence": "crates/api/src/client.rs:837 if matches!(event, StreamEvent::MessageStop(_)) { self.observed_terminal = true } (重复于 879);MessageDelta 不 set observed_terminal"
+        },
+        {
+          "area": "A5.2 MessageDelta.stop_reason 不参与完成判定",
+          "evidence": "crates/api/src/client.rs:776-778 event_is_meaningful_content 对 MessageStart/MessageDelta/MessageStop 一律返回 false;stop_reason 字段在 types.rs:258-262 MessageDelta 中存在但 next_event 从不读取"
+        },
+        {
+          "area": "A5.2 retry gate 用 observed_terminal",
+          "evidence": "crates/api/src/client.rs:794 should_retry_on_premature_eof 的第二参数 observed_terminal——clean-EOF 时若只见过带 stop_reason 的 MessageDelta 但缺 MessageStop,observed_terminal=false,会触发 retry (与 OpenAI 把 finish_reason 当 Complete 不对称)"
+        },
+        {
+          "area": "A5.2 OpenAI 对照",
+          "evidence": "crates/aris-cli/src/openai_executor.rs:200 stream_eof_action 中 'if observed_done || observed_finish_reason { return Complete }';CHANGELOG.md:169 自认 CL2 = Anthropic stop_reason symmetry,'the Anthropic path is already lenient so no user is blocked'"
+        },
+        {
+          "area": "A5.3 OE6 index-by-id",
+          "evidence": "crates/aris-cli/src/openai_executor.rs:258 let idx = tc.get(\"index\").and_then(...).unwrap_or(0);id 仅在 262-264 覆盖 pending[idx].0;测试 1506-1510 自述 'Missing index defaults to slot 0...a fragile assumption for true parallel tool calls — see OE6 deferred to v0.4.16'"
+        },
+        {
+          "area": "A5.3 OE5 usage fallback",
+          "evidence": "crates/aris-cli/src/openai_executor.rs:890-908 只读 usage.prompt_tokens (892) / completion_tokens (894) / prompt_tokens_details.cached_tokens (897-901),无 input_tokens/output_tokens/total_tokens 等 compat 变体的 fallback"
+        },
+        {
+          "area": "A5.3 OE8 event: 字段被 skip",
+          "evidence": "crates/aris-cli/src/openai_executor.rs:840 let Some(data) = sse_data_payload(&line) else { continue };sse_data_payload (284-286) 只 strip 'data:',event:/id:/retry: 行直接返回 None 被 skip (注释 282-283)"
+        },
+        {
+          "area": "A5.4 slash continue 绕过历史",
+          "evidence": "crates/aris-cli/src/main.rs:1172-1191 SlashCommand::parse 命中后 handle_repl_command,1190 continue;早于 1197 history::append_entry 和 1198 editor.push_history"
+        },
+        {
+          "area": "A5.4 push_history 契约测试",
+          "evidence": "crates/aris-cli/src/input.rs:1266 push_history_stores_raw_untrimmed_content + 1278 push_history_does_not_dedup;design_raw.json:586 明确 'Do NOT hook into run_turn or handle_repl_command — that would start persisting slash commands and break the only free-text turns remembered contract'"
+        }
+      ],
+      "work_items": [
+        {
+          "id": "A5.1",
+          "title": "api test Keychain gate (ARIS_DISABLE_KEYCHAIN 环境变量)",
+          "detail": "推荐方案:在 load_keychain_oauth_token (crates/api/src/client.rs:404) 函数体最前加 early-return gate:读 std::env::var(\"ARIS_DISABLE_KEYCHAIN\"),truthy 时返回 None。复用现成的 read_env_non_empty (574) 或写一个轻量 truthy 判断 (参照 read_send_betas 607 的 matches!(\"1\"|\"true\"|\"yes\")模式)。然后在三个 read_api_key_* 测试 (1090/1100/1110) 以及 read_api_key_requires_presence/non_empty 里 set_var(\"ARIS_DISABLE_KEYCHAIN\",\"1\")并在末尾 remove_var,通过现有 env_lock() guard 串行化。为什么选环境变量而非 #[cfg(test)]:(a) #[cfg(test)] 只在本 crate 编译期生效,无法让 from_env_or_saved 内的 fallback 真正短路而不污染调用图;(b) 环境变量 gate 同时给用户一个生产可用的开关 (在装了官方 Claude Code 但想强制走 ANTHROPIC_API_KEY 的机器上),与现有 ARIS_NO_HISTORY/CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS 风格一致;(c) load_keychain_oauth_token 是唯一 Keychain 入口,两个调用点 (394 from_env_or_saved、485 resolve_startup_auth_source) 都过它,gate 一处即全覆盖。要 gate 的 fallback 调用点:仅 load_keychain_oauth_token 本体 (404),不需改 394/485。",
+          "files": [
+            "crates/api/src/client.rs"
+          ],
+          "effort": "small / 0.5h",
+          "risk": "环境变量名需与文档同步;若用户生产环境已无 ANTHROPIC_API_KEY 且依赖 Keychain,设了 ARIS_DISABLE_KEYCHAIN 会回到 MissingApiKey——但这是 opt-in,默认行为不变。测试里务必 remove_var 防泄漏给并行测试 (env_lock 已串行化但跨测试要清)。"
+        },
+        {
+          "id": "A5.2",
+          "title": "CL2 Anthropic MessageDelta.stop_reason 完成判定对称",
+          "detail": "现状:client.rs next_event 只在 MessageStop 时 set observed_terminal (837/879)。对称改法:在两处 set observed_terminal 的相邻位置追加——当 event 是 StreamEvent::MessageDelta 且其 delta.stop_reason 为 Some(非空) 时也 set observed_terminal=true。即在 837 的 if 后加 'else if let StreamEvent::MessageDelta(e)=&event { if e.delta.stop_reason.as_deref().is_some_and(|s|!s.is_empty()) { self.observed_terminal=true } }',879 同改。这样 clean-EOF (done 分支 847) 时若见过带 stop_reason 的 MessageDelta 但代理没发 message_stop,should_retry_on_premature_eof (794) 的 observed_terminal=true 会正确判为完成而非 retry。是否真有 provider 触发:Anthropic 官方 SSE 一定发 message_stop,所以原生 API 不触发;只有 anthropic-compat 代理 (如某些 Bedrock/第三方网关) 可能只发 message_delta(stop_reason) 就关连接——与 OpenAI 侧 MiniMax 不发 [DONE] 同构。结论:健壮性对称 (CHANGELOG 自认 'already lenient so no user is blocked'),非阻塞 bug,优先级低于 A5.1。建议同时加一个 should_retry_on_premature_eof 的纯函数 truth-table 测试用例 (observed_terminal=true 时不 retry,已有 1545 行覆盖) 加一个解析 MessageDelta(stop_reason) 会 set terminal 的单测。",
+          "files": [
+            "crates/api/src/client.rs"
+          ],
+          "effort": "small / 1h",
+          "risk": "误把空字符串 stop_reason 当 terminal——必须 filter !is_empty (类比 choice_finish_reason 250)。改 next_event 主循环要确保不影响正常 MessageStop 路径 (Anthropic 原生总在 MessageDelta 后发 MessageStop,届时 observed_terminal 本就会被 837 set,无双重副作用)。这是 SSE 核心路径,任何改动需 Codex 审 + 跑现有 should_retry truth-table 11 例。"
+        },
+        {
+          "id": "A5.3",
+          "title": "OE5/OE6/OE8 三项 OpenAI-compat 健壮性增强",
+          "detail": "OE6 (真 bug 风险最高,但仅并行工具调用场景):accumulate_tool_call (openai_executor.rs:257) 当多个并行 tool_call 在同一 stream 且某 delta 缺 index 时 unwrap_or(0) 会全部累积到 slot 0、互相覆盖 id。最小修法:改 pending 从 Vec<(id,name,args)> 为按 index 显式定位 + 当 delta 带 id 且与该 slot 现有 id 不同时新开 slot;或更稳妥地把 pending 改成 Vec 但用 'index 缺失时复用最后一个非空 id 的 slot' 启发式。鉴于 OpenAI 实际总发 index,推荐保守做法:仅在 index 缺失时 fallback 到 'id 匹配现有 slot 则复用,否则 push 新 slot',保持 index-present 路径字节不变 (现有测试 1475-1513 全绿)。OE5 (健壮性):usage 解析 (890-908) 加 fallback——input_tokens 读不到时试 usage.input_tokens,output_tokens 同理试 usage.output_tokens,即 'prompt_tokens or input_tokens'。最小 diff:把 892/894 的 .get(\"prompt_tokens\") 改成 .get(\"prompt_tokens\").or_else(||usage.get(\"input_tokens\")) 链。OE8 (健壮性,最低优先级):SSE event: 字段现被 skip (840 None→continue)。多数 compat provider 不依赖 event:,Anthropic 才用。OpenAI Chat Completions 流不需要 event:,所以 OE8 基本是 no-op 增强——除非某 provider 用 event: error 区分错误流。建议 OE8 仅记录/暂缓,或在 sse_data_payload 旁加一个 sse_event_field 解析器但不改主逻辑。三项均建议各加纯函数单测 (类比 accumulate_tool_call_builds_and_concatenates 1475)。",
+          "files": [
+            "crates/aris-cli/src/openai_executor.rs"
+          ],
+          "effort": "medium / OE6 2h + OE5 0.5h + OE8 0.5h",
+          "risk": "OE6 改 pending 结构会触及 flush_pending_tools (1056) 和 985-1000 的 leftover drain,以及 emit ToolUse 顺序——并行工具调用顺序错乱会让 runtime 配对 tool_result 出错。必须保 index-present 路径零回归 (现有 5 个 SSE 单测 + accumulate 测试)。OE5 多 provider usage 字段语义可能不同 (有的 input_tokens 含 cached,有的不含),误加会让 /cost 偏差。OE8 若改主 skip 逻辑可能吞掉本该 skip 的 id:/retry: 行。"
+        },
+        {
+          "id": "A5.4",
+          "title": "slash command 入 in-memory + disk 历史 (P3)",
+          "detail": "现状 main.rs:1172 SlashCommand::parse 命中后在 1190 continue,完全绕过 1197 append_entry/1198 push_history。最小 diff:在 1190 continue 之前 (即 match cli.handle_repl_command 之后) 补两行:history::append_entry(&history_path, &input); editor.push_history(input.clone()); ——注意此处 input 已被 1164 trimmed 拷走但原 input 仍在 (1163 Submit(input) 持有),push_history 要传未 trim 的 input 以保 raw-untrimmed 契约 (input.rs:1267 测试)。关键冲突:design_raw.json:586 和 input.rs:1262-1264 的 Phase-0 characterization 明确写'绝不持久化 slash 命令'是 v0.4.16 既定契约,append_skips_blank_like_push_history 等测试虽不直接测 slash,但 push_history_does_not_dedup/raw_untrimmed 契约不会破 (slash 也是 raw string)。真正风险是违反设计意图而非破测试。若决定做,需:(a) 更新 design_raw.json/CHANGELOG 声明契约变更;(b) 确认 disk secret-skip (looks_like_secret) 不会误伤 /setup --api-key xxx 类命令 (实际会被 has_credential_assignment 拦掉,符合预期);(c) /exit|/quit (1168) 仍应排除——它们在 slash parse 前已 break,天然不入历史。建议加一个新测试锁'slash 命令现在进入 in-memory history'的新契约。",
+          "files": [
+            "crates/aris-cli/src/main.rs",
+            "crates/aris-cli/src/input.rs",
+            "idea-stage/v0.4.16/design_raw.json"
+          ],
+          "effort": "small / 1h",
+          "risk": "直接违反 v0.4.16 design_raw.json:586 既定'only free-text turns remembered'契约——需先与 maintainer 确认这是 intended 的 P3 行为变更而非回归。secret-skip 对 /xxx --token 类命令会 disk-skip 但仍入 memory (符合现有 disk-only skip 语义)。push_history 传值需用 input (raw) 而非 trimmed,否则破 raw-untrimmed 契约测试。"
+        }
+      ],
+      "regression_risks": [
+        "A5.1: 若 ARIS_DISABLE_KEYCHAIN 未在所有 read_api_key_* 测试设置/清理,env_lock 串行下仍可能让某测试看到上一测试残留值;生产用户依赖 Keychain 且无 env key 时设此开关会回 MissingApiKey (opt-in 可接受)。",
+        "A5.2: client.rs next_event 是 Anthropic SSE 核心热路径,误判空 stop_reason 为 terminal 会让本该 retry 的 premature-EOF 不 retry;需保 Anthropic 原生 (总发 MessageStop) 路径零行为变化。",
+        "A5.3 OE6: 改 pending_tools 结构会波及 flush_pending_tools (1056)、leftover drain (996-1000)、ToolUse emit 顺序——并行工具调用配对 tool_result 错乱;必须保 index-present (OpenAI 实际行为) 路径字节不变,现有 5 SSE 单测 + accumulate 测试全绿。",
+        "A5.3 OE5: 不同 provider 的 input_tokens 语义 (是否含 cached) 不一致,盲目 fallback 会让 /cost 与 usage tracker 偏差。",
+        "A5.3 OE8: 若改主 sse_data_payload skip 逻辑可能误吞 id:/retry: keep-alive 行。",
+        "A5.4: 直接违反 v0.4.16 design_raw.json:586 'do NOT persist slash commands' 既定契约——属设计意图变更,非纯 bug fix;需 maintainer 确认。push_history 必须传 raw input 不能传 trimmed 否则破 push_history_stores_raw_untrimmed_content (input.rs:1267)。"
+      ],
+      "characterization_tests": [
+        "A5.1: 锁'CI 路径 (无 Keychain) read_api_key_requires_presence 返回 MissingApiKey'——加 gate 前先确认设了 ARIS_DISABLE_KEYCHAIN=1 后本地也能复现 CI 绿,作为 gate 生效的回归基线。",
+        "A5.2: 锁现有 should_retry_on_premature_eof truth-table (client.rs:1525-1556, 11 例),尤其 observed_terminal=true → 不 retry (1545) 必须保持;新增'MessageDelta 带非空 stop_reason 后 clean-EOF 不 retry'用例。",
+        "A5.2: 锁'Anthropic 原生流 (MessageDelta+stop_reason 后跟 MessageStop) 行为不变'——确认 observed_terminal 双重 set 无副作用 (sse.rs:160-187 已有此 fixture)。",
+        "A5.3 OE6: 锁现有 accumulate_tool_call_builds_and_concatenates (openai_executor.rs:1475)——index-present 两工具不互相 clobber (1495-1505) 必须保持;新增'两并行 tool_call、第二个缺 index 但带不同 id 不覆盖第一个'的 OE6 目标用例。",
+        "A5.3 OE5: 锁现有 usage 解析 (prompt_tokens/completion_tokens/cached_tokens 标准字段) 不变;新增 input_tokens/output_tokens 变体 fallback 用例。",
+        "A5.4: 当前行为 = slash 命令不入 in-memory history (无直接测试,需先写一个'/status 后 history 为空'的 characterization 锁住 v0.4.16 现状),再以新测试翻转,使契约变更显式可见。"
+      ],
+      "open_questions": [
+        "A5.4 是否真要做?design_raw.json:586 + input.rs:1262 Phase-0 characterization 明确把'不持久化 slash 命令'当作 v0.4.16 既定契约——主 agent 需先与 maintainer 确认这是 v0.4.17 有意的 P3 行为变更,否则属违反既定设计。",
+        "A5.2 是否有具体 anthropic-compat 代理被报告只发 message_delta(stop_reason) 不发 message_stop?CHANGELOG 说'no user is blocked',若无真实 provider 触发,CL2 可继续 defer。",
+        "A5.3 OE8 的 event: 字段:是否有 OpenAI-compat provider 用 event: 区分 error/data 流?若无,OE8 可仅做解析器不接主逻辑 (近 no-op),优先级最低。",
+        "A5.3 OE6 pending_tools 重构粒度:保守的'index 缺失时按 id fallback'够不够,还是要彻底改成 IndexMap<index,slot> + id 二级索引?取决于目标 compat provider 实际是否真的发缺 index 的并行 tool_call (OpenAI 原生不会)。",
+        "A5.1 ARIS_DISABLE_KEYCHAIN 是否需在用户文档/help 中暴露,还是仅作内部测试 gate?若仅内部,命名可改 ARIS_TEST_DISABLE_KEYCHAIN 更明确,但牺牲生产可用性。"
+      ]
+    },
+    "issueSweep": {
+      "items": [
+        {
+          "number": 286,
+          "kind": "issue",
+          "title": "Codex MCP 大 payload（>3000 chars）走 stdio transport 时卡死无响应",
+          "state": "OPEN",
+          "relevance": "v0.4.17-MCP — 最强信号。今天(2026-06-05)新开,作者 zhouweii234 (#284 同一人)。报告 Codex MCP 短 prompt 通、>3000 char 长 prompt 内联卡死(token 冻结、15min 无响应、不报超时),写文件传路径可绕过。虽然现象是 Claude Code↔Codex MCP(非 aris-cli 二进制本身),但直接命中 v0.4.17 MCP 真接入设计面:aris-cli 自己的 crates/runtime/src/mcp_stdio.rs:634-670 用的正是 write_all→flush→read 顺序单任务 stdio 模型(write_frame@667、read_frame@673、read_response@723 串行),大写入若不并发 drain stdout 同样有 pipe buffer 死锁风险。是 v0.4.17 MCP 接入必须前置考虑的工程教训。",
+          "suggested_action": "并入 v0.4.17 — 作为 MCP 真接入的设计输入:(1) 回复作者确认写文件传路径是推荐绕过(与 reviewer-independence.md 一致);(2) v0.4.17 实现 aris-cli MCP client 时,write_frame 大 payload 必须用并发 reader 任务避免 stdio pipe 死锁(当前 mcp_stdio.rs:716-725 send_request 后才 read_response 是串行,需评估)。"
+        },
+        {
+          "number": 259,
+          "kind": "issue",
+          "title": "Environment has MinMax and DeepSeek configured; however, ARIS execution defaults to OpenAI requests.",
+          "state": "OPEN",
+          "relevance": "v0.4.17-P8 / 新 bug 候选 — 用户配了 MiniMax executor + DeepSeek reviewer 却发 OpenAI 请求。maintainer 已诊断:根因是用户写了错路径/错格式(~/.aris/config.yaml vs 实际读 ~/.config/aris/config.json 扁平 JSON),aris 退回默认 OpenAI。但暴露真问题:配置静默 fallback 到 OpenAI 而非报错,正是 P8 provider 路由 + fail-loud 主题(v0.4.16 已对 OpenAI-family subagent 做 fail-loud guard commit 4a9ad7a,但 executor 主配置错路径仍静默降级)。",
+          "suggested_action": "并入 v0.4.17 — P8 provider 抽象时:配置文件路径不存在/解析失败应 warn/fail-loud 而非静默退回 OpenAI 默认。短期可回复引导跑 `aris setup`;长期归入 P8。"
+        },
+        {
+          "number": 258,
+          "kind": "issue",
+          "title": "【feat】支持使用 Copilot CLI 内置 subagent 进行审阅，减少对 MCP 的硬依赖",
+          "state": "OPEN",
+          "relevance": "v0.4.17-P8 / v0.4.17-MCP — 请求 Copilot CLI 环境下默认用内置 subagent + GPT-5.4 审阅,减少 MCP 硬依赖。与 P8 Subagent 抽象 + MCP 接入直接相关,体现社区对 reviewer backend 多样化 + 降低 MCP 依赖的诉求。",
+          "suggested_action": "并入 v0.4.17 — 作为 P8 subagent backend 多样化的需求输入;v0.4.17 设计 subagent 抽象时纳入考量。"
+        },
+        {
+          "number": 274,
+          "kind": "issue",
+          "title": "请问能否加一个历史命令功能 (REPL Ctrl+R / up-down history)",
+          "state": "CLOSED",
+          "relevance": "v0.4.17-无关(已在 v0.4.16 交付) — 作者 huangzsdy。2026-06-05T01:38 maintainer 关闭并说明已在 v0.4.16 发布(历史持久化 ~/.config/aris/history 0600 + Ctrl+R 反向搜索 + ARIS_NO_HISTORY)。截至调查无作者后续回复(release 01:34 发布、关闭 01:38,仅 4 分钟)。aris-cli 侧已落地 crates/aris-cli/src/history.rs。",
+          "suggested_action": "忽略/观望 — 已交付。同一作者 huangzsdy 也是 #259 报告人,可顺带关注其后续是否回测 v0.4.16 历史功能 + #259 provider 路由。"
+        },
+        {
+          "number": 231,
+          "kind": "pr",
+          "title": "Add Codex OAuth backend to llm-chat",
+          "state": "OPEN",
+          "relevance": "v0.4.17-P8 (主题重叠,非代码冲突) — base=main,改 mcp-servers/llm-chat/server.py + tests + docs,NOT 触碰 Rust CLI 源码(crates/)。mergeable=CONFLICTING(需 rebase)。与 v0.4.17 Rust CLI 改动面不冲突(不同代码区),但与 P8 provider/reviewer backend 主题重叠。",
+          "suggested_action": "回复/单独处理 — 提醒作者 rebase 解冲突;不影响 v0.4.17 Rust 实施。这是 skills/mcp-servers 仓库事务(Python),与 aris-cli 二进制平行。"
+        },
+        {
+          "number": 213,
+          "kind": "pr",
+          "title": "docs: add OpenRouter integration guide",
+          "state": "OPEN",
+          "relevance": "v0.4.17-P8 (文档,主题相关) — 改 README/README_CN + docs/OPENROUTER_GUIDE*,关联 #94/#113/#127(OpenRouter/供应商请求)。mergeable=CONFLICTING。纯文档,不碰 Rust CLI。",
+          "suggested_action": "回复 — 提醒 rebase;若 v0.4.17 P8 落地 OpenRouter 路由,可一并合文档。"
+        },
+        {
+          "number": 212,
+          "kind": "pr",
+          "title": "fix(install): auto-detect Codex CLI platform and delegate to install_aris_codex.sh (#180)",
+          "state": "OPEN",
+          "relevance": "skills 仓库事务 — 改 tools/install_aris.sh(shell 安装脚本),修 #180 Codex CLI 自动适配。mergeable=MERGEABLE。不碰 aris-cli Rust 二进制。与 v0.4.17 Rust 改动面无冲突。",
+          "suggested_action": "单独处理(可合) — 唯一 MERGEABLE 的 PR,修已知 issue #180,与 v0.4.17 无冲突,可独立 review 合并。非 aris-cli 二进制范畴。"
+        },
+        {
+          "number": 284,
+          "kind": "issue",
+          "title": "/idea-creator 跳过子 skill 调用（allowed-tools 缺少 Skill）",
+          "state": "OPEN",
+          "relevance": "skills 仓库事务(跳过) — idea-creator/SKILL.md frontmatter 缺 Skill 授权。已被 maintainer 在 commit 07ca667 修复(allowed-tools 加 Skill);follow-up 立项 #285。属 skills(main)仓库 markdown 事务,非 aris-cli 二进制。但报告人 zhouweii234 由此引出 CLI 相关的 #286。",
+          "suggested_action": "忽略(CLI 视角) — skills 仓库已修。仅作为 #286 上下文关联。"
+        },
+        {
+          "number": 285,
+          "kind": "issue",
+          "title": "idea-discovery: per-stage evidence gate — explicit BLOCKED instead of silent stage-skipping (follow-up to #284)",
+          "state": "OPEN",
+          "relevance": "skills 仓库事务(跳过) — maintainer wanshuiyin 自开,enhancement label。讲 /idea-discovery workflow 应加 per-stage evidence gate(借 research-pipeline 的 done/accepted),属 skills markdown workflow 设计,非 aris-cli 二进制。",
+          "suggested_action": "忽略(CLI 视角) — skills/main 仓库 enhancement,与 v0.4.17 CLI 实施无关。"
+        },
+        {
+          "number": 244,
+          "kind": "pr",
+          "title": "fix(claude-review): server.py crashes on Windows due to Unix-only subprocess patterns",
+          "state": "CLOSED",
+          "relevance": "skills 仓库事务(跳过) — 已 COMPLETED 关闭。修 mcp-servers/claude-review/server.py 的 Windows 兼容(start_new_session/os.kill),属 Python MCP server,非 aris-cli Rust。",
+          "suggested_action": "忽略 — 已合并关闭。Python MCP server 事务。"
+        },
+        {
+          "number": 142,
+          "kind": "issue",
+          "title": "Skill tool requires args parameter but skill files are Markdown with no schema",
+          "state": "OPEN",
+          "relevance": "新 bug 候选(低优先,aris-cli 二进制可能涉及) — 调 Skill(skill=\"xxx\") 无 args 报错,要求 args 可选(省略时只加载显示 SKILL.md)。若 aris-cli 实现了 Skill 工具调度,其 args 校验可能命中此问题。2026-04 老 issue,1 评论。",
+          "suggested_action": "忽略/观望 — 优先级低,且更可能是 Claude Code 官方 Skill 工具行为而非 aris-cli。v0.4.17 若动 skill 调度可顺带核查。"
+        },
+        {
+          "number": 127,
+          "kind": "issue",
+          "title": "请求ARIS支持API供应商",
+          "state": "OPEN",
+          "relevance": "v0.4.17-P8(主题相关,泛化请求) — 泛泛请求支持更多 API 供应商。与 P8 provider 抽象主题一致,但内容空泛(3 评论)。同族还有 #113 openrouter、#117 ollama、#94 paper-illustration openrouter。",
+          "suggested_action": "并入 v0.4.17(归类) — 作为 P8 provider 抽象的需求池条目,无需单独 hotfix。"
+        }
+      ],
+      "summary": "GitHub sweep (wanshuiyin/Auto-claude-code-research-in-sleep,只看 aris-cli/CLI 相关) 结论:\n\n最强信号 = #286(今天 2026-06-05 新开,作者 zhouweii234)。Codex MCP 长 prompt(>3000 char 内联)走 stdio transport 卡死,写文件传路径可绕过。直接命中 v0.4.17-MCP 真接入设计面:aris-cli 自己的 MCP stdio 实现在 crates/runtime/src/mcp_stdio.rs(write_frame:667 / read_frame:673 / send_request:716 / read_response:723)用串行 write_all→flush→read 单任务模型(write_all:634, flush:638),大 payload 同样存在 stdio pipe buffer 死锁风险。v0.4.17 实现 aris-cli MCP client 必须用并发 reader 任务避免此类死锁——这是 #286 给的工程教训。\n\nv0.4.16(release 今天 01:34 发布)已交付 #274(REPL 历史 Ctrl+R,作者 huangzsdy,01:38 关闭,4 分钟内无后续回复;落地于 crates/aris-cli/src/history.rs)+ P8 Phase 2 OpenAI-subagent fail-loud guard(commit 4a9ad7a)。\n\nprovider 路由相关(归 v0.4.17-P8):#259(MiniMax 配置却发 OpenAI 请求,根因配置错路径但暴露静默 fallback-to-OpenAI 应 fail-loud)、#258(Copilot CLI 内置 subagent reviewer)、#127/#113/#117/#94(供应商请求池)。\n\n开放 PR 共 5 个,全部 base=main,无一触碰 Rust CLI 源码(crates/),故与 v0.4.17 Rust 改动面无代码冲突:#231(Codex OAuth llm-chat,CONFLICTING,需 rebase,P8 主题重叠)、#213(OpenRouter 文档,CONFLICTING)、#212(install_aris.sh Codex 自动适配,唯一 MERGEABLE,修 #180,可独立合)。\n\n跳过(skills/main 仓库事务):#284/#285(idea-creator SKILL.md,已 07ca667 修)、#244(claude-review Python server Windows 兼容,已关闭)。\n\n无 release 下载异常:v0.4.16 八个 asset 下载量正常(Windows zip 27 次最高),无报错反馈。\n\n注意:同一作者 huangzsdy 同时是 #274(已交付)和 #259(待修)报告人,zhouweii234 同时是 #284(skills 已修)和 #286(CLI 待办)报告人——这两位是活跃测试者,值得关注其 v0.4.16/v0.4.17 回测反馈。"
+    }
+  }
+}
