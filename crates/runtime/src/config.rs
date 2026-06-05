@@ -112,6 +112,28 @@ pub struct McpStdioServerConfig {
     /// time (`mcp_request_timeout` in `mcp_stdio.rs`) so the parse
     /// stays lossless.
     pub request_timeout_secs: Option<u64>,
+    /// v0.4.17 (T5): per-server trust flag. `Some(true)` means the
+    /// user has pre-approved this server's tools so the CLI's MCP
+    /// approval gate can skip the per-call confirmation. `None` (the
+    /// default — absent in config) is treated as untrusted. The runtime
+    /// only parses/stores it; the consuming approval logic lands with
+    /// Track C.
+    pub trust: Option<bool>,
+}
+
+impl McpStdioServerConfig {
+    /// v0.4.17 (T5): whether the user pre-trusted this server. Absent in
+    /// config (`None`) is treated as untrusted.
+    #[must_use]
+    pub fn trust(&self) -> Option<bool> {
+        self.trust
+    }
+
+    /// Convenience: resolved trust as a plain bool (absent => `false`).
+    #[must_use]
+    pub fn is_trusted(&self) -> bool {
+        self.trust.unwrap_or(false)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -626,6 +648,11 @@ fn parse_mcp_server_config(
             args: optional_string_array(object, "args", context)?.unwrap_or_default(),
             env: optional_string_map(object, "env", context)?.unwrap_or_default(),
             request_timeout_secs: optional_u64(object, "requestTimeoutSecs", context)?,
+            // v0.4.17 (T5): `trust` is a per-server bool. Absent =>
+            // `None` (untrusted). A non-bool value is a hard parse
+            // error (matches the strictness of every other typed field)
+            // so a typo can't silently disable the approval gate.
+            trust: optional_bool(object, "trust", context)?,
         })),
         "sse" => Ok(McpServerConfig::Sse(parse_mcp_remote_server_config(
             object, context,
@@ -912,8 +939,8 @@ fn deep_merge_objects(
 #[cfg(test)]
 mod tests {
     use super::{
-        ConfigLoader, ConfigSource, McpServerConfig, McpTransport, ResolvedPermissionMode,
-        CLAUDE_CODE_SETTINGS_SCHEMA_NAME,
+        parse_mcp_server_config, ConfigLoader, ConfigSource, McpServerConfig, McpTransport,
+        ResolvedPermissionMode, CLAUDE_CODE_SETTINGS_SCHEMA_NAME,
     };
     use crate::json::JsonValue;
     use crate::sandbox::FilesystemIsolationMode;
@@ -1485,5 +1512,92 @@ mod tests {
         }
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn parses_per_server_mcp_trust_flag() {
+        // v0.4.17 (T5): `trust` on a stdio MCP server entry round-trips
+        // into `McpStdioServerConfig.trust`. Absent => `None`
+        // (untrusted); `true`/`false` round-trip; a non-bool value is a
+        // hard parse error so a typo can't silently disable the
+        // approval gate.
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claude");
+        fs::create_dir_all(cwd.join(".claude")).expect("project config dir");
+        fs::create_dir_all(&home).expect("home config dir");
+
+        fs::write(
+            home.join("settings.json"),
+            r#"{
+              "mcpServers": {
+                "untrusted": {
+                  "command": "uvx",
+                  "args": ["fast-mcp"]
+                },
+                "trusted": {
+                  "command": "codex",
+                  "args": ["mcp-server"],
+                  "trust": true
+                },
+                "explicit-false": {
+                  "command": "tool",
+                  "args": [],
+                  "trust": false
+                }
+              }
+            }"#,
+        )
+        .expect("write settings");
+
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should load");
+
+        match &loaded.mcp().get("untrusted").expect("untrusted").config {
+            McpServerConfig::Stdio(stdio) => {
+                assert_eq!(stdio.trust, None, "absent trust => None");
+                assert!(!stdio.is_trusted(), "absent trust resolves to false");
+            }
+            other => panic!("expected stdio config, got {other:?}"),
+        }
+        match &loaded.mcp().get("trusted").expect("trusted").config {
+            McpServerConfig::Stdio(stdio) => {
+                assert_eq!(stdio.trust(), Some(true));
+                assert!(stdio.is_trusted());
+            }
+            other => panic!("expected stdio config, got {other:?}"),
+        }
+        match &loaded
+            .mcp()
+            .get("explicit-false")
+            .expect("explicit-false")
+            .config
+        {
+            McpServerConfig::Stdio(stdio) => {
+                assert_eq!(stdio.trust(), Some(false));
+                assert!(!stdio.is_trusted());
+            }
+            other => panic!("expected stdio config, got {other:?}"),
+        }
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn rejects_non_bool_mcp_trust_flag() {
+        // A non-boolean `trust` must be a hard parse error, not a
+        // silently-ignored field.
+        let value = JsonValue::parse(
+            r#"{"command": "tool", "args": [], "trust": "yes"}"#,
+        )
+        .expect("test json should parse");
+        let err = parse_mcp_server_config("bad", &value, "test")
+            .expect_err("non-bool trust should fail to parse");
+        let message = err.to_string();
+        assert!(
+            message.contains("trust") && message.contains("boolean"),
+            "unexpected error: {message}"
+        );
     }
 }

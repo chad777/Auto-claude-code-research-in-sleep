@@ -147,6 +147,7 @@ mod tests {
                 args: vec!["mcp-server".to_string()],
                 env: BTreeMap::from([("TOKEN".to_string(), "secret".to_string())]),
                 request_timeout_secs: None,
+                trust: None,
             }),
         };
 

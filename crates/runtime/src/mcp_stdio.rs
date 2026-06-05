@@ -217,6 +217,17 @@ pub struct UnsupportedMcpServer {
     pub reason: String,
 }
 
+/// v0.4.17 (RW6): a stdio MCP server that was configured and supported
+/// but failed during `discover_tools` (spawn / initialize / tools/list).
+/// Recorded per-server so one bad server no longer takes down the whole
+/// MCP tool catalogue — the others' tools are still returned and the
+/// failure is surfaced (stderr warning + this structured record).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpDiscoveryFailure {
+    pub server_name: String,
+    pub reason: String,
+}
+
 #[derive(Debug)]
 pub enum McpServerManagerError {
     Io(io::Error),
@@ -312,6 +323,10 @@ impl ManagedMcpServer {
 pub struct McpServerManager {
     servers: BTreeMap<String, ManagedMcpServer>,
     unsupported_servers: Vec<UnsupportedMcpServer>,
+    /// v0.4.17 (RW6): failures from the most recent `discover_tools`
+    /// pass. Cleared at the start of each `discover_tools` so it always
+    /// reflects the latest discovery.
+    discovery_failures: Vec<McpDiscoveryFailure>,
     tool_index: BTreeMap<String, ToolRoute>,
     next_request_id: u64,
 }
@@ -346,6 +361,7 @@ impl McpServerManager {
         Self {
             servers: managed_servers,
             unsupported_servers,
+            discovery_failures: Vec::new(),
             tool_index: BTreeMap::new(),
             next_request_id: 1,
         }
@@ -356,74 +372,125 @@ impl McpServerManager {
         &self.unsupported_servers
     }
 
+    /// v0.4.17 (RW6): per-server failures from the last `discover_tools`
+    /// pass (empty if every server succeeded). The CLI/doctor layer can
+    /// surface these without aborting the whole catalogue.
+    #[must_use]
+    pub fn discovery_failures(&self) -> &[McpDiscoveryFailure] {
+        &self.discovery_failures
+    }
+
+    /// Discover the tools advertised by every configured stdio server.
+    ///
+    /// v0.4.17 (RW6): discovery is now **per-server resilient**. A
+    /// server that fails to spawn / initialize / list its tools no
+    /// longer aborts the whole catalogue — its failure is recorded in
+    /// [`discovery_failures`] (and a one-line warning is written to
+    /// stderr), and discovery proceeds to the remaining servers. The
+    /// returned `Vec` therefore contains the union of every *healthy*
+    /// server's tools. The method only returns `Err` for a genuinely
+    /// unexpected internal inconsistency (e.g. a server vanishing from
+    /// the map mid-pass), never for a routine per-server failure.
     pub async fn discover_tools(&mut self) -> Result<Vec<ManagedMcpTool>, McpServerManagerError> {
         let server_names = self.servers.keys().cloned().collect::<Vec<_>>();
         let mut discovered_tools = Vec::new();
+        self.discovery_failures.clear();
 
         for server_name in server_names {
-            self.ensure_server_ready(&server_name).await?;
-            self.clear_routes_for_server(&server_name);
-
-            let mut cursor = None;
-            loop {
-                let request_id = self.take_request_id();
-                let response = {
-                    let server = self.server_mut(&server_name)?;
-                    let process = server.process.as_mut().ok_or_else(|| {
-                        McpServerManagerError::InvalidResponse {
-                            server_name: server_name.clone(),
-                            method: "tools/list",
-                            details: "server process missing after initialization".to_string(),
-                        }
-                    })?;
-                    process
-                        .list_tools(
-                            request_id,
-                            Some(McpListToolsParams {
-                                cursor: cursor.clone(),
-                            }),
-                        )
-                        .await?
-                };
-
-                if let Some(error) = response.error {
-                    return Err(McpServerManagerError::JsonRpc {
-                        server_name: server_name.clone(),
-                        method: "tools/list",
-                        error,
-                    });
-                }
-
-                let result =
-                    response
-                        .result
-                        .ok_or_else(|| McpServerManagerError::InvalidResponse {
-                            server_name: server_name.clone(),
-                            method: "tools/list",
-                            details: "missing result payload".to_string(),
-                        })?;
-
-                for tool in result.tools {
-                    let qualified_name = mcp_tool_name(&server_name, &tool.name);
-                    self.tool_index.insert(
-                        qualified_name.clone(),
-                        ToolRoute {
-                            server_name: server_name.clone(),
-                            raw_name: tool.name.clone(),
-                        },
+            match self.discover_server_tools(&server_name).await {
+                Ok(tools) => discovered_tools.extend(tools),
+                Err(error) => {
+                    let reason = error.to_string();
+                    // RW6: surface the failure (best-effort stderr line,
+                    // mirroring the existing notification-skip logging)
+                    // and record it structurally so the CLI/doctor can
+                    // report it. Tools already routed for this server are
+                    // dropped so we never dispatch to a broken server.
+                    self.clear_routes_for_server(&server_name);
+                    eprintln!(
+                        "aris mcp: server `{server_name}` failed during tool discovery, skipping: {reason}"
                     );
-                    discovered_tools.push(ManagedMcpTool {
+                    self.discovery_failures.push(McpDiscoveryFailure {
                         server_name: server_name.clone(),
-                        qualified_name,
-                        raw_name: tool.name.clone(),
-                        tool,
+                        reason,
                     });
                 }
+            }
+        }
 
-                match result.next_cursor {
-                    Some(next_cursor) => cursor = Some(next_cursor),
-                    None => break,
-                }
+        Ok(discovered_tools)
+    }
+
+    /// Discover one server's tools. Spawns/initializes the server (via
+    /// `ensure_server_ready`) and pages through `tools/list`. Any error
+    /// here is per-server (handled by the caller), never fatal to the
+    /// whole pass.
+    async fn discover_server_tools(
+        &mut self,
+        server_name: &str,
+    ) -> Result<Vec<ManagedMcpTool>, McpServerManagerError> {
+        self.ensure_server_ready(server_name).await?;
+        self.clear_routes_for_server(server_name);
+
+        let mut discovered_tools = Vec::new();
+        let mut cursor = None;
+        loop {
+            let request_id = self.take_request_id();
+            let response = {
+                let server = self.server_mut(server_name)?;
+                let process = server.process.as_mut().ok_or_else(|| {
+                    McpServerManagerError::InvalidResponse {
+                        server_name: server_name.to_string(),
+                        method: "tools/list",
+                        details: "server process missing after initialization".to_string(),
+                    }
+                })?;
+                process
+                    .list_tools(
+                        request_id,
+                        Some(McpListToolsParams {
+                            cursor: cursor.clone(),
+                        }),
+                    )
+                    .await?
+            };
+
+            if let Some(error) = response.error {
+                return Err(McpServerManagerError::JsonRpc {
+                    server_name: server_name.to_string(),
+                    method: "tools/list",
+                    error,
+                });
+            }
+
+            let result = response
+                .result
+                .ok_or_else(|| McpServerManagerError::InvalidResponse {
+                    server_name: server_name.to_string(),
+                    method: "tools/list",
+                    details: "missing result payload".to_string(),
+                })?;
+
+            for tool in result.tools {
+                let qualified_name = mcp_tool_name(server_name, &tool.name);
+                self.tool_index.insert(
+                    qualified_name.clone(),
+                    ToolRoute {
+                        server_name: server_name.to_string(),
+                        raw_name: tool.name.clone(),
+                    },
+                );
+                discovered_tools.push(ManagedMcpTool {
+                    server_name: server_name.to_string(),
+                    qualified_name,
+                    raw_name: tool.name.clone(),
+                    tool,
+                });
+            }
+
+            match result.next_cursor {
+                Some(next_cursor) => cursor = Some(next_cursor),
+                None => break,
             }
         }
 
@@ -581,6 +648,40 @@ impl McpServerManager {
                 });
             }
 
+            // MCP spec mandatory step: announce that initialization
+            // completed *before* marking the server ready / issuing
+            // `tools/list`. Strict servers reject subsequent requests
+            // without this. This is a notification (no id, no reply),
+            // so it must not go through `request()`'s read loop.
+            //
+            // v0.4.17 (Track R / R5-P2.1): if the notification write
+            // fails (broken stdin pipe, server already gone) the
+            // protocol state is unrecoverable — the server never saw
+            // `notifications/initialized`, so a strict server will
+            // reject every later request, yet our slot still holds the
+            // (now half-dead) process. Mirror `request()`'s I/O-failure
+            // handling: kill the child and clear the slot so the next
+            // call respawns from a clean state instead of reusing a
+            // poisoned connection.
+            {
+                let server = self.server_mut(server_name)?;
+                let process = server.process.as_mut().ok_or_else(|| {
+                    McpServerManagerError::InvalidResponse {
+                        server_name: server_name.to_string(),
+                        method: "notifications/initialized",
+                        details: "server process missing before initialized notification"
+                            .to_string(),
+                    }
+                })?;
+                if let Err(error) = process.notify_initialized().await {
+                    let _ = process.terminate().await;
+                    let server = self.server_mut(server_name)?;
+                    server.process = None;
+                    server.initialized = false;
+                    return Err(error.into());
+                }
+            }
+
             let server = self.server_mut(server_name)?;
             server.initialized = true;
         }
@@ -589,11 +690,131 @@ impl McpServerManager {
     }
 }
 
+/// v0.4.17 (R-6 / T4 prerequisite): synchronous façade over an
+/// [`McpServerManager`].
+///
+/// `McpServerManager`'s API is fully `async`, but the CLI's tool
+/// dispatch path (`ToolExecutor::execute`) is a synchronous trait
+/// method. This handle owns its own single-threaded tokio runtime and
+/// the manager, and exposes blocking wrappers that `block_on` the async
+/// calls — the same bridge pattern already proven by the Bash tool
+/// (`bash.rs` `Builder::new_current_thread() + block_on`).
+///
+/// SPIKE-A (R3-P2.2) hard constraint: this handle MUST NOT be used from
+/// inside a tokio runtime — `block_on` panics with "Cannot start a
+/// runtime from within a runtime" if it is. The current CLI topology
+/// guarantees this (tool dispatch runs after the stream `block_on` has
+/// already returned), and every sync entry point asserts it in debug
+/// builds so a future regression is caught immediately rather than
+/// silently risking a nested-runtime panic.
+///
+/// This is the single interface Track C (the `CliToolExecutor`
+/// integration) is expected to consume: Track C never has to touch any
+/// `async` code.
+#[derive(Debug)]
+pub struct McpManagerHandle {
+    runtime: tokio::runtime::Runtime,
+    manager: McpServerManager,
+}
+
+impl McpManagerHandle {
+    /// Build a sync handle from a runtime config. Constructs the
+    /// dedicated `current_thread` runtime and the manager. Returns the
+    /// runtime-construction error if the (rare) runtime build fails.
+    pub fn from_runtime_config(config: &RuntimeConfig) -> io::Result<Self> {
+        Self::from_manager(McpServerManager::from_runtime_config(config))
+    }
+
+    /// Build a sync handle wrapping an already-constructed manager.
+    pub fn from_manager(manager: McpServerManager) -> io::Result<Self> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        Ok(Self { runtime, manager })
+    }
+
+    /// Debug-only guard: panics in debug builds if called from within a
+    /// tokio runtime context, where `block_on` would itself panic. In
+    /// release builds this is a no-op (the topology invariant is
+    /// upheld; the assert exists to catch regressions during dev).
+    fn assert_not_in_runtime() {
+        debug_assert!(
+            tokio::runtime::Handle::try_current().is_err(),
+            "McpManagerHandle must not be used inside a tokio runtime (block_on would panic)"
+        );
+    }
+
+    /// Discover every healthy server's tools (RW6: per-server
+    /// resilient). Blocking.
+    pub fn discover_tools(&mut self) -> Result<Vec<ManagedMcpTool>, McpServerManagerError> {
+        Self::assert_not_in_runtime();
+        let manager = &mut self.manager;
+        self.runtime.block_on(manager.discover_tools())
+    }
+
+    /// Call a qualified MCP tool (`mcp__<server>__<tool>`). Blocking.
+    pub fn call_tool(
+        &mut self,
+        qualified_tool_name: &str,
+        arguments: Option<JsonValue>,
+    ) -> Result<JsonRpcResponse<McpToolCallResult>, McpServerManagerError> {
+        Self::assert_not_in_runtime();
+        let manager = &mut self.manager;
+        self.runtime
+            .block_on(manager.call_tool(qualified_tool_name, arguments))
+    }
+
+    /// Shut every spawned child down cleanly. Blocking.
+    pub fn shutdown(&mut self) -> Result<(), McpServerManagerError> {
+        Self::assert_not_in_runtime();
+        let manager = &mut self.manager;
+        self.runtime.block_on(manager.shutdown())
+    }
+
+    /// Read-only view of servers that were configured but use an
+    /// unsupported (non-stdio) transport.
+    #[must_use]
+    pub fn unsupported_servers(&self) -> &[UnsupportedMcpServer] {
+        self.manager.unsupported_servers()
+    }
+
+    /// Read-only view of per-server failures from the last
+    /// `discover_tools` pass.
+    #[must_use]
+    pub fn discovery_failures(&self) -> &[McpDiscoveryFailure] {
+        self.manager.discovery_failures()
+    }
+
+    /// Borrow the wrapped manager (read-only). Escape hatch for any
+    /// state query not yet surfaced as a dedicated method.
+    #[must_use]
+    pub fn manager(&self) -> &McpServerManager {
+        &self.manager
+    }
+}
+
+/// v0.4.17 (M6): upper bound on a single MCP frame's declared
+/// `Content-Length`. A frame larger than this is rejected before we
+/// allocate the receive buffer, so a hostile/buggy server can't OOM
+/// the process by advertising an enormous length. 64 MiB comfortably
+/// covers legitimate large tool results (multi-MB agent outputs) while
+/// still bounding the worst case.
+const MAX_CONTENT_LENGTH: usize = 64 * 1024 * 1024;
+
 #[derive(Debug)]
 pub struct McpStdioProcess {
     child: Child,
-    stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    /// v0.4.17 (RW9 / #286): the stdin write half and stdout read half
+    /// are owned independently so [`request`] can drive them
+    /// concurrently (write task + read pump under one `tokio::join!`),
+    /// breaking the pipe-buffer deadlock where a large request body
+    /// fills the child's stdin pipe while the child is blocked writing
+    /// its stdout response into a pipe we haven't started draining.
+    /// They are `Option` only so they can be temporarily `take`n into
+    /// the join; in the steady state (and on every public method entry)
+    /// both are `Some`.
+    stdin: Option<ChildStdin>,
+    stdout: Option<BufReader<ChildStdout>>,
     /// v0.4.13 P1.D: per-server timeout override copied from the
     /// transport. `None` means fall through to
     /// `MCP_REQUEST_TIMEOUT_SECS` env / 300s default at request time.
@@ -603,14 +824,168 @@ pub struct McpStdioProcess {
     request_timeout_override_secs: Option<u64>,
 }
 
+/// v0.4.17 (Track R / R5-P1): outcome of [`McpStdioProcess::request`]'s
+/// concurrent write+read round trip (the `select!` state machine).
+///
+/// * `Killed(err)` — a fatal-for-the-connection I/O error (write failed
+///   first, or a read error). The caller kills the child (so the next
+///   call respawns) and propagates `err`.
+/// * `ResponseWithFlag(resp, kill_after)` — a successful read. The IO
+///   halves are still healthy and get put back, UNLESS `kill_after` is
+///   set: that flags the "response-wins-with-late-write-error" branch,
+///   where the answer is valid but stdin is poisoned, so the connection
+///   is torn down and respawned on the next call.
+enum RoundTrip<R> {
+    ResponseWithFlag(R, bool),
+    Killed(io::Error),
+}
+
+/// Drive one MCP request's write half and response read pump
+/// CONCURRENTLY over the borrowed stdio halves, collapsing the outcome
+/// into a [`RoundTrip`]. Factored out of [`McpStdioProcess::request`]
+/// (R5-P1) so that method stays small and this state machine is
+/// self-contained.
+///
+/// Why concurrent (RW9 / #286): a request body larger than the OS stdin
+/// pipe buffer blocks our `write_all` until the child drains stdin, but
+/// an agent-style child often doesn't drain stdin until *after* it has
+/// written its response to stdout — whose pipe fills (blocking the
+/// child) because we haven't started reading. Both sides wedge. Racing
+/// write + read drains the child's stdout while we feed its stdin, so
+/// neither pipe can back-pressure into a hang.
+///
+/// State machine (R5-P1 — fixes the `tokio::join!` regression where a
+/// broken write half still blocked the read pump until the global
+/// timeout):
+///   1. WRITE FAILS FIRST — abandon the read immediately and return the
+///      write error (`Killed`). We do NOT wait for a read frame that may
+///      never arrive, so a server that drops our stdin while holding
+///      stdout open fails fast instead of at the global timeout. This is
+///      the regression fix.
+///   2. WRITE SUCCEEDS — fall through to a pure read loop bounded by the
+///      caller's outer timeout (unchanged behaviour for the common
+///      path).
+///   3. RESPONSE FIRST ("response wins") — a matched response id
+///      normally implies the server already drained our write, so the
+///      write future is essentially done. For the rare interleaving
+///      where the read completes while the write future is still
+///      pending, we DEFINE the contract: await the write future to
+///      completion (still inside the caller's outer timeout). If it
+///      ultimately errors, the response is STILL returned via
+///      `ResponseWithFlag(resp, true)` — the server demonstrably
+///      received and answered the request — but the connection is no
+///      longer trustworthy (stdin in an unknown state), so the `true`
+///      flag tells the caller to tear the child down and force a clean
+///      respawn on the next call.
+///
+/// The read pump skips JSON-RPC notifications (no `id` / `id == null`,
+/// preserved verbatim from v0.4.13 #151 / #172) and returns the first
+/// id-bearing frame; a generic `Value` is parsed first so a notification
+/// frame can't fail the mandatory-`id` `JsonRpcResponse` deserialize.
+async fn run_round_trip<TResult: DeserializeOwned>(
+    stdin: &mut ChildStdin,
+    stdout: &mut BufReader<ChildStdout>,
+    encoded: &[u8],
+) -> RoundTrip<JsonRpcResponse<TResult>> {
+    let write_fut = async {
+        stdin.write_all(encoded).await?;
+        stdin.flush().await?;
+        Ok::<(), io::Error>(())
+    };
+
+    let read_fut = async {
+        loop {
+            let payload = read_frame_from(stdout).await?;
+            let value: JsonValue = serde_json::from_slice(&payload)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            let frame_id = value.as_object().and_then(|object| object.get("id"));
+            match frame_id {
+                None | Some(JsonValue::Null) => {
+                    // Notification frame — log (best-effort) and read on.
+                    let method = value
+                        .as_object()
+                        .and_then(|object| object.get("method"))
+                        .and_then(JsonValue::as_str)
+                        .unwrap_or("?");
+                    eprintln!("aris mcp: notification skipped: method={method}");
+                }
+                Some(_) => {
+                    let response: JsonRpcResponse<TResult> = serde_json::from_value(value)
+                        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+                    return Ok::<JsonRpcResponse<TResult>, io::Error>(response);
+                }
+            }
+        }
+    };
+
+    tokio::pin!(write_fut);
+    tokio::pin!(read_fut);
+
+    tokio::select! {
+        // Bias toward the write arm so a write error ready in the same
+        // poll as a read result is surfaced first (more actionable),
+        // matching the old serial path's ordering.
+        biased;
+
+        write_result = &mut write_fut => match write_result {
+            // Case 1: write failed first. Abandon the read.
+            Err(write_err) => RoundTrip::Killed(write_err),
+            // Case 2: write succeeded. Pure read loop under the outer
+            // deadline.
+            Ok(()) => match (&mut read_fut).await {
+                Ok(resp) => RoundTrip::ResponseWithFlag(resp, false),
+                Err(read_err) => RoundTrip::Killed(read_err),
+            },
+        },
+        read_result = &mut read_fut => match read_result {
+            // Case 3: response wins. Await the still-pending write; a
+            // late write error keeps the response but poisons the
+            // connection (flag a kill).
+            Ok(response) => {
+                let kill_after = (&mut write_fut).await.is_err();
+                RoundTrip::ResponseWithFlag(response, kill_after)
+            }
+            Err(read_err) => RoundTrip::Killed(read_err),
+        },
+    }
+}
+
 impl McpStdioProcess {
     pub fn spawn(transport: &McpStdioTransport) -> io::Result<Self> {
+        // v0.4.17 (RW6): by default we DISCARD the child's stderr
+        // rather than letting it `inherit()` straight onto the aris
+        // terminal. Two reasons:
+        //   1. agent-style MCP servers are chatty on stderr; inheriting
+        //      interleaves their logs into the user's REPL output.
+        //   2. correctness — if a server writes a lot to stderr and
+        //      nothing reads it, a *piped* stderr buffer fills and the
+        //      server BLOCKS on its next stderr write (the same class
+        //      of pipe-full hang fixed for stdin in v0.4.13).
+        // v0.4.17 (Track R / R5-P2.2): we used to satisfy (2) by piping
+        // stderr and draining it on a background `tokio::spawn`. But
+        // `spawn` is a *synchronous* method, so that drain task made it
+        // implicitly depend on an ambient tokio runtime — an unclean
+        // contract for a public `spawn` API even though every current
+        // caller happens to run inside the manager's runtime. Since the
+        // default behaviour is "discard" anyway, route stderr to
+        // `Stdio::null()` instead: the kernel sends it to /dev/null, so
+        // it can never back-pressure and there is no drain task and no
+        // runtime dependency. The `ARIS_MCP_STDERR=inherit` escape hatch
+        // for debugging is preserved.
+        let inherit_stderr = std::env::var("ARIS_MCP_STDERR")
+            .map(|value| value.eq_ignore_ascii_case("inherit"))
+            .unwrap_or(false);
+
         let mut command = Command::new(&transport.command);
         command
             .args(&transport.args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit());
+            .stderr(if inherit_stderr {
+                Stdio::inherit()
+            } else {
+                Stdio::null()
+            });
         apply_env(&mut command, &transport.env);
 
         let mut child = command.spawn()?;
@@ -625,18 +1000,37 @@ impl McpStdioProcess {
 
         Ok(Self {
             child,
-            stdin,
-            stdout: BufReader::new(stdout),
+            stdin: Some(stdin),
+            stdout: Some(BufReader::new(stdout)),
             request_timeout_override_secs: transport.request_timeout_secs,
         })
     }
 
+    /// Borrow the stdin write half, erroring if it is currently `take`n.
+    /// The half is only absent transiently inside [`request`]'s
+    /// `tokio::join!`; any caller observing `None` means a prior
+    /// `request` was dropped mid-flight (e.g. a panic between `take`
+    /// and put-back), so we surface a clean error rather than panic.
+    fn stdin_mut(&mut self) -> io::Result<&mut ChildStdin> {
+        self.stdin.as_mut().ok_or_else(|| {
+            io::Error::other("MCP stdio stdin half unavailable (request in flight)")
+        })
+    }
+
+    /// Borrow the stdout read half; see [`stdin_mut`] for the `None`
+    /// rationale.
+    fn stdout_mut(&mut self) -> io::Result<&mut BufReader<ChildStdout>> {
+        self.stdout.as_mut().ok_or_else(|| {
+            io::Error::other("MCP stdio stdout half unavailable (request in flight)")
+        })
+    }
+
     pub async fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
-        self.stdin.write_all(bytes).await
+        self.stdin_mut()?.write_all(bytes).await
     }
 
     pub async fn flush(&mut self) -> io::Result<()> {
-        self.stdin.flush().await
+        self.stdin_mut()?.flush().await
     }
 
     pub async fn write_line(&mut self, line: &str) -> io::Result<()> {
@@ -647,7 +1041,7 @@ impl McpStdioProcess {
 
     pub async fn read_line(&mut self) -> io::Result<String> {
         let mut line = String::new();
-        let bytes_read = self.stdout.read_line(&mut line).await?;
+        let bytes_read = self.stdout_mut()?.read_line(&mut line).await?;
         if bytes_read == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
@@ -659,7 +1053,7 @@ impl McpStdioProcess {
 
     pub async fn read_available(&mut self) -> io::Result<Vec<u8>> {
         let mut buffer = vec![0_u8; 4096];
-        let read = self.stdout.read(&mut buffer).await?;
+        let read = self.stdout_mut()?.read(&mut buffer).await?;
         buffer.truncate(read);
         Ok(buffer)
     }
@@ -671,34 +1065,8 @@ impl McpStdioProcess {
     }
 
     pub async fn read_frame(&mut self) -> io::Result<Vec<u8>> {
-        let mut content_length = None;
-        loop {
-            let mut line = String::new();
-            let bytes_read = self.stdout.read_line(&mut line).await?;
-            if bytes_read == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "MCP stdio stream closed while reading headers",
-                ));
-            }
-            if line == "\r\n" {
-                break;
-            }
-            if let Some(value) = line.strip_prefix("Content-Length:") {
-                let parsed = value
-                    .trim()
-                    .parse::<usize>()
-                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-                content_length = Some(parsed);
-            }
-        }
-
-        let content_length = content_length.ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "missing Content-Length header")
-        })?;
-        let mut payload = vec![0_u8; content_length];
-        self.stdout.read_exact(&mut payload).await?;
-        Ok(payload)
+        let stdout = self.stdout_mut()?;
+        read_frame_from(stdout).await
     }
 
     pub async fn write_jsonrpc_message<T: Serialize>(&mut self, message: &T) -> io::Result<()> {
@@ -759,63 +1127,51 @@ impl McpStdioProcess {
         let request = JsonRpcRequest::new(id.clone(), method, params);
         let timeout = mcp_request_timeout(self.request_timeout_override_secs);
 
-        // Wrap send + (read-until-response) together so a write-side
-        // block (e.g. server alive but not reading stdin, pipe buffer
-        // full on a large request body) also trips the deadline, and
-        // so the deadline still bounds a stream of notifications that
-        // would otherwise keep the read loop alive indefinitely
-        // (v0.4.13 known-limitation fix).
-        //
-        // v0.4.13: the read side is now a loop. JSON-RPC servers may
-        // emit notification frames (no `id`, or `id == null`) such as
-        // `notifications/log` and `notifications/progress` while a
-        // request is in flight. The pre-v0.4.13 behaviour was to
-        // deserialize the first frame directly into
-        // `JsonRpcResponse<TResult>`, which made the call fail
-        // (`id` is mandatory on `JsonRpcResponse`) and we'd kill the
-        // child — root cause of the codex MCP "spurious failures"
-        // known limitation tracked in #151 / #172. We now read a
-        // generic `serde_json::Value` first, skip any frame whose
-        // `id` is missing or null (logging to stderr so the user can
-        // still observe the notification), and only deserialize once
-        // a frame with `id == request.id` arrives. An id mismatch on
-        // a *response* frame remains fatal, exactly as before.
-        let send_then_read = async {
-            self.send_request(&request).await?;
-            loop {
-                let payload = self.read_frame().await?;
-                let value: JsonValue = serde_json::from_slice(&payload)
-                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-                let frame_id = value.as_object().and_then(|object| object.get("id"));
-                match frame_id {
-                    None | Some(JsonValue::Null) => {
-                        // Notification — no id at all, or explicit
-                        // null. Log to stderr (best-effort) and keep
-                        // reading.
-                        let method = value
-                            .as_object()
-                            .and_then(|object| object.get("method"))
-                            .and_then(JsonValue::as_str)
-                            .unwrap_or("?");
-                        eprintln!("aris mcp: notification skipped: method={method}");
-                        continue;
-                    }
-                    Some(_) => {
-                        let response: JsonRpcResponse<TResult> = serde_json::from_value(value)
-                            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-                        return Ok::<JsonRpcResponse<TResult>, io::Error>(response);
-                    }
-                }
-            }
-        };
+        // Encode the request frame up front so the write task owns a
+        // plain `Vec<u8>` and doesn't need to borrow `self`.
+        let frame = serde_json::to_vec(&request)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let encoded = encode_frame(&frame);
 
-        let response: JsonRpcResponse<TResult> = match tokio::time::timeout(timeout, send_then_read)
-            .await
-        {
-            Ok(Ok(response)) => response,
-            Ok(Err(error)) => {
-                // I/O error during send or read. Stdio buffer is now
-                // ambiguous — kill so the next call respawns cleanly.
+        // v0.4.17 (RW9 / #286, Track R / R5-P1): the write half and read
+        // pump are driven CONCURRENTLY by `run_round_trip` (see its docs
+        // for the deadlock rationale and the write-fails-first /
+        // write-then-read / response-wins state machine).
+        //
+        // The two owned IO halves are taken out of `self` for the
+        // duration of the round trip (borrow split: a single
+        // `&mut self` can't lend two disjoint async borrows into two
+        // concurrent futures). On the success path we put them back; on
+        // any kill path we do NOT — the process is dead and
+        // `ensure_server_ready` respawns a fresh `McpStdioProcess` (new
+        // halves) on the next call, so leaving the slots empty is
+        // correct and avoids handing out half-broken pipes.
+        let mut stdin = self
+            .stdin
+            .take()
+            .ok_or_else(|| io::Error::other("MCP stdio stdin half unavailable"))?;
+        let mut stdout = self
+            .stdout
+            .take()
+            .ok_or_else(|| io::Error::other("MCP stdio stdout half unavailable"))?;
+
+        // The concurrent write+read `select!` state machine lives in the
+        // free `run_round_trip` helper (R5-P1) so this method stays
+        // focused on orchestration (take halves -> dispatch -> put back
+        // or kill -> id check). See that helper for the full case
+        // analysis (write-fails-first short-circuit, write-then-read,
+        // response-wins-with-late-write-error).
+        let round_trip =
+            tokio::time::timeout(timeout, run_round_trip(&mut stdin, &mut stdout, &encoded)).await;
+
+        let (response, kill_after): (JsonRpcResponse<TResult>, bool) = match round_trip {
+            Ok(RoundTrip::ResponseWithFlag(response, kill_after)) => (response, kill_after),
+            Ok(RoundTrip::Killed(error)) => {
+                // I/O error during send or read. The stdio buffers are
+                // now ambiguous and/or a half-write is in flight — kill
+                // so the next call respawns cleanly. We deliberately do
+                // NOT put the IO halves back: the process is being torn
+                // down.
                 let _ = self.child.kill().await;
                 return Err(error);
             }
@@ -831,9 +1187,25 @@ impl McpStdioProcess {
             }
         };
 
+        if kill_after {
+            // Response-wins-with-late-write-error: the answer is valid
+            // (`response` below is returned `Ok`) but stdin is poisoned,
+            // so tear the connection down and let `ensure_server_ready`
+            // respawn on the next call. Do not put the halves back.
+            let _ = self.child.kill().await;
+        } else {
+            // Success path: both halves are healthy, restore them so the
+            // struct is consistent (both-`Some`) for the next call /
+            // `shutdown`.
+            self.stdin = Some(stdin);
+            self.stdout = Some(stdout);
+        }
+
         if response.id != id {
             // Correlation mismatch: server is desynced or buggy. Treat
-            // as fatal for this connection so we respawn cleanly.
+            // as fatal for this connection so we respawn cleanly. (If
+            // `kill_after` already killed the child above, a second
+            // `kill().await` is a harmless no-op.)
             let _ = self.child.kill().await;
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -860,6 +1232,41 @@ impl McpStdioProcess {
         params: McpInitializeParams,
     ) -> io::Result<JsonRpcResponse<McpInitializeResult>> {
         self.request(id, "initialize", Some(params)).await
+    }
+
+    /// Send a fire-and-forget JSON-RPC notification (no `id`, no
+    /// response read).
+    ///
+    /// Unlike [`request`], this writes a single `Content-Length` frame
+    /// and returns immediately — it must not enter the response read
+    /// loop, because a notification frame never gets a reply. We reuse
+    /// [`write_frame`] (so the wire framing stays identical to every
+    /// other message) but build the body by hand to guarantee the `id`
+    /// field is entirely absent (an explicit `id: null` would be a
+    /// *response* shape, not a notification).
+    pub async fn notify(
+        &mut self,
+        method: &str,
+        params: Option<JsonValue>,
+    ) -> io::Result<()> {
+        let mut message = serde_json::Map::new();
+        message.insert("jsonrpc".to_string(), JsonValue::String("2.0".to_string()));
+        message.insert("method".to_string(), JsonValue::String(method.to_string()));
+        if let Some(params) = params {
+            message.insert("params".to_string(), params);
+        }
+        let body = serde_json::to_vec(&JsonValue::Object(message))
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        self.write_frame(&body).await
+    }
+
+    /// MCP spec: after a successful `initialize` round trip the client
+    /// MUST send a `notifications/initialized` notification before
+    /// issuing any further requests. Strict servers (including the
+    /// official SDK servers) reject `tools/list` until they have
+    /// received it.
+    pub async fn notify_initialized(&mut self) -> io::Result<()> {
+        self.notify("notifications/initialized", None).await
     }
 
     pub async fn list_tools(
@@ -937,6 +1344,69 @@ fn encode_frame(payload: &[u8]) -> Vec<u8> {
     framed
 }
 
+/// Read one `Content-Length`-framed message from `stdout`.
+///
+/// Factored out of `McpStdioProcess::read_frame` so the read pump in
+/// `request` (RW9 / #286) can borrow the stdout half on its own while
+/// the write task independently borrows stdin. The header parser is
+/// tolerant (v0.4.17 / M6): bare-LF separators, case-insensitive
+/// `Content-Length`, and a `MAX_CONTENT_LENGTH` cap to prevent OOM.
+async fn read_frame_from<R: AsyncBufReadExt + AsyncReadExt + Unpin>(
+    stdout: &mut R,
+) -> io::Result<Vec<u8>> {
+    let mut content_length = None;
+    loop {
+        let mut line = String::new();
+        let bytes_read = stdout.read_line(&mut line).await?;
+        if bytes_read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "MCP stdio stream closed while reading headers",
+            ));
+        }
+        // v0.4.17 (M6): the header/body separator is an empty line.
+        // Accept both CRLF (`\r\n`) and bare LF (`\n`) terminators
+        // so servers that don't strictly emit CRLF still parse.
+        // `read_line` keeps the trailing newline, so an empty line
+        // is one whose only bytes are CR/LF.
+        if line.trim_end_matches(['\r', '\n']).is_empty() {
+            break;
+        }
+        // v0.4.17 (M6): match `Content-Length` case-insensitively
+        // and tolerate leading whitespace on the header name. The
+        // LSP/MCP framing convention is canonical-cased, but real
+        // servers occasionally emit `content-length:`.
+        if let Some((key, value)) = line.split_once(':') {
+            if key.trim().eq_ignore_ascii_case("content-length") {
+                let parsed = value
+                    .trim()
+                    .parse::<usize>()
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+                // v0.4.17 (M6): cap the declared length so a
+                // malicious/buggy server can't make us allocate an
+                // unbounded buffer (`vec![0u8; len]`) and OOM the
+                // process.
+                if parsed > MAX_CONTENT_LENGTH {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "MCP frame Content-Length {parsed} exceeds maximum {MAX_CONTENT_LENGTH}"
+                        ),
+                    ));
+                }
+                content_length = Some(parsed);
+            }
+        }
+    }
+
+    let content_length = content_length.ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "missing Content-Length header")
+    })?;
+    let mut payload = vec![0_u8; content_length];
+    stdout.read_exact(&mut payload).await?;
+    Ok(payload)
+}
+
 /// Resolve the MCP request read timeout. Priority is:
 ///   1. per-server `override_secs` (from
 ///      `McpStdioServerConfig.request_timeout_secs` — v0.4.13 P1.D),
@@ -1008,8 +1478,8 @@ mod tests {
     use super::{
         mcp_request_timeout, spawn_mcp_stdio_process, JsonRpcId, JsonRpcRequest, JsonRpcResponse,
         McpInitializeClientInfo, McpInitializeParams, McpInitializeResult, McpInitializeServerInfo,
-        McpListToolsResult, McpReadResourceParams, McpReadResourceResult, McpServerManager,
-        McpServerManagerError, McpStdioProcess, McpTool, McpToolCallParams,
+        McpListToolsResult, McpManagerHandle, McpReadResourceParams, McpReadResourceResult,
+        McpServerManager, McpServerManagerError, McpStdioProcess, McpTool, McpToolCallParams,
     };
 
     fn temp_dir() -> PathBuf {
@@ -1252,6 +1722,10 @@ mod tests {
             "        break",
             "    method = request['method']",
             "    log(method)",
+            "    if 'id' not in request:",
+            "        # Notification (e.g. notifications/initialized): no",
+            "        # response is expected per JSON-RPC.",
+            "        continue",
             "    if method == 'initialize':",
             "        initialize_count += 1",
             "        send_message({",
@@ -1319,6 +1793,7 @@ mod tests {
                 args: vec![script_path.to_string_lossy().into_owned()],
                 env: BTreeMap::from([("MCP_TEST_TOKEN".to_string(), "secret-value".to_string())]),
                 request_timeout_secs: None,
+                trust: None,
             }),
         };
         McpClientBootstrap::from_scoped_config("stdio server", &config)
@@ -1356,6 +1831,7 @@ mod tests {
                     ),
                 ]),
                 request_timeout_secs: None,
+                trust: None,
             }),
         }
     }
@@ -1644,6 +2120,386 @@ mod tests {
         });
     }
 
+    // ============================================================
+    // v0.4.17 RW2 / M6 — read_frame header parser tolerance.
+    //   • bare LF (`\n`) header/body separator (no CRLF),
+    //   • case-insensitive `Content-Length` name,
+    //   • MAX_CONTENT_LENGTH guard against OOM.
+    // Each uses a tiny printf-based emitter so we control the exact
+    // bytes on the wire (the python fake servers always send canonical
+    // CRLF + canonical casing).
+    // ============================================================
+
+    /// Write a `/bin/sh` script that `printf`s `body` verbatim to
+    /// stdout (so the test fully controls the framing bytes), then
+    /// sleeps so the child stays alive for the read.
+    fn write_raw_emitter_script(body: &str) -> PathBuf {
+        let root = temp_dir();
+        fs::create_dir_all(&root).expect("temp dir");
+        let script_path = root.join("raw-frame-emitter.sh");
+        // `printf %s` emits the argument with no added trailing
+        // newline, so what we pass is exactly what hits the pipe.
+        let escaped = body.replace('\\', "\\\\").replace('\'', "'\\''");
+        let script = format!("#!/bin/sh\nprintf '%s' '{escaped}'\nsleep 30\n");
+        fs::write(&script_path, script).expect("write script");
+        make_executable(&script_path);
+        script_path
+    }
+
+    fn sh_transport(script_path: &Path) -> crate::mcp_client::McpStdioTransport {
+        crate::mcp_client::McpStdioTransport {
+            command: "/bin/sh".to_string(),
+            args: vec![script_path.to_string_lossy().into_owned()],
+            env: BTreeMap::new(),
+            request_timeout_secs: None,
+        }
+    }
+
+    #[test]
+    fn read_frame_accepts_lf_only_header_separator() {
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            // Bare LF terminators throughout — no CR anywhere.
+            let script_path = write_raw_emitter_script("Content-Length: 7\n\npayload");
+            let transport = sh_transport(&script_path);
+            let mut process = McpStdioProcess::spawn(&transport).expect("spawn lf-only emitter");
+
+            let frame = process.read_frame().await.expect("read lf-only frame");
+            assert_eq!(frame, b"payload");
+
+            process.terminate().await.expect("terminate child");
+            let _ = process.wait().await;
+            cleanup_script(&script_path);
+        });
+    }
+
+    #[test]
+    fn read_frame_accepts_lowercase_content_length_header() {
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            // Lowercased header name + canonical CRLF framing.
+            let script_path = write_raw_emitter_script("content-length: 5\r\n\r\nhello");
+            let transport = sh_transport(&script_path);
+            let mut process =
+                McpStdioProcess::spawn(&transport).expect("spawn lowercase-header emitter");
+
+            let frame = process.read_frame().await.expect("read lowercase-header frame");
+            assert_eq!(frame, b"hello");
+
+            process.terminate().await.expect("terminate child");
+            let _ = process.wait().await;
+            cleanup_script(&script_path);
+        });
+    }
+
+    #[test]
+    fn read_frame_accepts_leading_whitespace_header_name() {
+        // R5-P2.3: the parser trims the header *name* before the
+        // case-insensitive compare (`key.trim()` in `read_frame_from`),
+        // so a leading space on the `Content-Length` header name must
+        // still parse. Regression guard for that trim.
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            // One leading space before the header name; canonical CRLF.
+            let script_path = write_raw_emitter_script(" Content-Length: 5\r\n\r\nhowdy");
+            let transport = sh_transport(&script_path);
+            let mut process =
+                McpStdioProcess::spawn(&transport).expect("spawn leading-space-header emitter");
+
+            let frame = process
+                .read_frame()
+                .await
+                .expect("read leading-space-header frame");
+            assert_eq!(frame, b"howdy");
+
+            process.terminate().await.expect("terminate child");
+            let _ = process.wait().await;
+            cleanup_script(&script_path);
+        });
+    }
+
+    #[test]
+    fn read_frame_rejects_oversized_content_length() {
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            // Declare a length far beyond MAX_CONTENT_LENGTH. The
+            // parser must reject during header parsing, before it ever
+            // tries to allocate `vec![0u8; len]`. No body bytes are
+            // sent.
+            let huge = super::MAX_CONTENT_LENGTH + 1;
+            let script_path = write_raw_emitter_script(&format!("Content-Length: {huge}\r\n\r\n"));
+            let transport = sh_transport(&script_path);
+            let mut process =
+                McpStdioProcess::spawn(&transport).expect("spawn oversized emitter");
+
+            let err = process
+                .read_frame()
+                .await
+                .expect_err("oversized Content-Length should be rejected");
+            assert_eq!(err.kind(), ErrorKind::InvalidData);
+            assert!(
+                err.to_string().contains("exceeds maximum"),
+                "unexpected error: {err}"
+            );
+
+            process.terminate().await.expect("terminate child");
+            let _ = process.wait().await;
+            cleanup_script(&script_path);
+        });
+    }
+
+    // ============================================================
+    // v0.4.17 RW9 / #286 — large-payload pipe-buffer deadlock.
+    //
+    // The server writes a large (> OS pipe buffer) framed response to
+    // stdout BEFORE it reads the request from stdin, while the client
+    // sends a large request body. Under the old serial model
+    // (write-all-then-read) both pipes back-pressure into a hang and
+    // the call only survives by tripping the timeout. The concurrent
+    // join model drains stdout while still feeding stdin, so the round
+    // trip completes well under the timeout.
+    // ============================================================
+
+    /// MCP server that (1) emits one large framed response with a
+    /// hard-coded `id` (matching the test's request id) BEFORE reading
+    /// anything, then (2) drains stdin so the client's large write can
+    /// finally complete. The response is padded past the pipe buffer
+    /// via an extra ignored field so it deserialises cleanly into
+    /// `McpInitializeResult` (unknown fields are dropped).
+    // The response pad size is passed to the spawned server via the
+    // `RESPONSE_PAD_BYTES` env (see the caller), so the script source
+    // itself stays parameter-free.
+    fn write_write_before_read_script() -> PathBuf {
+        let root = temp_dir();
+        fs::create_dir_all(&root).expect("temp dir");
+        let script_path = root.join("write-before-read-mcp.py");
+        let script = [
+            "#!/usr/bin/env python3",
+            "import json, os, sys",
+            "pad = 'x' * int(os.environ.get('RESPONSE_PAD_BYTES', '0'))",
+            "response = {",
+            "    'jsonrpc': '2.0',",
+            "    'id': 7,",
+            "    'result': {",
+            "        'protocolVersion': '2025-03-26',",
+            "        'capabilities': {},",
+            "        'serverInfo': {'name': 'write-before-read', 'version': '0.1.0'},",
+            "        '_pad': pad,",
+            "    },",
+            "}",
+            "encoded = json.dumps(response).encode()",
+            r"sys.stdout.buffer.write(f'Content-Length: {len(encoded)}\r\n\r\n'.encode() + encoded)",
+            "sys.stdout.buffer.flush()",
+            "# Only now drain stdin so the client's (large) write can",
+            "# finish. A serial client never reaches its read until its",
+            "# write completes, so it deadlocks against our stdout above.",
+            "header = b''",
+            r"while not header.endswith(b'\r\n\r\n'):",
+            "    chunk = sys.stdin.buffer.read(1)",
+            "    if not chunk:",
+            "        raise SystemExit(0)",
+            "    header += chunk",
+            "length = 0",
+            r"for line in header.decode().split('\r\n'):",
+            r"    if line.lower().startswith('content-length:'):",
+            r"        length = int(line.split(':', 1)[1].strip())",
+            "sys.stdin.buffer.read(length)",
+            "import time; time.sleep(30)",
+            "",
+        ]
+        .join("\n");
+        fs::write(&script_path, script).expect("write script");
+        make_executable(&script_path);
+        script_path
+    }
+
+    #[test]
+    fn request_survives_large_payload_pipe_deadlock() {
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        // Keep the deadline tight so an accidental regression (serial
+        // re-introduction) FAILS fast rather than hanging the suite for
+        // the 300s default.
+        let guard = env_lock().lock().expect("env lock");
+        let prior = std::env::var("MCP_REQUEST_TIMEOUT_SECS").ok();
+        std::env::set_var("MCP_REQUEST_TIMEOUT_SECS", "10");
+
+        runtime.block_on(async {
+            // 256 KiB on both sides comfortably exceeds the 64 KiB
+            // default pipe buffer on Linux and macOS.
+            let pad = 256 * 1024;
+            let script_path = write_write_before_read_script();
+            let mut transport = script_transport(&script_path);
+            transport
+                .env
+                .insert("RESPONSE_PAD_BYTES".to_string(), pad.to_string());
+            let mut process =
+                McpStdioProcess::spawn(&transport).expect("spawn write-before-read server");
+
+            // Large request body so the WRITE side also exceeds the
+            // pipe buffer — the second half of the deadlock.
+            let big = "y".repeat(pad);
+            let started = std::time::Instant::now();
+            let response = process
+                .initialize(
+                    JsonRpcId::Number(7),
+                    McpInitializeParams {
+                        protocol_version: "2025-03-26".to_string(),
+                        capabilities: json!({ "filler": big }),
+                        client_info: McpInitializeClientInfo {
+                            name: "runtime-tests".to_string(),
+                            version: "0.1.0".to_string(),
+                        },
+                    },
+                )
+                .await
+                .expect("concurrent write+read should complete, not deadlock");
+            let elapsed = started.elapsed();
+
+            assert_eq!(response.id, JsonRpcId::Number(7));
+            let result = response.result.expect("response result");
+            assert_eq!(result.server_info.name, "write-before-read");
+            // Must finish far under the 10s ceiling; a deadlock would
+            // only resolve at the timeout.
+            assert!(
+                elapsed < std::time::Duration::from_secs(8),
+                "round trip took too long ({elapsed:?}); serial deadlock likely re-introduced"
+            );
+
+            let _ = process.terminate().await;
+            let _ = process.wait().await;
+            cleanup_script(&script_path);
+        });
+
+        match prior {
+            Some(value) => std::env::set_var("MCP_REQUEST_TIMEOUT_SECS", value),
+            None => std::env::remove_var("MCP_REQUEST_TIMEOUT_SECS"),
+        }
+        drop(guard);
+    }
+
+    // ============================================================
+    // v0.4.17 Track R / R5-P1 — write-fails-first short-circuit.
+    //
+    // If the server closes the read end of OUR stdin (so our write
+    // half breaks) but keeps its stdout open and silent, `request()`
+    // must return the WRITE error immediately — it must NOT block the
+    // read pump until the global timeout. The original `tokio::join!`
+    // implementation waited for both arms, so it only unwedged at the
+    // deadline; the `select!` state machine surfaces the write error at
+    // once. We prove "fast path, not timeout path" by configuring a
+    // large per-server timeout and asserting the call returns far
+    // sooner.
+    // ============================================================
+
+    /// MCP server that closes its own stdin read end (`os.close(0)`)
+    /// at startup, then keeps stdout open but never writes, sleeping
+    /// long. With the read end gone, the client's write to stdin breaks
+    /// (EPIPE), while the read pump would otherwise wait forever for a
+    /// frame that never arrives.
+    fn write_close_stdin_script() -> PathBuf {
+        let root = temp_dir();
+        fs::create_dir_all(&root).expect("temp dir");
+        let script_path = root.join("close-stdin-mcp.py");
+        let script = [
+            "#!/usr/bin/env python3",
+            "import os, sys, time",
+            "# Close the read end of our stdin so any client write to",
+            "# the corresponding pipe write end fails with EPIPE.",
+            "os.close(0)",
+            "# Keep stdout open but silent (never emit a frame) and stay",
+            "# alive well past the test's assertion window, so the only",
+            "# way the client can return quickly is the write-error",
+            "# short-circuit (NOT the global timeout).",
+            "time.sleep(120)",
+            "",
+        ]
+        .join("\n");
+        fs::write(&script_path, script).expect("write script");
+        make_executable(&script_path);
+        script_path
+    }
+
+    #[test]
+    fn request_returns_write_error_without_waiting_for_timeout() {
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        // Large per-server ceiling: if the call ever returns via the
+        // timeout path it would take ~30s, so a sub-5s return proves
+        // the write-error short-circuit fired instead.
+        let guard = env_lock().lock().expect("env lock");
+        let prior = std::env::var("MCP_REQUEST_TIMEOUT_SECS").ok();
+        std::env::set_var("MCP_REQUEST_TIMEOUT_SECS", "30");
+
+        runtime.block_on(async {
+            let script_path = write_close_stdin_script();
+            let transport = script_transport(&script_path);
+            let mut process =
+                McpStdioProcess::spawn(&transport).expect("spawn close-stdin server");
+
+            // A large body so even if the very first bytes slip into a
+            // not-yet-collapsed pipe buffer, subsequent writes hit the
+            // closed read end deterministically.
+            let big = "z".repeat(256 * 1024);
+            let started = std::time::Instant::now();
+            let err = process
+                .initialize(
+                    JsonRpcId::Number(1),
+                    McpInitializeParams {
+                        protocol_version: "2025-03-26".to_string(),
+                        capabilities: json!({ "filler": big }),
+                        client_info: McpInitializeClientInfo {
+                            name: "runtime-tests".to_string(),
+                            version: "0.1.0".to_string(),
+                        },
+                    },
+                )
+                .await
+                .expect_err("write to a closed stdin must error");
+            let elapsed = started.elapsed();
+
+            // The error must be a write/IO failure (broken pipe), NOT a
+            // timeout — that is the whole point of the short-circuit.
+            assert_ne!(
+                err.kind(),
+                ErrorKind::TimedOut,
+                "expected an immediate write error, got a timeout: {err}"
+            );
+            assert!(
+                elapsed < std::time::Duration::from_secs(5),
+                "write error returned too slowly ({elapsed:?}); \
+                 the read pump likely blocked until the timeout instead \
+                 of short-circuiting on the write failure"
+            );
+
+            // `request()` killed the child on the I/O failure; reap it.
+            let _ = process.wait().await;
+            cleanup_script(&script_path);
+        });
+
+        match prior {
+            Some(value) => std::env::set_var("MCP_REQUEST_TIMEOUT_SECS", value),
+            None => std::env::remove_var("MCP_REQUEST_TIMEOUT_SECS"),
+        }
+        drop(guard);
+    }
+
     #[test]
     fn manager_discovers_tools_from_stdio_config() {
         let runtime = Builder::new_current_thread()
@@ -1842,9 +2698,77 @@ mod tests {
 
             let log = fs::read_to_string(&log_path).expect("read log");
             assert_eq!(log.lines().filter(|line| *line == "initialize").count(), 1);
+            // RW1 (v0.4.17): after `initialize` succeeds the manager
+            // now sends the spec-mandated `notifications/initialized`
+            // notification before `tools/list`. The fake server logs
+            // every received method, so it shows up in the trace.
             assert_eq!(
                 log.lines().collect::<Vec<_>>(),
-                vec!["initialize", "tools/list", "tools/call"]
+                vec![
+                    "initialize",
+                    "notifications/initialized",
+                    "tools/list",
+                    "tools/call"
+                ]
+            );
+
+            manager.shutdown().await.expect("shutdown");
+            cleanup_script(&script_path);
+        });
+    }
+
+    // ============================================================
+    // v0.4.17 RW1 — initialize handshake completion notification.
+    // ============================================================
+
+    #[test]
+    fn manager_sends_initialized_notification_after_initialize() {
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let script_path = write_manager_mcp_server_script();
+            let root = script_path.parent().expect("script parent");
+            let log_path = root.join("alpha.log");
+            let servers = BTreeMap::from([(
+                "alpha".to_string(),
+                manager_server_config(&script_path, "alpha", &log_path),
+            )]);
+            let mut manager = McpServerManager::from_servers(&servers);
+
+            // Discovery drives `ensure_server_ready`, which performs
+            // initialize and (RW1) the mandated
+            // `notifications/initialized` before `tools/list`.
+            manager.discover_tools().await.expect("discover tools");
+
+            let log = fs::read_to_string(&log_path).expect("read log");
+            let methods = log.lines().collect::<Vec<_>>();
+            // The notification must land *after* the initialize reply
+            // and *before* tools/list.
+            let init_idx = methods
+                .iter()
+                .position(|m| *m == "initialize")
+                .expect("initialize logged");
+            let notify_idx = methods
+                .iter()
+                .position(|m| *m == "notifications/initialized")
+                .expect("notifications/initialized logged");
+            let list_idx = methods
+                .iter()
+                .position(|m| *m == "tools/list")
+                .expect("tools/list logged");
+            assert!(
+                init_idx < notify_idx && notify_idx < list_idx,
+                "expected initialize < notifications/initialized < tools/list, got {methods:?}"
+            );
+            // Exactly one initialized notification per initialize.
+            assert_eq!(
+                methods
+                    .iter()
+                    .filter(|m| **m == "notifications/initialized")
+                    .count(),
+                1
             );
 
             manager.shutdown().await.expect("shutdown");
@@ -1972,6 +2896,10 @@ mod tests {
             "        break",
             "    method = request['method']",
             "    log(method)",
+            "    if 'id' not in request:",
+            "        # Notification (e.g. notifications/initialized): no",
+            "        # response is expected per JSON-RPC.",
+            "        continue",
             "    if method == 'initialize':",
             "        send_message({",
             "            'jsonrpc': '2.0',",
@@ -2024,6 +2952,7 @@ mod tests {
                     log_path.to_string_lossy().into_owned(),
                 )]),
                 request_timeout_secs: None,
+                trust: None,
             }),
         }
     }
@@ -2156,6 +3085,150 @@ mod tests {
             manager.shutdown().await.expect("shutdown");
             cleanup_script(&script_path);
         });
+    }
+
+    // ============================================================
+    // v0.4.17 RW6 — per-server discovery degradation.
+    // A broken server must NOT take down the whole catalogue; the
+    // healthy server's tools are still returned and the failure is
+    // recorded in `discovery_failures`.
+    // ============================================================
+
+    /// MCP server that exits immediately without responding, so the
+    /// client's initialize round trip fails fast (broken pipe / EOF)
+    /// rather than timing out.
+    fn write_immediate_exit_script() -> PathBuf {
+        let root = temp_dir();
+        fs::create_dir_all(&root).expect("temp dir");
+        let script_path = root.join("immediate-exit-mcp.py");
+        let script = [
+            "#!/usr/bin/env python3",
+            "import sys",
+            "# Emit a noisy stderr line (sent to Stdio::null() by the RW6",
+            "# default; R5-P2.2) then exit without ever answering",
+            "# initialize.",
+            "sys.stderr.write('boom: server refuses to start\\n')",
+            "sys.stderr.flush()",
+            "raise SystemExit(1)",
+            "",
+        ]
+        .join("\n");
+        fs::write(&script_path, script).expect("write script");
+        make_executable(&script_path);
+        script_path
+    }
+
+    #[test]
+    fn discover_tools_skips_failed_server_and_keeps_healthy_one() {
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let healthy_script = write_manager_mcp_server_script();
+            let root = healthy_script.parent().expect("script parent");
+            let healthy_log = root.join("healthy.log");
+            let broken_script = write_immediate_exit_script();
+
+            let servers = BTreeMap::from([
+                (
+                    "healthy".to_string(),
+                    manager_server_config(&healthy_script, "healthy", &healthy_log),
+                ),
+                (
+                    "broken".to_string(),
+                    ScopedMcpServerConfig {
+                        scope: ConfigSource::Local,
+                        config: McpServerConfig::Stdio(McpStdioServerConfig {
+                            command: "python3".to_string(),
+                            args: vec![broken_script.to_string_lossy().into_owned()],
+                            env: BTreeMap::new(),
+                            request_timeout_secs: Some(2),
+                            trust: None,
+                        }),
+                    },
+                ),
+            ]);
+            let mut manager = McpServerManager::from_servers(&servers);
+
+            let tools = manager
+                .discover_tools()
+                .await
+                .expect("discovery must succeed despite one broken server");
+
+            // Healthy server's tool survives.
+            assert_eq!(tools.len(), 1);
+            assert_eq!(tools[0].server_name, "healthy");
+            assert_eq!(tools[0].raw_name, "echo");
+
+            // Broken server is recorded as a failure, not silently lost.
+            let failures = manager.discovery_failures();
+            assert_eq!(failures.len(), 1);
+            assert_eq!(failures[0].server_name, "broken");
+            assert!(
+                !failures[0].reason.is_empty(),
+                "failure reason should be populated"
+            );
+
+            // The healthy server is still routable after the partial
+            // failure.
+            let call = manager
+                .call_tool(&mcp_tool_name("healthy", "echo"), Some(json!({"text": "ok"})))
+                .await
+                .expect("healthy server still routable");
+            assert!(call.result.is_some());
+
+            manager.shutdown().await.expect("shutdown");
+            cleanup_script(&healthy_script);
+            let _ = fs::remove_file(&broken_script);
+        });
+    }
+
+    // ============================================================
+    // v0.4.17 R-6 / T4 — synchronous McpManagerHandle façade.
+    // Drives discover + call from a *plain synchronous* test body (no
+    // surrounding tokio runtime), which is exactly the topology Track C
+    // (CliToolExecutor::execute, a sync trait method) will use. The
+    // SPIKE-A debug_assert holds because there is no ambient runtime
+    // here; we deliberately don't test the panic path (documented as a
+    // dev-time guard only).
+    // ============================================================
+
+    #[test]
+    fn sync_handle_discovers_and_calls_tools_without_ambient_runtime() {
+        // NOTE: intentionally NOT wrapped in `runtime.block_on(...)`.
+        let script_path = write_manager_mcp_server_script();
+        let root = script_path.parent().expect("script parent");
+        let log_path = root.join("alpha.log");
+        let servers = BTreeMap::from([(
+            "alpha".to_string(),
+            manager_server_config(&script_path, "alpha", &log_path),
+        )]);
+        let manager = McpServerManager::from_servers(&servers);
+        let mut handle = McpManagerHandle::from_manager(manager).expect("build sync handle");
+
+        // Sync discovery via the handle's own internal runtime.
+        let tools = handle.discover_tools().expect("sync discover");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].qualified_name, mcp_tool_name("alpha", "echo"));
+        assert!(handle.discovery_failures().is_empty());
+        assert!(handle.unsupported_servers().is_empty());
+
+        // Sync tool call via the handle.
+        let response = handle
+            .call_tool(&mcp_tool_name("alpha", "echo"), Some(json!({"text": "sync"})))
+            .expect("sync call");
+        assert_eq!(
+            response
+                .result
+                .as_ref()
+                .and_then(|result| result.structured_content.as_ref())
+                .and_then(|value| value.get("echoed")),
+            Some(&json!("sync"))
+        );
+
+        handle.shutdown().expect("sync shutdown");
+        cleanup_script(&script_path);
     }
 
     #[test]
