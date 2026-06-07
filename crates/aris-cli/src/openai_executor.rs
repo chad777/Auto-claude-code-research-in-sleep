@@ -11,7 +11,7 @@ use runtime::{
     RuntimeError, TokenUsage,
 };
 use serde_json::{json, Value};
-use tools::ToolSpec;
+use tools::{RuntimeToolSpec, ToolSpec};
 
 use crate::{filter_tool_specs, format_tool_call_start, AllowedToolSet};
 
@@ -391,6 +391,11 @@ pub struct OpenAIRuntimeClient {
     enable_tools: bool,
     emit_output: bool,
     allowed_tools: Option<AllowedToolSet>,
+    /// v0.4.17 (RW5): MCP tools to advertise in addition to the static
+    /// catalogue. Empty when no MCP servers are configured (no-MCP path is
+    /// byte-for-byte identical to pre-v0.4.17). Mirrors the Anthropic path so
+    /// OpenAI-family main sessions also see MCP tools.
+    mcp_specs: Vec<RuntimeToolSpec>,
     /// Kimi K2.5: stores reasoning_content per assistant turn for replay.
     /// Key = message index in session, Value = reasoning text.
     kimi_reasoning_cache: std::collections::HashMap<usize, String>,
@@ -403,6 +408,7 @@ impl OpenAIRuntimeClient {
         enable_tools: bool,
         emit_output: bool,
         allowed_tools: Option<AllowedToolSet>,
+        mcp_specs: Vec<RuntimeToolSpec>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         Ok(Self {
             runtime: tokio::runtime::Runtime::new()?,
@@ -415,6 +421,7 @@ impl OpenAIRuntimeClient {
             enable_tools,
             emit_output,
             allowed_tools,
+            mcp_specs,
             kimi_reasoning_cache: std::collections::HashMap::new(),
         })
     }
@@ -455,11 +462,21 @@ impl ApiClient for OpenAIRuntimeClient {
         );
 
         let tools: Option<Value> = self.enable_tools.then(|| {
+            // v0.4.17 (RW5): static catalogue (byte-identical to pre-v0.4.17 —
+            // same `convert_tool_spec_openai` over the same filtered specs)
+            // followed by the cached MCP specs. When `mcp_specs` is empty (no
+            // MCP servers) this is exactly the pre-v0.4.17 tools array.
             let specs = filter_tool_specs(self.allowed_tools.as_ref());
-            json!(specs
+            let mut converted: Vec<Value> = specs
                 .into_iter()
                 .map(|spec| convert_tool_spec_openai(&spec))
-                .collect::<Vec<_>>())
+                .collect();
+            converted.extend(
+                self.mcp_specs
+                    .iter()
+                    .map(convert_runtime_tool_spec_openai),
+            );
+            json!(converted)
         });
 
         let mut body = json!({
@@ -1189,6 +1206,21 @@ fn convert_messages_openai(
 }
 
 fn convert_tool_spec_openai(spec: &ToolSpec) -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": spec.name,
+            "description": spec.description,
+            "parameters": spec.input_schema,
+        }
+    })
+}
+
+/// v0.4.17 (RW5): `OpenAI` tool-spec JSON for a runtime (MCP) spec. Produces
+/// the exact same `{type, function:{name, description, parameters}}` shape as
+/// `convert_tool_spec_openai` so MCP tools are advertised identically to static
+/// ones.
+fn convert_runtime_tool_spec_openai(spec: &RuntimeToolSpec) -> Value {
     json!({
         "type": "function",
         "function": {

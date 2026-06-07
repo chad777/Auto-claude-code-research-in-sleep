@@ -22,6 +22,7 @@ pub(crate) fn env_test_guard() -> std::sync::MutexGuard<'static, ()> {
     ENV_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner())
 }
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
@@ -29,6 +30,7 @@ use std::io::{self, Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use api::{
@@ -52,7 +54,7 @@ use runtime::{
     Session, TokenUsage, ToolError, ToolExecutor, UsageTracker,
 };
 use serde_json::json;
-use tools::{execute_tool, mvp_tool_specs, ToolSpec};
+use tools::{execute_tool, mcp_tool_specs, mvp_tool_specs, McpToolCatalog, RuntimeToolSpec, ToolSpec};
 
 const DEFAULT_MODEL: &str = "claude-opus-4-7";
 fn max_tokens_for_model(model: &str) -> u32 {
@@ -1249,6 +1251,11 @@ struct LiveCli {
     session: SessionHandle,
     /// Plan mode state: stores original permissions/tools before entering plan mode.
     plan_mode: Option<PlanModeState>,
+    /// v0.4.17 (T4/RW5): shared MCP runtime (handle + discovered tool catalog),
+    /// reused across every `build_runtime` rebuild (plan-mode switches) so MCP
+    /// servers are spawned/discovered exactly once. `None` when no `mcpServers`
+    /// are configured.
+    mcp: Option<SharedMcpRuntime>,
 }
 
 #[derive(Debug, Clone)]
@@ -1266,6 +1273,9 @@ impl LiveCli {
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let system_prompt = build_system_prompt(Some(&model))?;
         let session = create_managed_session_handle()?;
+        // v0.4.17 (RW5): eager MCP discovery once at startup. None when no
+        // mcpServers are configured (no-MCP path unchanged).
+        let mcp = build_shared_mcp_runtime();
         let runtime = build_runtime(
             Session::new(),
             model.clone(),
@@ -1274,6 +1284,7 @@ impl LiveCli {
             true,
             allowed_tools.clone(),
             permission_mode,
+            mcp.clone(),
         )?;
         // Determine default reviewer model. saved_config.apply_to_env() runs
         // BEFORE this point in run(), so when a user has persisted
@@ -1315,6 +1326,7 @@ impl LiveCli {
             runtime,
             session,
             plan_mode: None,
+            mcp,
         };
         cli.persist_session()?;
         Ok(cli)
@@ -1568,6 +1580,7 @@ impl LiveCli {
             false,
             self.allowed_tools.clone(),
             self.permission_mode,
+            self.mcp.clone(),
         )?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
         let summary = runtime.run_turn(input, Some(&mut permission_prompter))?;
@@ -1856,6 +1869,7 @@ impl LiveCli {
             true,
             self.allowed_tools.clone(),
             self.permission_mode,
+            self.mcp.clone(),
         )?;
         self.system_prompt = new_system_prompt;
         self.model.clone_from(&model);
@@ -2025,6 +2039,7 @@ impl LiveCli {
                     true,
                     self.allowed_tools.clone(),
                     self.permission_mode,
+                    self.mcp.clone(),
                 )?;
                 self.system_prompt = new_system_prompt;
                 self.model.clone_from(&new_model);
@@ -2269,6 +2284,7 @@ impl LiveCli {
             true,
             self.allowed_tools.clone(),
             self.permission_mode,
+            self.mcp.clone(),
         )?;
         println!(
             "{}",
@@ -2294,6 +2310,7 @@ impl LiveCli {
             true,
             self.allowed_tools.clone(),
             self.permission_mode,
+            self.mcp.clone(),
         )?;
         println!(
             "Session cleared\n  Mode             fresh session\n  Preserved model  {}\n  Permission mode  {}\n  Session          {}",
@@ -2329,6 +2346,7 @@ impl LiveCli {
             true,
             self.allowed_tools.clone(),
             self.permission_mode,
+            self.mcp.clone(),
         )?;
         self.session = handle;
         println!(
@@ -2401,6 +2419,7 @@ impl LiveCli {
                     true,
                     self.allowed_tools.clone(),
                     self.permission_mode,
+                    self.mcp.clone(),
                 )?;
                 self.session = handle;
                 println!(
@@ -2440,6 +2459,7 @@ impl LiveCli {
                     true,
                     state.previous_allowed_tools.clone(),
                     state.previous_permission_mode,
+                    self.mcp.clone(),
                 ) {
                     Ok(rt) => rt,
                     Err(e) => {
@@ -2477,6 +2497,7 @@ impl LiveCli {
                         true,
                         state.previous_allowed_tools.clone(),
                         state.previous_permission_mode,
+                        self.mcp.clone(),
                     ) {
                         Ok(rt) => rt,
                         Err(e) => {
@@ -2532,6 +2553,7 @@ impl LiveCli {
                     true,
                     Some(plan_tools.clone()),
                     PermissionMode::ReadOnly,
+                    self.mcp.clone(),
                 ) {
                     Ok(rt) => rt,
                     Err(e) => {
@@ -2622,6 +2644,7 @@ impl LiveCli {
             true,
             self.allowed_tools.clone(),
             self.permission_mode,
+            self.mcp.clone(),
         )?;
         self.persist_session()?;
         println!("{}", format_compact_report(removed, kept, skipped));
@@ -2642,6 +2665,7 @@ impl LiveCli {
             false,
             self.allowed_tools.clone(),
             self.permission_mode,
+            self.mcp.clone(),
         )?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
         let summary = runtime.run_turn(prompt, Some(&mut permission_prompter))?;
@@ -3943,6 +3967,98 @@ fn build_runtime_feature_config(
     }
 }
 
+/// v0.4.17 (T4/RW5): the long-lived MCP state shared across the REPL.
+///
+/// Holds the sync [`runtime::McpManagerHandle`] (which owns the spawned MCP
+/// server child processes and their dedicated `current_thread` tokio runtime)
+/// plus the [`McpToolCatalog`] cached from the single startup `discover_tools`
+/// pass. Both the advertising path (the executors, which append the catalog's
+/// specs to the static catalogue) and the dispatch path (the
+/// [`CliToolExecutor`], which routes `mcp__` names back through the handle) read
+/// from this one instance.
+///
+/// It is held behind `Rc<RefCell<_>>` by [`LiveCli`] so the spawned servers
+/// survive `build_runtime` rebuilds (plan-mode enter/exit/execute rebuild the
+/// whole `ConversationRuntime`; reusing this handle avoids re-spawning and
+/// re-`initialize`-ing every server on each switch — SPIKE-A §3.2). Single
+/// threaded REPL ⇒ `Rc<RefCell>` suffices; no `Arc<Mutex>` / `Send` needed.
+struct McpRuntime {
+    handle: runtime::McpManagerHandle,
+    catalog: McpToolCatalog,
+}
+
+type SharedMcpRuntime = Rc<RefCell<McpRuntime>>;
+
+impl McpRuntime {
+    /// Eager startup discovery (RW5). Builds the sync handle from the runtime
+    /// config, runs one `discover_tools` pass, and caches the resulting
+    /// advertisable catalog. Per-server discovery failures are non-fatal
+    /// (already surfaced by the manager via `discovery_failures` + a stderr
+    /// line); only a hard handle/runtime construction error returns `Err`.
+    ///
+    /// MUST be called from outside any tokio runtime context (the handle's
+    /// internal `block_on` would panic otherwise) — the CLI's `fn main` is not
+    /// `#[tokio::main]`, so this holds (SPIKE-A).
+    fn discover(config: &runtime::RuntimeConfig) -> io::Result<Self> {
+        // RW5: surface (but do not truncate) catalogues large enough to crowd a
+        // provider's tool array / token budget. Deferred advertising is a
+        // v0.5.0 item; for now we just warn.
+        const MCP_TOOL_WARN_THRESHOLD: usize = 40;
+
+        let mut handle = runtime::McpManagerHandle::from_runtime_config(config)?;
+        let managed = handle.discover_tools().unwrap_or_else(|error| {
+            eprintln!("aris mcp: tool discovery failed, continuing without MCP tools: {error}");
+            Vec::new()
+        });
+        let catalog = mcp_tool_specs(&managed);
+
+        if catalog.len() > MCP_TOOL_WARN_THRESHOLD {
+            eprintln!(
+                "aris mcp: {} MCP tools discovered (>{}); this may crowd the provider tool list",
+                catalog.len(),
+                MCP_TOOL_WARN_THRESHOLD
+            );
+        }
+
+        Ok(Self { handle, catalog })
+    }
+
+    /// The advertisable MCP specs (cloned) for appending onto a provider's
+    /// static tool catalogue.
+    fn advertised_specs(&self) -> Vec<RuntimeToolSpec> {
+        self.catalog.specs().to_vec()
+    }
+}
+
+/// v0.4.17 (RW5): build the shared MCP runtime if (and only if) the config
+/// declares MCP servers. Returns `None` when no servers are configured so that
+/// every downstream path is byte-for-byte identical to the pre-MCP behavior
+/// (no handle, no extra advertised tools, no dispatch branch taken).
+fn build_shared_mcp_runtime() -> Option<SharedMcpRuntime> {
+    let cwd = env::current_dir().ok()?;
+    let config = ConfigLoader::default_for(&cwd).load().ok()?;
+    if config.mcp().servers().is_empty() {
+        return None;
+    }
+    match McpRuntime::discover(&config) {
+        Ok(mcp) => Some(Rc::new(RefCell::new(mcp))),
+        Err(error) => {
+            eprintln!(
+                "aris mcp: could not initialize MCP runtime, continuing without MCP tools: {error}"
+            );
+            None
+        }
+    }
+}
+
+/// Snapshot of the advertised MCP specs to hand to a freshly built executor.
+/// Empty when there is no MCP runtime (preserving the no-MCP byte-equivalence).
+fn advertised_mcp_specs(mcp: Option<&SharedMcpRuntime>) -> Vec<RuntimeToolSpec> {
+    mcp.map(|m| m.borrow().advertised_specs())
+        .unwrap_or_default()
+}
+
+#[allow(clippy::too_many_arguments)]
 fn build_runtime(
     session: Session,
     model: String,
@@ -3951,7 +4067,9 @@ fn build_runtime(
     emit_output: bool,
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
+    mcp: Option<SharedMcpRuntime>,
 ) -> Result<ConversationRuntime<ExecutorClient, CliToolExecutor>, Box<dyn std::error::Error>> {
+    let mcp_specs = advertised_mcp_specs(mcp.as_ref());
     let executor: ExecutorClient =
         if let Some(config) = openai_executor::resolve_openai_executor_config() {
             ExecutorClient::OpenAI(openai_executor::OpenAIRuntimeClient::new(
@@ -3960,6 +4078,7 @@ fn build_runtime(
                 enable_tools,
                 emit_output,
                 allowed_tools.clone(),
+                mcp_specs.clone(),
             )?)
         } else {
             ExecutorClient::Anthropic(AnthropicRuntimeClient::new(
@@ -3967,6 +4086,7 @@ fn build_runtime(
                 enable_tools,
                 emit_output,
                 allowed_tools.clone(),
+                mcp_specs,
             )?)
         };
 
@@ -3975,7 +4095,7 @@ fn build_runtime(
     Ok(ConversationRuntime::new_with_features(
         session,
         executor,
-        CliToolExecutor::new(allowed_tools, emit_output),
+        CliToolExecutor::new(allowed_tools, emit_output, mcp),
         permission_policy(permission_mode),
         system_prompt,
         feature_config,
@@ -4078,6 +4198,10 @@ struct AnthropicRuntimeClient {
     enable_tools: bool,
     emit_output: bool,
     allowed_tools: Option<AllowedToolSet>,
+    /// v0.4.17 (RW5): MCP tools to advertise in addition to the static
+    /// catalogue. Empty when no MCP servers are configured (no-MCP path is
+    /// byte-for-byte identical to pre-v0.4.17).
+    mcp_specs: Vec<RuntimeToolSpec>,
 }
 
 impl AnthropicRuntimeClient {
@@ -4086,6 +4210,7 @@ impl AnthropicRuntimeClient {
         enable_tools: bool,
         emit_output: bool,
         allowed_tools: Option<AllowedToolSet>,
+        mcp_specs: Vec<RuntimeToolSpec>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         Ok(Self {
             runtime: tokio::runtime::Runtime::new()?,
@@ -4096,6 +4221,7 @@ impl AnthropicRuntimeClient {
             enable_tools,
             emit_output,
             allowed_tools,
+            mcp_specs,
         })
     }
 }
@@ -4136,11 +4262,17 @@ impl ApiClient for AnthropicRuntimeClient {
                 }]))
             },
             tools: self.enable_tools.then(|| {
+                // v0.4.17 (T1/RW5): static catalogue (via RuntimeToolSpec —
+                // byte-identical to the old inline construction) followed by
+                // the cached MCP specs. When `mcp_specs` is empty (no MCP
+                // servers) this is exactly the pre-v0.4.17 payload.
                 filter_tool_specs(self.allowed_tools.as_ref())
-                    .into_iter()
+                    .iter()
+                    .map(RuntimeToolSpec::from)
+                    .chain(self.mcp_specs.iter().cloned())
                     .map(|spec| ToolDefinition {
-                        name: spec.name.to_string(),
-                        description: Some(spec.description.to_string()),
+                        name: spec.name,
+                        description: Some(spec.description),
                         input_schema: spec.input_schema,
                     })
                     .collect()
@@ -4873,16 +5005,103 @@ struct CliToolExecutor {
     renderer: TerminalRenderer,
     emit_output: bool,
     allowed_tools: Option<AllowedToolSet>,
+    /// v0.4.17 (T4/T3): shared MCP runtime for dispatching `mcp__`-prefixed
+    /// tool calls. `None` when no MCP servers are configured, in which case
+    /// an `mcp__` name falls through to `execute_tool` and gets the usual
+    /// `unsupported tool` error (preserving pre-v0.4.17 behavior).
+    mcp: Option<SharedMcpRuntime>,
 }
 
 impl CliToolExecutor {
-    fn new(allowed_tools: Option<AllowedToolSet>, emit_output: bool) -> Self {
+    fn new(
+        allowed_tools: Option<AllowedToolSet>,
+        emit_output: bool,
+        mcp: Option<SharedMcpRuntime>,
+    ) -> Self {
         Self {
             renderer: TerminalRenderer::new(),
             emit_output,
             allowed_tools,
+            mcp,
         }
     }
+
+    /// v0.4.17 (T3): dispatch a single `mcp__`-prefixed tool call through the
+    /// shared MCP handle. Returns the flattened textual content. An MCP-level
+    /// `isError: true` result and any transport/JSON-RPC error both map to an
+    /// `Err(ToolError)` — the message never includes credentials or env var
+    /// names.
+    ///
+    /// SPIKE-A invariant: this runs in `CliToolExecutor::execute`, the pure
+    /// synchronous tool-dispatch layer (outside any `block_on`), so the
+    /// handle's internal `block_on` is safe.
+    fn dispatch_mcp(
+        mcp: &SharedMcpRuntime,
+        tool_name: &str,
+        value: &serde_json::Value,
+    ) -> Result<String, ToolError> {
+        let mut mcp = mcp.borrow_mut();
+        // Map the advertised name back to its route (qualified name + raw
+        // server identity) the manager can resolve. Falls back to the
+        // advertised name verbatim for a name the catalog never produced (the
+        // manager will then surface an `unknown MCP tool` error).
+        let qualified = mcp
+            .catalog
+            .route_for_advertised_name(tool_name)
+            .map_or_else(|| tool_name.to_string(), |route| route.qualified_name.clone());
+        let arguments = if value.is_null() {
+            None
+        } else {
+            Some(value.clone())
+        };
+        let response = mcp
+            .handle
+            .call_tool(&qualified, arguments)
+            .map_err(|error| ToolError::new(format!("MCP tool call failed: {error}")))?;
+        if let Some(rpc_error) = response.error {
+            return Err(ToolError::new(format!(
+                "MCP tool `{tool_name}` returned an error: {}",
+                rpc_error.message
+            )));
+        }
+        let result = response.result.ok_or_else(|| {
+            ToolError::new(format!("MCP tool `{tool_name}` returned an empty response"))
+        })?;
+        let text = flatten_mcp_content(&result.content);
+        if result.is_error.unwrap_or(false) {
+            return Err(ToolError::new(if text.is_empty() {
+                format!("MCP tool `{tool_name}` reported an error")
+            } else {
+                text
+            }));
+        }
+        Ok(text)
+    }
+}
+
+/// v0.4.17 (T3): flatten an MCP tool result's content blocks into a single
+/// string. `text` blocks contribute their text; any other block kind is
+/// serialized to a JSON line so nothing is silently dropped.
+fn flatten_mcp_content(content: &[runtime::McpToolCallContent]) -> String {
+    let mut parts: Vec<String> = Vec::with_capacity(content.len());
+    for block in content {
+        if block.kind == "text" {
+            if let Some(serde_json::Value::String(text)) = block.data.get("text") {
+                parts.push(text.clone());
+                continue;
+            }
+        }
+        // Non-text (or malformed text) block: emit a JSON line. Reconstruct
+        // the full block (kind + flattened data) so structured content
+        // survives round-trip.
+        let mut obj = serde_json::Map::new();
+        obj.insert("type".to_string(), serde_json::Value::String(block.kind.clone()));
+        for (key, value) in &block.data {
+            obj.insert(key.clone(), value.clone());
+        }
+        parts.push(serde_json::Value::Object(obj).to_string());
+    }
+    parts.join("\n")
 }
 
 impl ToolExecutor for CliToolExecutor {
@@ -4898,6 +5117,27 @@ impl ToolExecutor for CliToolExecutor {
         }
         let value = serde_json::from_str(input)
             .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
+        // v0.4.17 (T3): intercept MCP-prefixed names BEFORE the static
+        // `execute_tool` match. Only when an MCP runtime is present — without
+        // one, the name falls through to `execute_tool` → `unsupported tool`
+        // (the T6 structural guarantee that subagents never reach MCP, and the
+        // pre-v0.4.17 behavior for users without `mcpServers`).
+        if tool_name.starts_with("mcp__") {
+            if let Some(mcp) = self.mcp.as_ref() {
+                let result = Self::dispatch_mcp(mcp, tool_name, &value);
+                if self.emit_output {
+                    let (body, is_error) = match &result {
+                        Ok(output) => (output.clone(), false),
+                        Err(error) => (error.to_string(), true),
+                    };
+                    let markdown = format_tool_result(tool_name, &body, is_error);
+                    self.renderer
+                        .stream_markdown(&markdown, &mut io::stdout())
+                        .map_err(|error| ToolError::new(error.to_string()))?;
+                }
+                return result;
+            }
+        }
         match execute_tool(tool_name, &value) {
             Ok(output) => {
                 if self.emit_output {
@@ -5766,6 +6006,189 @@ mod tests {
             .expect("catalogue names parse")
             .expect("non-empty input yields a set");
         assert!(ok.contains("read_file"));
+    }
+
+    // ── v0.4.17 C1 (T3/T4/RW5): MCP dispatch + no-MCP equivalence ───────────
+
+    use runtime::ToolExecutor as _;
+
+    /// No-MCP path char test: a `CliToolExecutor` built with `mcp: None`
+    /// continues to route an `mcp__`-prefixed name into the static
+    /// `execute_tool`, producing the verbatim `unsupported tool` error. This is
+    /// the structural guarantee that users without `mcpServers` see no behavior
+    /// change (and the T6 guarantee that subagents — which always go through
+    /// the no-MCP path — never reach MCP).
+    #[test]
+    fn char_cli_tool_executor_without_mcp_treats_mcp_name_as_unsupported() {
+        let mut executor = super::CliToolExecutor::new(None, false, None);
+        let err = executor
+            .execute("mcp__fake__tool", "{}")
+            .expect_err("mcp name without an MCP runtime must be unsupported");
+        assert_eq!(err.to_string(), "unsupported tool: mcp__fake__tool");
+    }
+
+    /// `flatten_mcp_content` joins text blocks and serializes non-text blocks
+    /// to JSON lines (T3 content flattening).
+    #[test]
+    fn flatten_mcp_content_text_and_nontext() {
+        use runtime::McpToolCallContent;
+        let mut text_block = McpToolCallContent {
+            kind: "text".to_string(),
+            data: std::collections::BTreeMap::new(),
+        };
+        text_block
+            .data
+            .insert("text".to_string(), json!("hello world"));
+
+        let mut image_block = McpToolCallContent {
+            kind: "image".to_string(),
+            data: std::collections::BTreeMap::new(),
+        };
+        image_block
+            .data
+            .insert("data".to_string(), json!("base64=="));
+
+        let flattened = super::flatten_mcp_content(&[text_block, image_block]);
+        let lines: Vec<&str> = flattened.lines().collect();
+        assert_eq!(lines[0], "hello world");
+        // Second line is a JSON object reconstructing the non-text block.
+        let parsed: serde_json::Value =
+            serde_json::from_str(lines[1]).expect("non-text block serialized as JSON");
+        assert_eq!(parsed["type"], "image");
+        assert_eq!(parsed["data"], "base64==");
+    }
+
+    fn fake_mcp_echo_server_script() -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("aris-cli-mcp-it-{nanos}"));
+        std::fs::create_dir_all(&root).expect("temp dir");
+        let script_path = root.join("echo-server.py");
+        let script = [
+            "#!/usr/bin/env python3",
+            "import json, sys",
+            "",
+            "def read_message():",
+            "    header = b''",
+            r"    while not header.endswith(b'\r\n\r\n'):",
+            "        chunk = sys.stdin.buffer.read(1)",
+            "        if not chunk:",
+            "            return None",
+            "        header += chunk",
+            "    length = 0",
+            r"    for line in header.decode().split('\r\n'):",
+            r"        if line.lower().startswith('content-length:'):",
+            r"            length = int(line.split(':', 1)[1].strip())",
+            "    return json.loads(sys.stdin.buffer.read(length).decode())",
+            "",
+            "def send(message):",
+            "    payload = json.dumps(message).encode()",
+            r"    sys.stdout.buffer.write(f'Content-Length: {len(payload)}\r\n\r\n'.encode() + payload)",
+            "    sys.stdout.buffer.flush()",
+            "",
+            "while True:",
+            "    req = read_message()",
+            "    if req is None:",
+            "        break",
+            "    method = req['method']",
+            "    if 'id' not in req:",
+            "        continue",
+            "    if method == 'initialize':",
+            "        send({'jsonrpc': '2.0', 'id': req['id'], 'result': {",
+            "            'protocolVersion': req['params']['protocolVersion'],",
+            "            'capabilities': {'tools': {}},",
+            "            'serverInfo': {'name': 'alpha', 'version': '1.0.0'}}})",
+            "    elif method == 'tools/list':",
+            "        send({'jsonrpc': '2.0', 'id': req['id'], 'result': {'tools': [{",
+            "            'name': 'echo',",
+            "            'description': 'Echo the text back.',",
+            "            'inputSchema': {'type': 'object', 'properties': {'text': {'type': 'string'}}, 'required': ['text']}}]}})",
+            "    elif method == 'tools/call':",
+            "        args = req['params'].get('arguments') or {}",
+            "        text = args.get('text', '')",
+            "        is_error = text == 'BOOM'",
+            "        send({'jsonrpc': '2.0', 'id': req['id'], 'result': {",
+            "            'content': [{'type': 'text', 'text': f'echoed: {text}'}],",
+            "            'isError': is_error}})",
+            "    else:",
+            "        send({'jsonrpc': '2.0', 'id': req['id'], 'error': {'code': -32601, 'message': 'unknown'}})",
+            "",
+        ]
+        .join("\n");
+        std::fs::write(&script_path, script).expect("write script");
+        script_path
+    }
+
+    fn build_mcp_runtime_for_echo_server() -> super::SharedMcpRuntime {
+        use runtime::{
+            ConfigSource, McpServerConfig, McpServerManager, McpStdioServerConfig,
+            ScopedMcpServerConfig,
+        };
+        let script_path = fake_mcp_echo_server_script();
+        let servers = std::collections::BTreeMap::from([(
+            "alpha".to_string(),
+            ScopedMcpServerConfig {
+                scope: ConfigSource::Local,
+                config: McpServerConfig::Stdio(McpStdioServerConfig {
+                    command: "python3".to_string(),
+                    args: vec![script_path.to_string_lossy().into_owned()],
+                    env: std::collections::BTreeMap::new(),
+                    request_timeout_secs: None,
+                    trust: None,
+                }),
+            },
+        )]);
+        let manager = McpServerManager::from_servers(&servers);
+        let mut handle =
+            runtime::McpManagerHandle::from_manager(manager).expect("build sync handle");
+        let managed = handle.discover_tools().expect("discover tools");
+        let catalog = super::mcp_tool_specs(&managed);
+        std::rc::Rc::new(std::cell::RefCell::new(super::McpRuntime { handle, catalog }))
+    }
+
+    /// End-to-end (T3/T4): a `CliToolExecutor` holding a real MCP runtime backed
+    /// by a fake stdio server dispatches an `mcp__alpha__echo` call all the way
+    /// to the server and flattens the text result. Drives the executor layer
+    /// exactly as `ConversationRuntime` would (synchronous, outside any tokio
+    /// runtime — SPIKE-A invariant; the handle's debug_assert must not fire).
+    #[test]
+    fn mcp_executor_dispatch_end_to_end() {
+        let mcp = build_mcp_runtime_for_echo_server();
+        // The catalog should advertise exactly the echo tool.
+        assert_eq!(mcp.borrow().catalog.len(), 1);
+        assert_eq!(
+            mcp.borrow().catalog.specs()[0].name,
+            "mcp__alpha__echo"
+        );
+
+        let mut executor = super::CliToolExecutor::new(None, false, Some(mcp.clone()));
+        let output = executor
+            .execute("mcp__alpha__echo", &json!({"text": "hi"}).to_string())
+            .expect("mcp dispatch succeeds");
+        assert_eq!(output, "echoed: hi");
+
+        // is_error mapping: the fake server flags text == "BOOM" as an error.
+        let err = executor
+            .execute("mcp__alpha__echo", &json!({"text": "BOOM"}).to_string())
+            .expect_err("isError:true must map to a tool error");
+        assert_eq!(err.to_string(), "echoed: BOOM");
+
+        // An mcp__ name the server never advertised surfaces a clean error
+        // (no credentials / env names leaked).
+        let unknown = executor
+            .execute("mcp__alpha__missing", "{}")
+            .expect_err("unknown mcp tool errors");
+        assert!(
+            unknown.to_string().contains("MCP tool call failed"),
+            "unexpected error: {unknown}"
+        );
+
+        mcp.borrow_mut()
+            .handle
+            .shutdown()
+            .expect("shutdown servers");
     }
 
     #[test]

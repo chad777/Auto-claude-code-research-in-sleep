@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -56,6 +56,251 @@ pub struct ToolSpec {
     pub description: &'static str,
     pub input_schema: Value,
     pub required_permission: PermissionMode,
+}
+
+/// v0.4.17 (T1): the owned-name counterpart to the static [`ToolSpec`].
+///
+/// The static `ToolSpec` keeps `name`/`description` as `&'static str` so the
+/// hard-coded MVP catalogue (see [`mvp_tool_specs`]) stays a zero-allocation,
+/// byte-for-byte-stable source of truth. But runtime-discovered MCP tools have
+/// names/descriptions that are only known at runtime, so the provider request
+/// construction layer is migrated to consume this owned variant instead.
+///
+/// `RuntimeToolSpec` carries exactly the three fields the API request needs
+/// (`name`, `description`, `input_schema`) and intentionally drops
+/// `required_permission`: permission registration is the CLI's concern and is
+/// handled separately (a static-MVP `ToolSpec` keeps that field). Converting a
+/// static `ToolSpec` into a `RuntimeToolSpec` is lossless for the request
+/// payload (`From<&ToolSpec>` below), and the conversion is byte-identical to
+/// the previous inline `ToolDefinition { name, description, input_schema }`
+/// construction, which the characterization tests pin.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeToolSpec {
+    pub name: String,
+    pub description: String,
+    pub input_schema: Value,
+}
+
+impl From<&ToolSpec> for RuntimeToolSpec {
+    fn from(spec: &ToolSpec) -> Self {
+        Self {
+            name: spec.name.to_string(),
+            description: spec.description.to_string(),
+            input_schema: spec.input_schema.clone(),
+        }
+    }
+}
+
+impl From<ToolSpec> for RuntimeToolSpec {
+    fn from(spec: ToolSpec) -> Self {
+        Self::from(&spec)
+    }
+}
+
+/// v0.4.17 (T2): a single advertised MCP tool's dispatch route.
+///
+/// Maps the advertised name back to everything dispatch needs:
+/// - `qualified_name`: the key the manager's `tool_index` understands, passed
+///   to `call_tool`.
+/// - `server_name`: the **raw** MCP server name (as configured / reported by
+///   the runtime, before any normalization), carried straight from
+///   [`runtime::ManagedMcpTool::server_name`]. This is preserved so per-server
+///   policy (C2's per-server approval / trust) can identify the originating
+///   server without reverse-engineering it from the advertised or qualified
+///   name — both of which are lossy (normalization can collapse two distinct
+///   raw server names to the same qualified prefix).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpRoute {
+    /// The original `qualified_name` (`mcp__<server>__<tool>`) the manager can
+    /// route via `call_tool`.
+    pub qualified_name: String,
+    /// The raw, un-normalized MCP server name this tool came from.
+    pub server_name: String,
+}
+
+/// v0.4.17 (T2): the result of turning the manager's discovered
+/// [`runtime::ManagedMcpTool`] list into advertisable specs.
+///
+/// MCP tool names are advertised to the model under their `qualified_name`
+/// (`mcp__<server>__<tool>`, already normalized by the runtime). Because the
+/// runtime's `normalize_name_for_mcp` collapses illegal characters to `_`, two
+/// distinct tools can normalize to the **same** advertised name (e.g. a server
+/// named `"a b"` and one named `"a_b"`, or two tools `"do it"` / `"do_it"`).
+///
+/// The advertised catalogue must contain no duplicate names (providers reject
+/// duplicate tool names, and the model would have no way to disambiguate).
+/// Worse, the runtime's own `tool_index` is keyed by `qualified_name`, so a
+/// collision there is last-writer-wins: both colliding tools resolve to the
+/// SAME surviving manager route. A numeric `_2`/`_3` suffix on the advertised
+/// side would therefore be **fake disambiguation** — both advertised names
+/// would still call the one surviving tool.
+///
+/// Collision policy is **last-wins**, mirroring the runtime `tool_index`
+/// insert-overwrite semantics ([`mcp_stdio.rs`](crate) `tool_index`): when two
+/// tools normalize to the same `qualified_name`, the LAST one (in
+/// `ManagedMcpTool` input order, which is deterministic) keeps the advertised
+/// name; its spec **replaces** any earlier collider in place (preserving the
+/// earlier slot so advertised ordering stays deterministic), and a one-line
+/// warning is written to stderr. The catalog survivor MUST equal the manager
+/// survivor — both consume the same `ManagedMcpTool` order, so taking the last
+/// on collision keeps the advertised description/schema/server_name describing
+/// exactly the tool the manager's `call_tool` will execute. Precise
+/// per-`(server, raw_name)` routing through a collision would
+/// require a new manager API on the runtime side and is deferred to v0.5.0 /
+/// when a real need appears.
+///
+/// Dispatch must call the server with the *original* `qualified_name` (that is
+/// the key the manager's `tool_index` understands). `route_for_advertised_name`
+/// maps an advertised name back to its [`McpRoute`] (qualified name + raw
+/// server identity) so the manager's `call_tool` is always given a name it can
+/// resolve, and so downstream per-server policy can recover the raw server.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct McpToolCatalog {
+    specs: Vec<RuntimeToolSpec>,
+    /// advertised name -> route (qualified name + raw server name)
+    routes: BTreeMap<String, McpRoute>,
+}
+
+impl McpToolCatalog {
+    /// The advertisable specs, one per surviving advertised name, in discovery
+    /// order. On a `qualified_name` collision the last colliding tool's spec
+    /// replaces the earlier one in place (**last-wins**, matching the runtime
+    /// `tool_index` insert-overwrite semantics), so there are no duplicate
+    /// names and no collision suffixes.
+    #[must_use]
+    pub fn specs(&self) -> &[RuntimeToolSpec] {
+        &self.specs
+    }
+
+    /// Consume the catalog and yield the owned specs (used by the request
+    /// construction layer to append onto the static catalogue).
+    #[must_use]
+    pub fn into_specs(self) -> Vec<RuntimeToolSpec> {
+        self.specs
+    }
+
+    /// Map an advertised MCP tool name (as the model called it) back to its
+    /// [`McpRoute`] (original `qualified_name` the manager can route + the raw
+    /// server identity). Returns `None` for an advertised name this catalog
+    /// never produced. On a `qualified_name` collision the route reflects the
+    /// **last** colliding tool (last-wins, matching the runtime `tool_index`),
+    /// so the raw server identity here equals the manager's `call_tool` target.
+    #[must_use]
+    pub fn route_for_advertised_name(&self, advertised_name: &str) -> Option<&McpRoute> {
+        self.routes.get(advertised_name)
+    }
+
+    /// Number of advertised MCP tools.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.specs.len()
+    }
+
+    /// Whether the catalog advertises any MCP tools.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.specs.is_empty()
+    }
+}
+
+/// v0.4.17 (T2): build the advertisable MCP tool catalog from the manager's
+/// discovered tools.
+///
+/// Per-tool transformation:
+/// - **`name`**: the tool's `qualified_name` (already `mcp__<server>__<tool>`).
+/// - **`description`**: `tool.description` when present, otherwise a synthesized
+///   `"MCP tool <name> (server: <server>)"` hint so the model isn't handed a
+///   blank description.
+/// - **`input_schema`**: `tool.input_schema` when it is a JSON object, otherwise
+///   the minimal `{"type":"object"}` net. A non-object schema (or a missing
+///   one) is replaced and a one-line warning is written to stderr — providers
+///   require an object schema for function/tool parameters.
+///
+/// **Collision handling (last-wins):** when two tools normalize to the same
+/// `qualified_name`, the LAST one (in input order) wins — its spec replaces the
+/// earlier collider in place (preserving the advertised slot) and its route
+/// overwrites the earlier route (warning on stderr). This mirrors the runtime
+/// `tool_index` insert-overwrite (mcp_stdio.rs): both consume the same
+/// `Vec<ManagedMcpTool>` order, so the catalog survivor equals the manager
+/// survivor — see [`McpToolCatalog`] for why a `_2` suffix would be fake
+/// disambiguation.
+#[must_use]
+pub fn mcp_tool_specs(tools: &[runtime::ManagedMcpTool]) -> McpToolCatalog {
+    let mut specs = Vec::with_capacity(tools.len());
+    let mut routes: BTreeMap<String, McpRoute> = BTreeMap::new();
+    // advertised_name -> index into `specs`, so a collision can replace the
+    // already-recorded spec in place (last-wins) without scanning.
+    let mut spec_index: HashMap<String, usize> = HashMap::new();
+
+    for tool in tools {
+        let qualified_name = tool.qualified_name.clone();
+
+        let description = match tool.tool.description.as_deref() {
+            Some(text) if !text.is_empty() => text.to_string(),
+            _ => format!(
+                "MCP tool {} (server: {})",
+                tool.qualified_name, tool.server_name
+            ),
+        };
+
+        let input_schema =
+            sanitize_mcp_input_schema(tool.tool.input_schema.as_ref(), &qualified_name);
+
+        let spec = RuntimeToolSpec {
+            name: qualified_name.clone(),
+            description,
+            input_schema,
+        };
+        let route = McpRoute {
+            qualified_name: qualified_name.clone(),
+            server_name: tool.server_name.clone(),
+        };
+
+        // Last-wins, mirroring the runtime tool_index insert-overwrite
+        // semantics (mcp_stdio.rs `tool_index`): when two tools normalize to
+        // the same qualified_name, the manager's `call_tool` resolves to the
+        // LAST inserted route, so the catalog survivor MUST equal the manager
+        // survivor — otherwise the advertised description/schema/server_name
+        // would describe a different tool than the one actually executed
+        // (corrupting C2's per-server approval/trust). Both this catalog and
+        // the manager consume the same `Vec<ManagedMcpTool>` order, so taking
+        // the last on collision is naturally consistent with the manager.
+        if let Some(&idx) = spec_index.get(&qualified_name) {
+            eprintln!(
+                "aris mcp: duplicate MCP tool `{qualified_name}` after normalization; \
+                 replacing earlier (server `{}`) with later (server `{}`, tool `{}`) \
+                 to match runtime last-writer-wins routing",
+                routes[&qualified_name].server_name, tool.server_name, tool.raw_name
+            );
+            // Replace in place to keep advertised ordering deterministic.
+            specs[idx] = spec;
+            routes.insert(qualified_name, route);
+        } else {
+            spec_index.insert(qualified_name.clone(), specs.len());
+            routes.insert(qualified_name, route);
+            specs.push(spec);
+        }
+    }
+
+    McpToolCatalog { specs, routes }
+}
+
+/// Minimal schema net (T2): MCP servers may return no `inputSchema` at all, or
+/// a schema whose top level is not a JSON object. Providers require an object
+/// schema for tool parameters, so anything that is not an object is replaced
+/// with `{"type":"object"}` (a warning is emitted so the drift is visible).
+fn sanitize_mcp_input_schema(schema: Option<&Value>, advertised_name: &str) -> Value {
+    match schema {
+        Some(value) if value.is_object() => value.clone(),
+        Some(_) => {
+            eprintln!(
+                "aris mcp: tool `{advertised_name}` returned a non-object inputSchema; \
+                 substituting a minimal object schema"
+            );
+            json!({ "type": "object" })
+        }
+        None => json!({ "type": "object" }),
+    }
 }
 
 #[must_use]
@@ -2104,11 +2349,17 @@ impl AnthropicRuntimeClient {
 
 impl ApiClient for AnthropicRuntimeClient {
     fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+        // v0.4.17 (T1/T6): subagents are deliberately NOT given MCP tools —
+        // only the static catalogue flows through here. Converting via
+        // RuntimeToolSpec keeps the request payload byte-identical to the
+        // previous inline construction while migrating the request-building
+        // layer onto the owned-name spec type.
         let tools = tool_specs_for_allowed_tools(Some(&self.allowed_tools))
-            .into_iter()
+            .iter()
+            .map(RuntimeToolSpec::from)
             .map(|spec| ToolDefinition {
-                name: spec.name.to_string(),
-                description: Some(spec.description.to_string()),
+                name: spec.name,
+                description: Some(spec.description),
                 input_schema: spec.input_schema,
             })
             .collect::<Vec<_>>();
@@ -3993,6 +4244,201 @@ mod tests {
         let err = execute_tool("nonexistent", &json!({}))
             .expect_err("unknown tool must be unsupported");
         assert_eq!(err, "unsupported tool: nonexistent");
+    }
+
+    // ── v0.4.17 C1 (T1/T2): RuntimeToolSpec + mcp_tool_specs ────────────────
+
+    fn managed_tool(
+        server: &str,
+        raw_name: &str,
+        schema: Option<serde_json::Value>,
+    ) -> runtime::ManagedMcpTool {
+        runtime::ManagedMcpTool {
+            server_name: server.to_string(),
+            qualified_name: runtime::mcp_tool_name(server, raw_name),
+            raw_name: raw_name.to_string(),
+            tool: runtime::McpTool {
+                name: raw_name.to_string(),
+                description: Some(format!("desc for {raw_name}")),
+                input_schema: schema,
+                annotations: None,
+                meta: None,
+            },
+        }
+    }
+
+    /// T1: converting every static ToolSpec into a RuntimeToolSpec is lossless
+    /// for the request payload — the resulting ToolDefinition serializes
+    /// byte-for-byte identically to the previous inline construction.
+    #[test]
+    fn runtime_tool_spec_conversion_matches_legacy_tool_definition_bytes() {
+        for spec in mvp_tool_specs() {
+            // Legacy inline construction (pre-T1).
+            let legacy = api::ToolDefinition {
+                name: spec.name.to_string(),
+                description: Some(spec.description.to_string()),
+                input_schema: spec.input_schema.clone(),
+            };
+            // New path: through RuntimeToolSpec.
+            let runtime_spec = super::RuntimeToolSpec::from(&spec);
+            let migrated = api::ToolDefinition {
+                name: runtime_spec.name,
+                description: Some(runtime_spec.description),
+                input_schema: runtime_spec.input_schema,
+            };
+            let legacy_bytes = serde_json::to_string(&legacy).expect("legacy serializes");
+            let migrated_bytes = serde_json::to_string(&migrated).expect("migrated serializes");
+            assert_eq!(
+                legacy_bytes, migrated_bytes,
+                "RuntimeToolSpec conversion changed the serialized ToolDefinition for {}",
+                spec.name
+            );
+        }
+    }
+
+    /// T2: a normal discovered tool becomes one advertised spec whose name is
+    /// the qualified name and whose route maps back to that same qualified name,
+    /// carrying the raw server identity (P2.2).
+    #[test]
+    fn mcp_tool_specs_basic_conversion_and_route() {
+        let tools = vec![managed_tool(
+            "codex",
+            "codex",
+            Some(json!({"type": "object", "properties": {"prompt": {"type": "string"}}})),
+        )];
+        let catalog = super::mcp_tool_specs(&tools);
+        assert_eq!(catalog.len(), 1);
+        let spec = &catalog.specs()[0];
+        assert_eq!(spec.name, "mcp__codex__codex");
+        assert_eq!(spec.description, "desc for codex");
+        assert_eq!(spec.input_schema["type"], "object");
+        let route = catalog
+            .route_for_advertised_name("mcp__codex__codex")
+            .expect("advertised tool routes");
+        assert_eq!(route.qualified_name, "mcp__codex__codex");
+        assert_eq!(route.server_name, "codex");
+        assert_eq!(catalog.route_for_advertised_name("mcp__codex__nope"), None);
+    }
+
+    /// T2 collision strategy (**last-wins**, matching the runtime tool_index):
+    /// two tools that normalize to the SAME qualified name cannot both be
+    /// advertised. The runtime's `tool_index.insert` is last-writer-wins
+    /// (mcp_stdio.rs), so the manager's `call_tool` resolves a colliding name to
+    /// the LAST-discovered tool's route. The catalog therefore MUST also keep
+    /// the last — both the catalog and the manager consume the SAME
+    /// `Vec<ManagedMcpTool>` order, so taking the last on collision is
+    /// naturally consistent: the advertised description / schema / route's
+    /// server_name all describe exactly the tool that will be executed. Locks:
+    /// len == 1; the survivor's metadata equals the LAST input's; the FIRST
+    /// input's metadata is absent.
+    #[test]
+    fn mcp_tool_specs_collision_last_wins_matching_runtime_index() {
+        // Two tools from DIFFERENT raw servers that both normalize to the same
+        // qualified name (manager's tool_index would overwrite first with
+        // second), with DISTINCT description + schema + server_name so we can
+        // prove which one survives.
+        let tools = vec![
+            // FIRST: server "a b", raw "do it"  -> mcp__a_b__do_it
+            managed_tool("a b", "do it", Some(json!({"type": "object", "first": true}))),
+            // LAST:  server "a_b", raw "do_it"  -> mcp__a_b__do_it (collision)
+            managed_tool("a_b", "do_it", Some(json!({"type": "object", "last": true}))),
+        ];
+        assert_eq!(tools[0].qualified_name, tools[1].qualified_name);
+        // Sanity: the two inputs really do carry different metadata.
+        assert_ne!(tools[0].tool.description, tools[1].tool.description);
+        assert_ne!(tools[0].server_name, tools[1].server_name);
+
+        let catalog = super::mcp_tool_specs(&tools);
+
+        // Exactly one advertised tool (no duplicate name, no `_2` suffix).
+        let names: Vec<&str> = catalog.specs().iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["mcp__a_b__do_it"]);
+        assert_eq!(catalog.len(), 1);
+
+        // The survivor's spec carries the LAST input's description + schema.
+        let spec = &catalog.specs()[0];
+        assert_eq!(spec.description, "desc for do_it");
+        assert_eq!(spec.input_schema, json!({"type": "object", "last": true}));
+
+        // The survivor's route carries the LAST input's raw server identity —
+        // this MUST equal the manager's `call_tool` target so C2's per-server
+        // approval/trust acts on the tool that actually executes.
+        let route = catalog
+            .route_for_advertised_name("mcp__a_b__do_it")
+            .expect("the survivor routes");
+        assert_eq!(route.qualified_name, "mcp__a_b__do_it");
+        assert_eq!(route.server_name, "a_b");
+
+        // The FIRST input's metadata is GONE: its description, its schema, and
+        // its raw server_name ("a b") no longer appear anywhere in the catalog.
+        assert_ne!(spec.description, "desc for do it");
+        assert_ne!(spec.input_schema, json!({"type": "object", "first": true}));
+        assert_ne!(route.server_name, "a b");
+    }
+
+    /// P2.2: routes carry the RAW server name (not derivable from the
+    /// advertised/qualified name once two raw server names normalize to the same
+    /// prefix). Lock that the raw server identity is passed through verbatim so
+    /// C2's per-server approval/trust can recover it.
+    #[test]
+    fn mcp_tool_specs_route_preserves_raw_server_identity() {
+        // A raw server name with a space normalizes for the qualified prefix but
+        // must survive untouched in the route's `server_name`.
+        let tools = vec![managed_tool(
+            "my server",
+            "act",
+            Some(json!({"type": "object"})),
+        )];
+        let catalog = super::mcp_tool_specs(&tools);
+        let advertised = catalog.specs()[0].name.clone();
+        let route = catalog
+            .route_for_advertised_name(&advertised)
+            .expect("advertised tool routes");
+        assert_eq!(route.server_name, "my server");
+        assert_eq!(route.qualified_name, advertised);
+    }
+
+    /// T2 schema sanitization: a missing schema and a non-object schema both
+    /// become the minimal `{"type":"object"}` net; an object schema passes
+    /// through unchanged.
+    #[test]
+    fn mcp_tool_specs_sanitizes_input_schema() {
+        let tools = vec![
+            managed_tool("srv", "no_schema", None),
+            managed_tool("srv", "array_schema", Some(json!(["not", "an", "object"]))),
+            managed_tool(
+                "srv",
+                "object_schema",
+                Some(json!({"type": "object", "properties": {"x": {"type": "number"}}})),
+            ),
+        ];
+        let catalog = super::mcp_tool_specs(&tools);
+        let specs = catalog.specs();
+
+        assert_eq!(specs[0].input_schema, json!({"type": "object"}));
+        assert_eq!(specs[1].input_schema, json!({"type": "object"}));
+        assert_eq!(
+            specs[2].input_schema,
+            json!({"type": "object", "properties": {"x": {"type": "number"}}})
+        );
+    }
+
+    /// T2: a tool with no description (or an empty one) gets a synthesized,
+    /// non-empty hint rather than a blank string.
+    #[test]
+    fn mcp_tool_specs_synthesizes_missing_description() {
+        let mut tool = managed_tool("srv", "thing", Some(json!({"type": "object"})));
+        tool.tool.description = None;
+        let catalog = super::mcp_tool_specs(std::slice::from_ref(&tool));
+        let desc = &catalog.specs()[0].description;
+        assert!(
+            desc.contains("mcp__srv__thing") && desc.contains("srv"),
+            "synthesized description should reference tool + server: {desc}"
+        );
+
+        tool.tool.description = Some(String::new());
+        let catalog = super::mcp_tool_specs(std::slice::from_ref(&tool));
+        assert!(!catalog.specs()[0].description.is_empty());
     }
 
     #[test]
