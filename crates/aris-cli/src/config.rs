@@ -5,7 +5,8 @@
 
 use std::fs;
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -37,7 +38,7 @@ pub struct ArisConfig {
     pub executor_base_url: Option<String>,
     #[serde(default)]
     pub executor_model: Option<String>,
-    /// "gemini" or "openai"
+    /// "gemini" / "openai" / ... / "codex-mcp"
     #[serde(default)]
     pub reviewer_provider: Option<String>,
     #[serde(default)]
@@ -46,6 +47,17 @@ pub struct ArisConfig {
     pub reviewer_base_url: Option<String>,
     #[serde(default)]
     pub reviewer_model: Option<String>,
+    /// v0.4.17 (T10/P1.2): the HTTP reviewer to fall back to when the primary
+    /// reviewer is Codex MCP (`reviewer_provider == "codex-mcp"`) but the MCP
+    /// channel is unavailable. Separating this from `reviewer_provider` keeps
+    /// "MCP primary" and "fallback provider" as two distinct states — the
+    /// fallback never usurps the primary the way it did when it was written
+    /// straight into `reviewer_provider`. `#[serde(default)]` means an older
+    /// `config.json` with no such key still parses (round-trip test locks this).
+    /// The fallback's key, base URL, and model reuse the existing
+    /// `reviewer_api_key` / `reviewer_base_url` / `reviewer_model` fields.
+    #[serde(default)]
+    pub reviewer_fallback_provider: Option<String>,
     /// "cn" or "en"
     #[serde(default)]
     pub language: Option<String>,
@@ -134,6 +146,8 @@ impl ArisConfig {
             std::env::remove_var("ARIS_REVIEWER_BASE_URL");
             std::env::remove_var("ARIS_REVIEWER_PROVIDER");
             std::env::remove_var("ARIS_REVIEWER_AUTH_TOKEN");
+            // v0.4.17 (T10/P1.2): the Codex-MCP fallback provider env var.
+            std::env::remove_var("ARIS_REVIEWER_FALLBACK_PROVIDER");
         }
         // The rest of the function uses `force_exec` and `force_rev` to decide
         // whether to overwrite existing env vars.
@@ -202,57 +216,42 @@ impl ArisConfig {
         // Reviewer API key — gated on force_reviewer, not force_exec, so
         // executor-only force does not clobber shell-provided reviewer keys.
         if let Some(reviewer_provider) = &self.reviewer_provider {
-            if let Some(key) = &self.reviewer_api_key {
-                match reviewer_provider.as_str() {
-                    "gemini" => {
-                        if force_reviewer || std::env::var("GEMINI_API_KEY").is_err() {
-                            std::env::set_var("GEMINI_API_KEY", key);
-                        }
+            // v0.4.17 (T10/P1.2): when Codex MCP is the PRIMARY reviewer, the
+            // HTTP key/model fields belong to the *fallback* provider, not to
+            // codex-mcp (which has no HTTP credentials). The key env var must be
+            // chosen from `reviewer_fallback_provider`, NOT `reviewer_provider`.
+            // We export the fallback key only when both a fallback provider and
+            // a key are present; with no fallback, nothing HTTP is exported
+            // (zero stale state).
+            let key_provider = if reviewer_provider == "codex-mcp" {
+                self.reviewer_fallback_provider.as_deref()
+            } else {
+                Some(reviewer_provider.as_str())
+            };
+            if let (Some(kp), Some(key)) = (key_provider, &self.reviewer_api_key) {
+                if let Some(key_env) = reviewer_key_env(kp) {
+                    if force_reviewer || std::env::var(key_env).is_err() {
+                        std::env::set_var(key_env, key);
                     }
-                    "openai" => {
-                        if force_reviewer || std::env::var("OPENAI_API_KEY").is_err() {
-                            std::env::set_var("OPENAI_API_KEY", key);
-                        }
-                    }
-                    "glm" => {
-                        if force_reviewer || std::env::var("GLM_API_KEY").is_err() {
-                            std::env::set_var("GLM_API_KEY", key);
-                        }
-                    }
-                    "minimax" => {
-                        if force_reviewer || std::env::var("MINIMAX_API_KEY").is_err() {
-                            std::env::set_var("MINIMAX_API_KEY", key);
-                        }
-                    }
-                    "kimi" => {
-                        if force_reviewer || std::env::var("KIMI_API_KEY").is_err() {
-                            std::env::set_var("KIMI_API_KEY", key);
-                        }
-                    }
-                    "anthropic-compat" => {
-                        if force_reviewer || std::env::var("ARIS_REVIEWER_AUTH_TOKEN").is_err() {
-                            std::env::set_var("ARIS_REVIEWER_AUTH_TOKEN", key);
-                        }
-                    }
-                    "deepseek" => {
-                        if force_reviewer || std::env::var("ARIS_REVIEWER_AUTH_TOKEN").is_err() {
-                            std::env::set_var("ARIS_REVIEWER_AUTH_TOKEN", key);
-                        }
-                    }
-                    "custom" => {
-                        // Custom OpenAI-compatible reviewer: store key in
-                        // ARIS_REVIEWER_AUTH_TOKEN so it doesn't collide with
-                        // the executor's OPENAI_API_KEY.
-                        if force_reviewer || std::env::var("ARIS_REVIEWER_AUTH_TOKEN").is_err() {
-                            std::env::set_var("ARIS_REVIEWER_AUTH_TOKEN", key);
-                        }
-                    }
-                    _ => {}
                 }
             }
-            // Set reviewer provider env var
+            // Set reviewer provider env var. For codex-mcp this stays
+            // "codex-mcp" (MCP primary); the fallback provider is exported
+            // separately below as ARIS_REVIEWER_FALLBACK_PROVIDER so it never
+            // usurps the primary (the P1.2 bug: fallback written into
+            // reviewer_provider made the MCP gate think MCP was unselected).
             if force_reviewer || std::env::var("ARIS_REVIEWER_PROVIDER").is_err() {
                 std::env::set_var("ARIS_REVIEWER_PROVIDER", reviewer_provider);
+            }
+            // v0.4.17 (T10/P1.2): for codex-mcp primary, export the fallback
+            // provider name (used by LlmReview's effective-provider resolution
+            // and the system-prompt gate). No fallback ⇒ nothing exported.
+            if reviewer_provider == "codex-mcp" {
+                if let Some(fallback) = &self.reviewer_fallback_provider {
+                    if force_reviewer || std::env::var("ARIS_REVIEWER_FALLBACK_PROVIDER").is_err() {
+                        std::env::set_var("ARIS_REVIEWER_FALLBACK_PROVIDER", fallback);
+                    }
+                }
             }
         }
 
@@ -288,6 +287,26 @@ impl ArisConfig {
     /// Returns the executor model from config, or None.
     pub fn executor_model(&self) -> Option<&str> {
         self.executor_model.as_deref()
+    }
+}
+
+/// v0.4.17 (T10/P1.2): map a reviewer provider string to the env var its API
+/// key is exported under. Single source of truth for both the normal-provider
+/// path and the Codex-MCP fallback path in `apply_to_env_inner`, so the two can
+/// never drift on which env var a given provider's key lands in. Returns `None`
+/// for providers that carry no HTTP key (e.g. `codex-mcp`) or unknown strings.
+fn reviewer_key_env(provider: &str) -> Option<&'static str> {
+    match provider {
+        "gemini" => Some("GEMINI_API_KEY"),
+        "openai" => Some("OPENAI_API_KEY"),
+        "glm" => Some("GLM_API_KEY"),
+        "minimax" => Some("MINIMAX_API_KEY"),
+        "kimi" => Some("KIMI_API_KEY"),
+        // anthropic-compat / deepseek / custom all store their key in the
+        // dedicated reviewer auth token so it never collides with the
+        // executor's OPENAI_API_KEY.
+        "anthropic-compat" | "deepseek" | "custom" => Some("ARIS_REVIEWER_AUTH_TOKEN"),
+        _ => None,
     }
 }
 
@@ -541,7 +560,10 @@ pub fn run_interactive_setup() -> io::Result<ArisConfig> {
     }
 
     // ── Step 4: Reviewer ──
-    println!("\n\x1b[1m[2/3] Reviewer (for LlmReview tool)\x1b[0m");
+    println!("\n\x1b[1m[2/3] Reviewer (for cross-model review)\x1b[0m");
+    println!(
+        "  \x1b[2m★ Option 10 (Codex MCP) needs no API key — uses your ChatGPT subscription.\x1b[0m"
+    );
     println!("  1. OpenAI          (gpt-5.5)");
     println!("  2. Gemini          (gemini-2.5-pro)");
     println!("  3. GLM             (GLM-5)");
@@ -551,21 +573,27 @@ pub fn run_interactive_setup() -> io::Result<ArisConfig> {
     println!("  7. DeepSeek        (deepseek-v4-pro)");
     println!("  8. Skip (no reviewer)");
     println!("  9. Custom          (OpenAI-compatible endpoint)");
-    let default_reviewer = match config.reviewer_provider.as_deref() {
-        Some("openai") => "1",
-        Some("gemini") => "2",
-        Some("glm") => "3",
-        Some("minimax") => "4",
-        Some("kimi") => "5",
-        Some("anthropic-compat") => "6",
-        Some("deepseek") => "7",
-        Some("custom") => "9",
-        None => "1",
-        _ => "8",
-    };
-    let reviewer_choice_raw = prompt_with_default("  Choose [1-9]", default_reviewer)?;
+    // v0.4.17 (T10): APPENDED, not reordered — reordering would break the
+    // `main.rs` "aris setup → option 7 (DeepSeek)" reference (the v0.4.14 P9
+    // regression). Codex MCP routes external reviews through Claude Code's own
+    // `mcp__codex__codex` channel (no API key).
+    println!(" 10. Codex MCP (ChatGPT subscription, no API key) \x1b[1m★recommended\x1b[0m");
+    let default_reviewer = default_reviewer_choice(config.reviewer_provider.as_deref());
+    let reviewer_choice_raw = prompt_with_default("  Choose [1-10]", default_reviewer)?;
     let reviewer_choice = reviewer_choice_raw.trim();
     let switched_reviewer = reviewer_choice != default_reviewer;
+
+    // v0.4.17 (T10): Codex MCP reviewer — special-cased BEFORE the
+    // `reviewer_info` match below, because that match's `_ => None` arm would
+    // clear `reviewer_provider` (config.rs `else` branch) and wipe the choice.
+    if reviewer_choice == "10" {
+        configure_codex_mcp_reviewer(&mut config)?;
+        // Skip the API-reviewer key/URL/model prompts entirely; codex-mcp uses
+        // no HTTP reviewer credentials. If the user opted into a fallback inside
+        // `configure_codex_mcp_reviewer`, the primary stays "codex-mcp" and the
+        // fallback provider is stored in `reviewer_fallback_provider` (T10/P1.2),
+        // whose key/url/model export via apply_to_env's codex-mcp fallback arm.
+    } else {
 
     // (provider_name, key_env_var, key_label, default_model)
     let reviewer_info: Option<(&str, &str, &str, &str)> = match reviewer_choice {
@@ -706,6 +734,7 @@ pub fn run_interactive_setup() -> io::Result<ArisConfig> {
         config.reviewer_base_url = None;
         config.reviewer_model = None;
     }
+    } // end: non-codex-mcp reviewer branch (v0.4.17 T10)
 
     // ── Step 5: Language ──
     println!("\n\x1b[1m[3/3] Language\x1b[0m");
@@ -736,6 +765,343 @@ pub fn run_interactive_setup() -> io::Result<ArisConfig> {
     println!("\n\x1b[1;32m✓ Setup complete!\x1b[0m Run `aris` to start.\n");
 
     Ok(config)
+}
+
+/// v0.4.17 (T10): map a saved `reviewer_provider` to the reviewer-menu default
+/// choice. Pure (no I/O) so it can be unit-tested for the round-trip
+/// `Some("codex-mcp") -> "10"` (the bug class: a missing arm would let the
+/// default drift to "8"/Skip on the next `setup`). Mirrors the menu order in
+/// `run_interactive_setup`.
+// `openai` and `None` both map to "1" intentionally (the menu default is
+// OpenAI); keeping them as distinct arms mirrors the original inline match and
+// documents each provider's slot explicitly.
+#[allow(clippy::match_same_arms)]
+fn default_reviewer_choice(provider: Option<&str>) -> &'static str {
+    match provider {
+        Some("openai") => "1",
+        Some("gemini") => "2",
+        Some("glm") => "3",
+        Some("minimax") => "4",
+        Some("kimi") => "5",
+        Some("anthropic-compat") => "6",
+        Some("deepseek") => "7",
+        Some("custom") => "9",
+        // v0.4.17 (T10): keep the Codex MCP default sticky across runs.
+        Some("codex-mcp") => "10",
+        None => "1",
+        _ => "8",
+    }
+}
+
+/// v0.4.17 (T10): interactive flow for the Codex MCP reviewer (menu option 10).
+///
+/// 1. `which codex` detection — if missing, print an install hint and ask
+///    whether to still write the config.
+/// 2. Idempotently merge `mcpServers.codex = {command, args, [trust]}` into the
+///    `ConfigLoader` user-scope settings file (`~/.claude/settings.json`) via the
+///    atomic-write/backup helper. An existing `mcpServers.codex` is NOT
+///    clobbered. **P1.1:** if this write FAILS, the entire option-10 branch is
+///    aborted — `config` is left exactly as it was (the previous reviewer config
+///    is preserved) so we never advertise a Codex MCP reviewer whose server
+///    entry never landed in settings.json (an unrecoverable bad state).
+/// 3. Ask whether to trust the server (skip per-call approval).
+/// 4. Optionally configure an API reviewer as a fallback (routes through the
+///    SAME menu choices 1-9). **P1.2:** when a fallback is chosen, the primary
+///    `reviewer_provider` STAYS `"codex-mcp"` and the fallback provider name is
+///    stored in the dedicated `reviewer_fallback_provider` field (its
+///    key/url/model reuse the existing `reviewer_api_key`/`reviewer_base_url`/
+///    `reviewer_model` fields). This keeps "MCP primary" and "fallback provider"
+///    as two distinct states so the fallback never usurps the MCP primary. With
+///    no fallback, `reviewer_provider` is `"codex-mcp"`, `reviewer_fallback_provider`
+///    is cleared, and the stale HTTP-reviewer fields are cleared so nothing
+///    bogus is exported.
+fn configure_codex_mcp_reviewer(config: &mut ArisConfig) -> io::Result<()> {
+    println!("\n  \x1b[1mCodex MCP reviewer\x1b[0m");
+
+    // Step 1: detect the codex CLI.
+    let codex_found = which_codex();
+    if codex_found {
+        println!("  \x1b[2m✓ found `codex` on PATH\x1b[0m");
+    } else {
+        println!("  \x1b[33m⚠ `codex` not found on PATH.\x1b[0m");
+        println!(
+            "  \x1b[2mInstall it with `npm i -g @openai/codex` (or your platform's package),\x1b[0m"
+        );
+        println!("  \x1b[2mthen sign in once with `codex` so the MCP server can start.\x1b[0m");
+        let go_on = prompt_with_default("  Write the MCP config anyway? [Y/n]", "y")?;
+        if go_on.trim().eq_ignore_ascii_case("n") {
+            println!("  \x1b[2mSkipped Codex MCP config; reviewer unchanged.\x1b[0m");
+            // Leave reviewer_provider untouched (do NOT set codex-mcp without a
+            // server entry, which would advertise a reviewer that can't run).
+            return Ok(());
+        }
+    }
+
+    // Step 3 (asked before the write so we know whether to set trust): trust.
+    let trust_ans = prompt_with_default(
+        "  Trust this server? (skip per-call approval) [Y/n]",
+        "y",
+    )?;
+    let trust = !trust_ans.trim().eq_ignore_ascii_case("n");
+
+    // Step 2: write into the ConfigLoader user-scope settings file.
+    let claude_dir = claude_config_home();
+    let settings_display = claude_dir.join("settings.json");
+    let settings_display = settings_display.display();
+    match merge_codex_mcp_into_settings(&claude_dir, trust) {
+        Ok(true) => {
+            let trust_note = if trust { " (trusted)" } else { "" };
+            println!("  \x1b[2m✓ added mcpServers.codex to {settings_display}{trust_note}\x1b[0m");
+        }
+        Ok(false) => {
+            println!(
+                "  \x1b[2mmcpServers.codex already exists in {settings_display} — left unchanged.\x1b[0m"
+            );
+        }
+        Err(e) => {
+            // v0.4.17 (T10/P1.1): the settings write FAILED. If we continued
+            // and set reviewer_provider="codex-mcp", the system-prompt gate +
+            // LlmReview override would switch to the MCP path even though
+            // mcpServers.codex never landed in settings.json — an unrecoverable
+            // bad state (restart can't fix a server that isn't configured).
+            // So abort the ENTIRE option-10 branch: report the error, leave the
+            // previous reviewer config completely untouched, and tell the user
+            // how to recover. `config` is unmodified up to here, so returning
+            // now preserves their old reviewer exactly.
+            println!("  \x1b[31m✗ could not write MCP config: {e}\x1b[0m");
+            println!(
+                "  \x1b[33mAborting Codex MCP setup; your previous reviewer config is unchanged.\x1b[0m"
+            );
+            println!(
+                "  \x1b[2mCheck write permissions on {settings_display}, then re-run setup — \
+                 or add mcpServers.codex to that file by hand.\x1b[0m"
+            );
+            return Ok(());
+        }
+    }
+
+    // Step 4: optional API reviewer fallback.
+    println!(
+        "  \x1b[2mYou can also set an API reviewer as a fallback (used when Codex MCP is unavailable).\x1b[0m"
+    );
+    let fallback_choice_raw =
+        prompt_with_default("  Optionally configure an API reviewer as fallback? [Enter=skip / 1-9]", "")?;
+    let fallback_choice = fallback_choice_raw.trim();
+    let fallback_info: Option<(&str, &str)> = match fallback_choice {
+        "1" => Some(("openai", "gpt-5.5")),
+        "2" => Some(("gemini", "gemini-2.5-pro")),
+        "3" => Some(("glm", "GLM-5")),
+        "4" => Some(("minimax", "MiniMax-M2.7")),
+        "5" => Some(("kimi", "kimi-k2.5")),
+        "6" => Some(("anthropic-compat", "claude-sonnet-4-6")),
+        "7" => Some(("deepseek", "deepseek-v4-pro")),
+        "9" => Some(("custom", "")),
+        // "" / "8" / anything else = skip fallback (do NOT clear codex-mcp).
+        _ => None,
+    };
+
+    if let Some((provider, default_model)) = fallback_info {
+        // v0.4.17 (T10/P1.2): the primary reviewer STAYS Codex MCP. The fallback
+        // provider name is recorded in the dedicated `reviewer_fallback_provider`
+        // field (NOT `reviewer_provider`), so it never usurps the MCP primary —
+        // the old design wrote the fallback straight into `reviewer_provider`,
+        // which made the system-prompt gate think MCP was unselected and routed
+        // every review through the fallback. The fallback's key/url/model reuse
+        // the existing reviewer_api_key/base_url/model fields.
+        config.reviewer_provider = Some("codex-mcp".into());
+        config.reviewer_fallback_provider = Some(provider.into());
+        config.reviewer_api_key = None;
+        config.reviewer_base_url = None;
+        config.reviewer_model = None;
+        // Mirror reviewer_key_env() for the live env-set + the label; keeping
+        // the label here (reviewer_key_env returns only the env var) is why this
+        // small match stays local.
+        let (key_env, key_label) = match provider {
+            "openai" => ("OPENAI_API_KEY", "OpenAI API key"),
+            "gemini" => ("GEMINI_API_KEY", "Gemini API key"),
+            "glm" => ("GLM_API_KEY", "GLM API key"),
+            "minimax" => ("MINIMAX_API_KEY", "MiniMax API key"),
+            "kimi" => ("KIMI_API_KEY", "Kimi API key"),
+            _ => ("ARIS_REVIEWER_AUTH_TOKEN", "Reviewer auth token"),
+        };
+        let new_key = prompt_with_default(&format!("  {key_label} [(not set)]"), "")?;
+        if !new_key.is_empty() {
+            config.reviewer_api_key = Some(new_key.clone());
+            std::env::set_var(key_env, &new_key);
+        }
+        if provider == "custom" {
+            let url = prompt_with_default("  Custom reviewer base URL", "")?;
+            if !url.is_empty() {
+                config.reviewer_base_url = Some(url);
+            }
+            let model = prompt_with_default("  Model name", "")?;
+            config.reviewer_model = if model.is_empty() { None } else { Some(model) };
+        } else {
+            config.reviewer_model = Some(default_model.to_string());
+        }
+        println!(
+            "  \x1b[2mPrimary reviewer: Codex MCP — fallback: {provider} ({})\x1b[0m",
+            config.reviewer_model.as_deref().unwrap_or("(none)")
+        );
+    } else {
+        // Pure Codex MCP: no HTTP reviewer. Clear stale fields (incl. any
+        // previously-saved fallback) so apply_to_env doesn't export a leftover
+        // base_url / model / fallback from a previous provider.
+        config.reviewer_provider = Some("codex-mcp".into());
+        config.reviewer_fallback_provider = None;
+        config.reviewer_api_key = None;
+        config.reviewer_base_url = None;
+        config.reviewer_model = None;
+    }
+
+    Ok(())
+}
+
+/// v0.4.17 (T10): resolve the user-scope config directory the runtime
+/// `ConfigLoader` reads `mcpServers` from. Mirrors `ConfigLoader::default_for`
+/// exactly: honor `CLAUDE_CONFIG_HOME` if set, else `$HOME/.claude`
+/// (`$USERPROFILE/.claude` on Windows), else `.claude`. This is what makes the
+/// `setup` write land in the SAME file the runtime later reads (otherwise a
+/// `CLAUDE_CONFIG_HOME` user would get a config written where it's never read).
+fn claude_config_home() -> PathBuf {
+    std::env::var_os("CLAUDE_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .or_else(|| std::env::var_os("USERPROFILE"))
+                .map(|home| PathBuf::from(home).join(".claude"))
+        })
+        .unwrap_or_else(|| PathBuf::from(".claude"))
+}
+
+/// v0.4.17 (T10): is the `codex` CLI on PATH? Uses `which`/`where` so the check
+/// matches what the MCP runtime would spawn. Best-effort: a spawn error counts
+/// as "not found".
+fn which_codex() -> bool {
+    let probe = if cfg!(windows) { "where" } else { "which" };
+    std::process::Command::new(probe)
+        .arg("codex")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// v0.4.17 (T10): the JSON object written for `mcpServers.codex`.
+fn codex_mcp_server_entry(trust: bool) -> serde_json::Value {
+    let mut obj = serde_json::Map::new();
+    obj.insert("command".into(), serde_json::Value::String("codex".into()));
+    obj.insert(
+        "args".into(),
+        serde_json::Value::Array(vec![serde_json::Value::String("mcp-server".into())]),
+    );
+    if trust {
+        obj.insert("trust".into(), serde_json::Value::Bool(true));
+    }
+    serde_json::Value::Object(obj)
+}
+
+/// v0.4.17 (T10): idempotently merge `mcpServers.codex` into the user-scope
+/// settings file `<home>/.claude/settings.json` — the file the runtime
+/// `ConfigLoader` resolves as `ConfigSource::User` for `mcpServers` (NOT
+/// `~/.claude.json`, which the doctor "Codex MCP" check reads; that path
+/// mismatch is disclosed in `run_doctor`).
+///
+/// `claude_dir` is the resolved config home (e.g. `~/.claude` or
+/// `$CLAUDE_CONFIG_HOME`) — see [`claude_config_home`]; `settings.json` lives
+/// directly inside it.
+///
+/// Returns `Ok(true)` if it ADDED the entry, `Ok(false)` if `mcpServers.codex`
+/// already existed (left untouched — never clobbered). Reuses the same
+/// safety mechanism as `deploy_meta_opt_hooks_to`: read-or-`{}`, refuse to
+/// clobber a malformed file, back up the existing file to
+/// `settings.json.bak.<millis>`, then atomically write via tempfile + rename.
+fn merge_codex_mcp_into_settings(claude_dir: &Path, trust: bool) -> Result<bool, String> {
+    fs::create_dir_all(claude_dir)
+        .map_err(|e| format!("create_dir_all({}): {e}", claude_dir.display()))?;
+    let settings_path = claude_dir.join("settings.json");
+
+    let (mut settings, had_existing) = match fs::read_to_string(&settings_path) {
+        Ok(text) => {
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                (serde_json::json!({}), true)
+            } else {
+                let parsed: serde_json::Value = serde_json::from_str(trimmed).map_err(|e| {
+                    format!(
+                        "parse {}: {e} (refusing to clobber malformed user settings)",
+                        settings_path.display()
+                    )
+                })?;
+                if !parsed.is_object() {
+                    return Err(format!(
+                        "{} is not a JSON object (top-level must be {{...}})",
+                        settings_path.display()
+                    ));
+                }
+                (parsed, true)
+            }
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => (serde_json::json!({}), false),
+        Err(e) => return Err(format!("read {}: {e}", settings_path.display())),
+    };
+
+    // Idempotency: never clobber an existing codex entry.
+    let mcp_servers = settings
+        .as_object_mut()
+        .expect("settings is a JSON object (checked above / freshly created)")
+        .entry("mcpServers")
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    let Some(mcp_obj) = mcp_servers.as_object_mut() else {
+        return Err(format!(
+            "{}: `mcpServers` is not a JSON object",
+            settings_path.display()
+        ));
+    };
+    if mcp_obj.contains_key("codex") {
+        return Ok(false);
+    }
+    mcp_obj.insert("codex".into(), codex_mcp_server_entry(trust));
+
+    // Backup existing file (hard-fail if backup fails), then atomic rewrite.
+    if had_existing {
+        let backup_suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let backup_path = claude_dir.join(format!("settings.json.bak.{backup_suffix}"));
+        fs::copy(&settings_path, &backup_path).map_err(|e| {
+            format!(
+                "backup {} → {} failed: {e}; aborting to protect existing settings",
+                settings_path.display(),
+                backup_path.display()
+            )
+        })?;
+    }
+
+    let pretty = serde_json::to_string_pretty(&settings)
+        .map_err(|e| format!("serialize settings.json: {e}"))?;
+    let body = format!("{pretty}\n");
+    let temp_path = claude_dir.join(format!(
+        "settings.json.tmp.{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    fs::write(&temp_path, body)
+        .map_err(|e| format!("write tempfile {}: {e}", temp_path.display()))?;
+    fs::rename(&temp_path, &settings_path).map_err(|e| {
+        let _ = fs::remove_file(&temp_path);
+        format!(
+            "atomic rename {} → {}: {e}",
+            temp_path.display(),
+            settings_path.display()
+        )
+    })?;
+
+    Ok(true)
 }
 
 /// Print a provider-specific list of known-working third-party proxy URLs
@@ -998,7 +1364,10 @@ mod tests {
         };
         config.force_apply_to_env();
 
-        assert_eq!(std::env::var("ANTHROPIC_API_KEY").ok().as_deref(), Some("K"));
+        assert_eq!(
+            std::env::var("ANTHROPIC_API_KEY").ok().as_deref(),
+            Some("K")
+        );
         // Official endpoint: no base URL, no beta-disable, betas remain ON.
         assert!(std::env::var("ANTHROPIC_BASE_URL").is_err());
         assert!(std::env::var("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS").is_err());
@@ -1031,7 +1400,10 @@ mod tests {
         config.force_apply_to_env();
 
         // x-api-key auth preserved — the load-bearing assertion.
-        assert_eq!(std::env::var("ANTHROPIC_API_KEY").ok().as_deref(), Some("K"));
+        assert_eq!(
+            std::env::var("ANTHROPIC_API_KEY").ok().as_deref(),
+            Some("K")
+        );
         // Must NOT have flipped to Bearer (anthropic-compat) auth.
         assert!(
             std::env::var("ANTHROPIC_AUTH_TOKEN").is_err(),
@@ -1211,7 +1583,10 @@ mod tests {
 
         assert!(std::env::var("ANTHROPIC_BASE_URL").is_err());
         assert!(std::env::var("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS").is_err());
-        assert_eq!(std::env::var("ANTHROPIC_API_KEY").ok().as_deref(), Some("K"));
+        assert_eq!(
+            std::env::var("ANTHROPIC_API_KEY").ok().as_deref(),
+            Some("K")
+        );
     }
 
     /// case: force_executor_only_preserves_reviewer_keys
@@ -1392,7 +1767,11 @@ mod tests {
             (Some("openai"), None, "2"),
             // anthropic → "1"; custom → "11"; unknown/None → "1"
             (Some("anthropic"), None, "1"),
-            (Some("anthropic"), Some("https://code.newcli.com/claude"), "1"),
+            (
+                Some("anthropic"),
+                Some("https://code.newcli.com/claude"),
+                "1",
+            ),
             (Some("custom"), None, "11"),
             (None, None, "1"),
         ];
@@ -1403,5 +1782,353 @@ mod tests {
                 "echo mismatch for provider={provider:?} base_url={base_url:?}"
             );
         }
+    }
+
+    // ── v0.4.17 (T10): Codex MCP reviewer setup integration ──────────────────
+
+    fn codex_mcp_test_root() -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time after epoch")
+            .as_nanos();
+        let pid = std::process::id();
+        std::env::temp_dir().join(format!("aris-codex-mcp-test-{pid}-{nanos}"))
+    }
+
+    /// default_reviewer_choice must round-trip the saved provider back to the
+    /// matching menu number — most importantly `codex-mcp -> "10"` so the next
+    /// `setup` defaults to the Codex MCP reviewer instead of drifting to Skip.
+    #[test]
+    fn default_reviewer_choice_round_trips_codex_mcp_to_10() {
+        assert_eq!(default_reviewer_choice(Some("codex-mcp")), "10");
+        // The pre-existing providers keep their numbers (no reorder).
+        assert_eq!(default_reviewer_choice(Some("openai")), "1");
+        assert_eq!(default_reviewer_choice(Some("deepseek")), "7");
+        assert_eq!(default_reviewer_choice(Some("custom")), "9");
+        assert_eq!(default_reviewer_choice(None), "1");
+        // Unknown / "skip" provider falls back to Skip (8), not to codex-mcp.
+        assert_eq!(default_reviewer_choice(Some("something-else")), "8");
+    }
+
+    #[test]
+    fn codex_mcp_server_entry_has_command_args_and_optional_trust() {
+        let trusted = codex_mcp_server_entry(true);
+        assert_eq!(trusted["command"], "codex");
+        assert_eq!(trusted["args"], serde_json::json!(["mcp-server"]));
+        assert_eq!(trusted["trust"], serde_json::json!(true));
+
+        let untrusted = codex_mcp_server_entry(false);
+        // Absent (not false) — matches the "absent => untrusted" parser default.
+        assert!(untrusted.get("trust").is_none());
+    }
+
+    /// Fresh write: no settings.json yet → creates it with mcpServers.codex,
+    /// returns true (added), writes trust:true, and leaves no backup (nothing
+    /// to back up).
+    #[test]
+    fn merge_codex_mcp_creates_settings_when_absent() {
+        let root = codex_mcp_test_root();
+        let home = root.join("home");
+        let claude_dir = home.join(".claude");
+        let added = merge_codex_mcp_into_settings(&claude_dir, true).expect("write should succeed");
+        assert!(added, "first write must report it ADDED the entry");
+
+        let settings_path = claude_dir.join("settings.json");
+        let body = fs::read_to_string(&settings_path).expect("settings written");
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(parsed["mcpServers"]["codex"]["command"], "codex");
+        assert_eq!(
+            parsed["mcpServers"]["codex"]["args"],
+            serde_json::json!(["mcp-server"])
+        );
+        assert_eq!(parsed["mcpServers"]["codex"]["trust"], serde_json::json!(true));
+
+        // No backups created when there was no prior file.
+        let backups: Vec<_> = fs::read_dir(&claude_dir)
+            .expect("read .claude dir")
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains("settings.json.bak."))
+            .collect();
+        assert!(backups.is_empty(), "no backup expected on fresh write");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Idempotent: a second call with an existing mcpServers.codex must NOT
+    /// clobber it and must report `false` (not added).
+    #[test]
+    fn merge_codex_mcp_is_idempotent_and_never_clobbers() {
+        let root = codex_mcp_test_root();
+        let home = root.join("home");
+        let claude_dir = home.join(".claude");
+        // First: add it untrusted.
+        assert!(merge_codex_mcp_into_settings(&claude_dir, false).expect("first add"));
+        // Second: try to add trusted — must be a no-op (existing entry kept).
+        let added = merge_codex_mcp_into_settings(&claude_dir, true).expect("second call");
+        assert!(!added, "second call must report it did NOT add (already exists)");
+
+        let settings_path = claude_dir.join("settings.json");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&settings_path).expect("read")).expect("json");
+        // Still the ORIGINAL untrusted entry (no trust flag) — not clobbered.
+        assert!(
+            parsed["mcpServers"]["codex"].get("trust").is_none(),
+            "existing entry must not be overwritten with trust:true"
+        );
+
+        // The no-op second call returns early (before any write), so it makes
+        // NO backup — idempotency means zero side effects on disk.
+        let had_backup = fs::read_dir(&claude_dir)
+            .expect("read dir")
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().contains("settings.json.bak."));
+        assert!(
+            !had_backup,
+            "a no-op (already-exists) call must not write a backup"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Existing unrelated settings + another MCP server are PRESERVED when we
+    /// merge codex in, and a backup is written.
+    #[test]
+    fn merge_codex_mcp_preserves_existing_settings_and_backs_up() {
+        let root = codex_mcp_test_root();
+        let home = root.join("home");
+        let claude_dir = home.join(".claude");
+        fs::create_dir_all(&claude_dir).expect("mkdir .claude");
+        let existing = serde_json::json!({
+            "language": "cn",
+            "mcpServers": { "other": { "command": "foo", "args": ["bar"] } }
+        });
+        let settings_path = claude_dir.join("settings.json");
+        fs::write(
+            &settings_path,
+            format!("{}\n", serde_json::to_string_pretty(&existing).unwrap()),
+        )
+        .expect("seed settings");
+
+        let added = merge_codex_mcp_into_settings(&claude_dir, true).expect("merge");
+        assert!(added);
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&settings_path).expect("read")).expect("json");
+        // Unrelated keys preserved.
+        assert_eq!(parsed["language"], "cn");
+        // Sibling MCP server preserved.
+        assert_eq!(parsed["mcpServers"]["other"]["command"], "foo");
+        // Codex added.
+        assert_eq!(parsed["mcpServers"]["codex"]["command"], "codex");
+
+        // Backup of the prior file exists and parses to the ORIGINAL content.
+        let backup = fs::read_dir(&claude_dir)
+            .expect("read dir")
+            .filter_map(|e| e.ok())
+            .find(|e| e.file_name().to_string_lossy().contains("settings.json.bak."))
+            .expect("a backup file");
+        let backup_body = fs::read_to_string(backup.path()).expect("read backup");
+        let backup_parsed: serde_json::Value =
+            serde_json::from_str(&backup_body).expect("backup json");
+        assert!(
+            backup_parsed["mcpServers"].get("codex").is_none(),
+            "backup must be the pre-merge content (no codex yet)"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A malformed settings.json must be REFUSED (never clobbered).
+    #[test]
+    fn merge_codex_mcp_refuses_malformed_settings() {
+        let root = codex_mcp_test_root();
+        let home = root.join("home");
+        let claude_dir = home.join(".claude");
+        fs::create_dir_all(&claude_dir).expect("mkdir");
+        let settings_path = claude_dir.join("settings.json");
+        fs::write(&settings_path, "{ this is : not json").expect("seed garbage");
+
+        let err = merge_codex_mcp_into_settings(&claude_dir, true)
+            .expect_err("malformed settings must be rejected");
+        assert!(
+            err.contains("refusing to clobber"),
+            "error should explain it refused to clobber: {err}"
+        );
+        // Original garbage untouched.
+        assert_eq!(
+            fs::read_to_string(&settings_path).expect("read"),
+            "{ this is : not json"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// apply_to_env with reviewer_provider="codex-mcp" and NO api key must set
+    /// ARIS_REVIEWER_PROVIDER="codex-mcp" and must NOT write any provider API
+    /// key env var (codex-mcp has no HTTP credentials).
+    #[test]
+    fn apply_to_env_codex_mcp_sets_provider_and_writes_no_api_key() {
+        let _g = crate::env_test_guard();
+        let _snap = EnvSnapshot::capture(&[
+            "ARIS_REVIEWER_PROVIDER",
+            "ARIS_REVIEWER_BASE_URL",
+            "ARIS_REVIEWER_MODEL",
+            "ARIS_REVIEWER_AUTH_TOKEN",
+            "OPENAI_API_KEY",
+            "GEMINI_API_KEY",
+        ]);
+
+        let config = ArisConfig {
+            reviewer_provider: Some("codex-mcp".into()),
+            reviewer_api_key: None,
+            reviewer_base_url: None,
+            reviewer_model: None,
+            ..Default::default()
+        };
+        config.force_apply_to_env();
+
+        assert_eq!(
+            std::env::var("ARIS_REVIEWER_PROVIDER").ok().as_deref(),
+            Some("codex-mcp")
+        );
+        // No provider key / auth token written.
+        assert!(std::env::var("OPENAI_API_KEY").is_err());
+        assert!(std::env::var("GEMINI_API_KEY").is_err());
+        assert!(std::env::var("ARIS_REVIEWER_AUTH_TOKEN").is_err());
+        // No stale base URL / model exported.
+        assert!(std::env::var("ARIS_REVIEWER_BASE_URL").is_err());
+        assert!(std::env::var("ARIS_REVIEWER_MODEL").is_err());
+        // P1.2: pure codex-mcp ⇒ no fallback provider exported.
+        assert!(std::env::var("ARIS_REVIEWER_FALLBACK_PROVIDER").is_err());
+    }
+
+    // ── v0.4.17 (T10/P1.2): reviewer_fallback_provider round-trip + apply ────
+
+    /// An OLD config.json (written before the `reviewer_fallback_provider` field
+    /// existed) must still parse — `#[serde(default)]` makes the missing key
+    /// deserialize to `None`. This locks backward compatibility (the field is
+    /// additive, never required).
+    #[test]
+    fn config_parses_legacy_json_without_fallback_field() {
+        let legacy = r#"{
+            "reviewer_provider": "codex-mcp",
+            "reviewer_api_key": null,
+            "reviewer_base_url": null,
+            "reviewer_model": null,
+            "language": "en"
+        }"#;
+        let parsed: ArisConfig = serde_json::from_str(legacy).expect("legacy json parses");
+        assert_eq!(parsed.reviewer_provider.as_deref(), Some("codex-mcp"));
+        assert_eq!(parsed.reviewer_fallback_provider, None);
+        assert_eq!(parsed.language.as_deref(), Some("en"));
+    }
+
+    /// Round-trip with the field PRESENT: serialize → parse must preserve the
+    /// fallback provider, and a config carrying it must round-trip losslessly.
+    #[test]
+    fn config_round_trips_fallback_provider_when_present() {
+        let config = ArisConfig {
+            reviewer_provider: Some("codex-mcp".into()),
+            reviewer_fallback_provider: Some("gemini".into()),
+            reviewer_api_key: Some("sk-test-key".into()),
+            reviewer_model: Some("gemini-2.5-pro".into()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&config).expect("serialize");
+        let parsed: ArisConfig = serde_json::from_str(&json).expect("re-parse");
+        assert_eq!(parsed.reviewer_provider.as_deref(), Some("codex-mcp"));
+        assert_eq!(parsed.reviewer_fallback_provider.as_deref(), Some("gemini"));
+        assert_eq!(parsed.reviewer_api_key.as_deref(), Some("sk-test-key"));
+        assert_eq!(parsed.reviewer_model.as_deref(), Some("gemini-2.5-pro"));
+    }
+
+    /// apply_to_env state 2 (codex-mcp PRIMARY + fallback): the primary provider
+    /// stays "codex-mcp", the fallback name is exported separately as
+    /// ARIS_REVIEWER_FALLBACK_PROVIDER, and the fallback's key lands in the
+    /// fallback provider's key env var (here: gemini → GEMINI_API_KEY), with the
+    /// model exported too. The primary must NEVER be overwritten by the fallback.
+    #[test]
+    fn apply_to_env_codex_mcp_with_fallback_exports_fallback_separately() {
+        let _g = crate::env_test_guard();
+        let _snap = EnvSnapshot::capture(&[
+            "ARIS_REVIEWER_PROVIDER",
+            "ARIS_REVIEWER_FALLBACK_PROVIDER",
+            "ARIS_REVIEWER_BASE_URL",
+            "ARIS_REVIEWER_MODEL",
+            "ARIS_REVIEWER_AUTH_TOKEN",
+            "OPENAI_API_KEY",
+            "GEMINI_API_KEY",
+        ]);
+
+        let config = ArisConfig {
+            reviewer_provider: Some("codex-mcp".into()),
+            reviewer_fallback_provider: Some("gemini".into()),
+            reviewer_api_key: Some("gem-key".into()),
+            reviewer_base_url: None,
+            reviewer_model: Some("gemini-2.5-pro".into()),
+            ..Default::default()
+        };
+        config.force_apply_to_env();
+
+        // Primary stays codex-mcp (NOT usurped by the fallback).
+        assert_eq!(
+            std::env::var("ARIS_REVIEWER_PROVIDER").ok().as_deref(),
+            Some("codex-mcp")
+        );
+        // Fallback provider exported separately.
+        assert_eq!(
+            std::env::var("ARIS_REVIEWER_FALLBACK_PROVIDER")
+                .ok()
+                .as_deref(),
+            Some("gemini")
+        );
+        // Fallback key lands in the fallback provider's key env var.
+        assert_eq!(
+            std::env::var("GEMINI_API_KEY").ok().as_deref(),
+            Some("gem-key")
+        );
+        // Model exported; OpenAI key never written.
+        assert_eq!(
+            std::env::var("ARIS_REVIEWER_MODEL").ok().as_deref(),
+            Some("gemini-2.5-pro")
+        );
+        assert!(std::env::var("OPENAI_API_KEY").is_err());
+    }
+
+    /// apply_to_env state 3 (a NORMAL provider): a plain reviewer provider is
+    /// unaffected by the new field — its key exports under its own env var, no
+    /// ARIS_REVIEWER_FALLBACK_PROVIDER is ever set, and the provider is itself.
+    #[test]
+    fn apply_to_env_normal_provider_unaffected_by_fallback_field() {
+        let _g = crate::env_test_guard();
+        let _snap = EnvSnapshot::capture(&[
+            "ARIS_REVIEWER_PROVIDER",
+            "ARIS_REVIEWER_FALLBACK_PROVIDER",
+            "ARIS_REVIEWER_MODEL",
+            "OPENAI_API_KEY",
+            "GEMINI_API_KEY",
+        ]);
+
+        let config = ArisConfig {
+            reviewer_provider: Some("openai".into()),
+            // No fallback — irrelevant for a non-codex-mcp provider.
+            reviewer_fallback_provider: None,
+            reviewer_api_key: Some("oa-key".into()),
+            reviewer_model: Some("gpt-5.5".into()),
+            ..Default::default()
+        };
+        config.force_apply_to_env();
+
+        assert_eq!(
+            std::env::var("ARIS_REVIEWER_PROVIDER").ok().as_deref(),
+            Some("openai")
+        );
+        assert_eq!(
+            std::env::var("OPENAI_API_KEY").ok().as_deref(),
+            Some("oa-key")
+        );
+        // Never set for a normal provider.
+        assert!(std::env::var("ARIS_REVIEWER_FALLBACK_PROVIDER").is_err());
+        assert!(std::env::var("GEMINI_API_KEY").is_err());
     }
 }

@@ -23,7 +23,7 @@ pub(crate) fn env_test_guard() -> std::sync::MutexGuard<'static, ()> {
 }
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::env;
 use std::fs;
 use std::io::{self, Read, Write};
@@ -54,7 +54,9 @@ use runtime::{
     Session, TokenUsage, ToolError, ToolExecutor, UsageTracker,
 };
 use serde_json::json;
-use tools::{execute_tool, mcp_tool_specs, mvp_tool_specs, McpToolCatalog, RuntimeToolSpec, ToolSpec};
+use tools::{
+    execute_tool, mcp_tool_specs, mvp_tool_specs, McpToolCatalog, RuntimeToolSpec, ToolSpec,
+};
 
 const DEFAULT_MODEL: &str = "claude-opus-4-7";
 fn max_tokens_for_model(model: &str) -> u32 {
@@ -249,8 +251,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             output_format,
             allowed_tools,
             permission_mode,
-        } => LiveCli::new(model, true, allowed_tools, permission_mode)?
-            .run_turn_with_output(&prompt, output_format)?,
+        } =>
+        // v0.4.17 (T5): one-shot `--print`/prompt is non-interactive, so MCP
+        // approval may NOT prompt (untrusted MCP calls are denied here).
+        {
+            LiveCli::new(model, true, allowed_tools, permission_mode, false)?
+                .run_turn_with_output(&prompt, output_format)?
+        }
         CliAction::Login => run_login()?,
         CliAction::Logout => run_logout()?,
         CliAction::Init => run_init()?,
@@ -524,10 +531,26 @@ fn normalize_allowed_tools(values: &[String]) -> Result<Option<AllowedToolSet>, 
             .split(|ch: char| ch == ',' || ch.is_whitespace())
             .filter(|token| !token.is_empty())
         {
+            // v0.4.17 (T8): an `mcp__`-prefixed token names an MCP tool whose
+            // existence is only known after runtime discovery, so it CANNOT be
+            // validated against the static catalogue here. Accept it verbatim
+            // (deferred validation): the advertising layer filters the MCP
+            // catalogue to this allowlist (so only listed MCP tools are shown
+            // to the model) and the dispatch gate in `CliToolExecutor::execute`
+            // rejects any MCP name not in the allowlist. A token that names an
+            // MCP tool which does not exist simply never advertises / never
+            // dispatches — the same effect as an unknown static name being
+            // dropped by `filter_tool_specs`. Case is preserved (MCP names are
+            // case-sensitive and already normalized by the runtime); only
+            // non-MCP names go through the canonical-name map below.
+            if token.starts_with("mcp__") {
+                allowed.insert(token.to_string());
+                continue;
+            }
             let normalized = normalize_tool_name(token);
             let canonical = name_map.get(&normalized).ok_or_else(|| {
                 format!(
-                    "unsupported tool in --allowedTools: {token} (expected one of: {})",
+                    "unsupported tool in --allowedTools: {token} (expected one of: {}, or an mcp__<server>__<tool> name)",
                     canonical_names.join(", ")
                 )
             })?;
@@ -1140,7 +1163,8 @@ fn run_repl(
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut cli = LiveCli::new(model, true, allowed_tools, permission_mode)?;
+    // v0.4.17 (T5): the REPL is interactive, so MCP approval may prompt.
+    let mut cli = LiveCli::new(model, true, allowed_tools, permission_mode, true)?;
     let mut editor = input::LineEditor::new(
         "\x1b[38;5;74m❯\x1b[0m ",
         slash_command_completion_candidates(),
@@ -1256,6 +1280,12 @@ struct LiveCli {
     /// servers are spawned/discovered exactly once. `None` when no `mcpServers`
     /// are configured.
     mcp: Option<SharedMcpRuntime>,
+    /// v0.4.17 (T5): whether this CLI session may interactively prompt for MCP
+    /// tool approval. `true` for the interactive REPL; `false` for one-shot
+    /// `--print` / JSON output (where an untrusted MCP call is denied rather
+    /// than silently run). Threaded into every `build_runtime` so plan-mode
+    /// rebuilds keep the same posture.
+    may_prompt: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1270,6 +1300,7 @@ impl LiveCli {
         enable_tools: bool,
         allowed_tools: Option<AllowedToolSet>,
         permission_mode: PermissionMode,
+        may_prompt: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let system_prompt = build_system_prompt(Some(&model))?;
         let session = create_managed_session_handle()?;
@@ -1285,6 +1316,7 @@ impl LiveCli {
             allowed_tools.clone(),
             permission_mode,
             mcp.clone(),
+            may_prompt,
         )?;
         // Determine default reviewer model. saved_config.apply_to_env() runs
         // BEFORE this point in run(), so when a user has persisted
@@ -1327,6 +1359,7 @@ impl LiveCli {
             session,
             plan_mode: None,
             mcp,
+            may_prompt,
         };
         cli.persist_session()?;
         Ok(cli)
@@ -1581,6 +1614,10 @@ impl LiveCli {
             self.allowed_tools.clone(),
             self.permission_mode,
             self.mcp.clone(),
+            // v0.4.17 (T5): JSON output path is non-interactive — never prompt
+            // for MCP approval (an untrusted MCP call is denied instead so the
+            // JSON stream is never polluted by a prompt).
+            false,
         )?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
         let summary = runtime.run_turn(input, Some(&mut permission_prompter))?;
@@ -1870,6 +1907,7 @@ impl LiveCli {
             self.allowed_tools.clone(),
             self.permission_mode,
             self.mcp.clone(),
+            self.may_prompt,
         )?;
         self.system_prompt = new_system_prompt;
         self.model.clone_from(&model);
@@ -2023,33 +2061,82 @@ impl LiveCli {
         let new_config = config::run_interactive_setup()?;
         new_config.force_apply_to_env();
 
-        // Update model if config changed it
-        if let Some(new_model) = new_config.executor_model() {
-            let new_model = resolve_model_alias(new_model).to_string();
-            if new_model != self.model {
-                let previous = self.model.clone();
-                // Rebuild system prompt with new model identity
-                let new_system_prompt = build_system_prompt(Some(&new_model))?;
-                let session = self.runtime.session().clone();
-                self.runtime = build_runtime(
-                    session,
-                    new_model.clone(),
-                    new_system_prompt.clone(),
-                    true,
-                    true,
-                    self.allowed_tools.clone(),
-                    self.permission_mode,
-                    self.mcp.clone(),
-                )?;
-                self.system_prompt = new_system_prompt;
-                self.model.clone_from(&new_model);
-                println!("  Executor model: {previous} → \x1b[1;32m{new_model}\x1b[0m");
-            }
+        // Resolve the effective executor model after /setup. If the config
+        // changed it, switch to the new one; otherwise keep the current model.
+        let new_model = new_config
+            .executor_model()
+            .map(|m| resolve_model_alias(m).to_string())
+            .filter(|m| *m != self.model);
+        let model_changed = new_model.is_some();
+        let previous_model = self.model.clone();
+        let effective_model = new_model.unwrap_or_else(|| self.model.clone());
+
+        // Rebuild system prompt + runtime UNCONDITIONALLY after /setup (codex R11):
+        // reviewer provider/fallback and language preference all affect the system
+        // prompt, and `build_system_prompt` reads them live from the env that
+        // `force_apply_to_env()` just refreshed. Without this, a session that
+        // already has a Codex catalog would silently keep an outdated reviewer
+        // routing nudge (e.g. switching codex-mcp → API still tells the model to
+        // use `mcp__codex__codex`, and API → codex-mcp leaves the stale "use
+        // LlmReview instead" override) for the rest of the session. /setup is a
+        // low-frequency operation, so an unconditional rebuild is the cheapest and
+        // most robust fix — we do NOT try to diff which fields are prompt-affecting.
+        //
+        // This reuses the existing build_runtime path with `self.mcp.clone()`
+        // (the C1-designed SharedMcpRuntime is shared, NOT re-spawned/re-discovered
+        // here); spawning new mcpServers entries still requires a restart, handled
+        // by the restart notice below. The executor-switch case keeps its prior
+        // behavior: when the model changed we additionally adopt the new model id
+        // and print the switch line; when it did not change, runtime/prompt are
+        // refreshed in place against the unchanged model with no behavior drift.
+        let new_system_prompt = build_system_prompt(Some(&effective_model))?;
+        let session = self.runtime.session().clone();
+        self.runtime = build_runtime(
+            session,
+            effective_model.clone(),
+            new_system_prompt.clone(),
+            true,
+            true,
+            self.allowed_tools.clone(),
+            self.permission_mode,
+            self.mcp.clone(),
+            self.may_prompt,
+        )?;
+        self.system_prompt = new_system_prompt;
+        if model_changed {
+            self.model.clone_from(&effective_model);
+            println!("  Executor model: {previous_model} → \x1b[1;32m{effective_model}\x1b[0m");
         }
 
         // Update reviewer model
         if let Some(new_reviewer) = &new_config.reviewer_model {
             self.reviewer_model.clone_from(new_reviewer);
+        }
+
+        // v0.4.17 (T10/P1.3): an inline /setup may have just written
+        // `mcpServers.codex` into ~/.claude/settings.json, but the live
+        // `SharedMcpRuntime` is discovered ONCE at startup and is not rebuilt
+        // here (rebuilding would re-spawn every server mid-session). The restart
+        // notice must be gated on whether the LIVE catalog already advertises
+        // the `codex` server's tools — NOT on `self.mcp.is_none()`. The old
+        // `is_none()` check was wrong: if THIS session already has some OTHER
+        // MCP server running, `self.mcp` is `Some` but its catalog was built at
+        // startup and won't contain `codex` (discovery is not re-run here), so
+        // the system prompt would claim Codex MCP is available while
+        // `mcp__codex__codex` is absent from the catalog — an "unknown tool"
+        // call. So: if the catalog already has `codex`, no restart is needed; if
+        // it doesn't (no runtime at all, or a runtime that predates this write /
+        // where codex failed to spawn), tell the user to restart.
+        if new_config.reviewer_provider.as_deref() == Some("codex-mcp") {
+            let codex_in_catalog = self
+                .mcp
+                .as_ref()
+                .is_some_and(|m| m.borrow().catalog_has_server("codex"));
+            if !codex_in_catalog {
+                println!(
+                    "  \x1b[33mRestart aris to activate the Codex MCP server (MCP servers are spawned at startup).\x1b[0m"
+                );
+            }
         }
 
         Ok(true)
@@ -2285,6 +2372,7 @@ impl LiveCli {
             self.allowed_tools.clone(),
             self.permission_mode,
             self.mcp.clone(),
+            self.may_prompt,
         )?;
         println!(
             "{}",
@@ -2311,6 +2399,7 @@ impl LiveCli {
             self.allowed_tools.clone(),
             self.permission_mode,
             self.mcp.clone(),
+            self.may_prompt,
         )?;
         println!(
             "Session cleared\n  Mode             fresh session\n  Preserved model  {}\n  Permission mode  {}\n  Session          {}",
@@ -2347,6 +2436,7 @@ impl LiveCli {
             self.allowed_tools.clone(),
             self.permission_mode,
             self.mcp.clone(),
+            self.may_prompt,
         )?;
         self.session = handle;
         println!(
@@ -2420,6 +2510,7 @@ impl LiveCli {
                     self.allowed_tools.clone(),
                     self.permission_mode,
                     self.mcp.clone(),
+                    self.may_prompt,
                 )?;
                 self.session = handle;
                 println!(
@@ -2460,6 +2551,7 @@ impl LiveCli {
                     state.previous_allowed_tools.clone(),
                     state.previous_permission_mode,
                     self.mcp.clone(),
+                    self.may_prompt,
                 ) {
                     Ok(rt) => rt,
                     Err(e) => {
@@ -2498,6 +2590,7 @@ impl LiveCli {
                         state.previous_allowed_tools.clone(),
                         state.previous_permission_mode,
                         self.mcp.clone(),
+                        self.may_prompt,
                     ) {
                         Ok(rt) => rt,
                         Err(e) => {
@@ -2554,6 +2647,7 @@ impl LiveCli {
                     Some(plan_tools.clone()),
                     PermissionMode::ReadOnly,
                     self.mcp.clone(),
+                    self.may_prompt,
                 ) {
                     Ok(rt) => rt,
                     Err(e) => {
@@ -2645,6 +2739,7 @@ impl LiveCli {
             self.allowed_tools.clone(),
             self.permission_mode,
             self.mcp.clone(),
+            self.may_prompt,
         )?;
         self.persist_session()?;
         println!("{}", format_compact_report(removed, kept, skipped));
@@ -2666,6 +2761,7 @@ impl LiveCli {
             self.allowed_tools.clone(),
             self.permission_mode,
             self.mcp.clone(),
+            self.may_prompt,
         )?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
         let summary = runtime.run_turn(prompt, Some(&mut permission_prompter))?;
@@ -3182,7 +3278,10 @@ fn deploy_meta_opt_hooks() -> Result<String, Box<dyn std::error::Error>> {
 /// and safe to overwrite on every `aris init` since only we put them there.
 const META_OPT_HOOK_SCRIPTS: &[(&str, &str)] = &[
     ("tools/meta_opt/log_event.sh", "aris-meta-opt-log-event.sh"),
-    ("tools/meta_opt/check_ready.sh", "aris-meta-opt-check-ready.sh"),
+    (
+        "tools/meta_opt/check_ready.sh",
+        "aris-meta-opt-check-ready.sh",
+    ),
 ];
 
 /// Pure-fn variant of [`deploy_meta_opt_hooks`] that takes explicit `home` +
@@ -3774,6 +3873,50 @@ fn resolve_export_path(
     Ok(cwd.join(final_name))
 }
 
+/// Pure (I/O-free) reviewer-routing nudge used in the system prompt.
+///
+/// v0.4.17 (T10/P1-2): when the user picked the Codex MCP reviewer
+/// (`reviewer_provider == "codex-mcp"`), the cross-model review goes through
+/// Claude Code's own `mcp__codex__codex` channel — so do NOT push the "use
+/// `LlmReview` instead" override (which would contradict the user's chosen
+/// reviewer). For every other reviewer the override stands: skills' MCP review
+/// calls are redirected to `LlmReview`, which hits the configured API reviewer
+/// directly without MCP.
+///
+/// Three states:
+///   - `codex-mcp` + fallback configured → mention `LlmReview` as a fallback.
+///   - `codex-mcp` + no fallback         → emit nothing (pure MCP path).
+///   - any other provider                → push the "use `LlmReview` instead" override.
+///
+/// Extracted as a pure fn (codex R11) so its output across all three states is
+/// unit-testable without the filesystem I/O that `build_system_prompt` performs.
+fn reviewer_routing_nudge(reviewer_provider: &str, fallback: Option<&str>) -> Vec<String> {
+    if reviewer_provider == "codex-mcp" {
+        // Codex MCP is the PRIMARY reviewer. Keep using the `mcp__codex__codex`
+        // channel; do NOT push the "use LlmReview instead" override. If a
+        // fallback HTTP reviewer is configured (ARIS_REVIEWER_FALLBACK_PROVIDER),
+        // mention that LlmReview is available as a fallback when the MCP channel
+        // is unavailable.
+        match fallback.filter(|s| !s.is_empty()) {
+            Some(fallback) => vec![format!(
+                "IMPORTANT: Your external LLM reviewer is Codex MCP — use `mcp__codex__codex` / \
+                 `mcp__codex__codex-reply` as instructed by skills. If that MCP channel is \
+                 unavailable, you may fall back to the `LlmReview` tool, which calls the configured \
+                 HTTP fallback reviewer ({fallback}) directly."
+            )],
+            None => Vec::new(),
+        }
+    } else {
+        vec![
+            "IMPORTANT: When a skill instructs you to use `mcp__codex__codex` or `mcp__codex__codex-reply` \
+             for external LLM review, use the `LlmReview` tool instead. The LlmReview tool calls \
+             Gemini or OpenAI directly (via GEMINI_API_KEY or OPENAI_API_KEY) without needing MCP. \
+             Pass the full review prompt as the `prompt` parameter to LlmReview."
+                .to_string(),
+        ]
+    }
+}
+
 fn build_system_prompt(model_id: Option<&str>) -> Result<Vec<String>, Box<dyn std::error::Error>> {
     let mut prompt = match load_system_prompt(
         env::current_dir()?,
@@ -3852,14 +3995,17 @@ fn build_system_prompt(model_id: Option<&str>) -> Result<Vec<String>, Box<dyn st
         prompt.push("User language preference is English. Always respond in English unless the user explicitly writes in another language.".to_string());
     }
 
-    // ARIS override: tell the model to use LlmReview instead of Codex MCP for external reviews.
-    prompt.push(
-        "IMPORTANT: When a skill instructs you to use `mcp__codex__codex` or `mcp__codex__codex-reply` \
-         for external LLM review, use the `LlmReview` tool instead. The LlmReview tool calls \
-         Gemini or OpenAI directly (via GEMINI_API_KEY or OPENAI_API_KEY) without needing MCP. \
-         Pass the full review prompt as the `prompt` parameter to LlmReview."
-            .to_string(),
-    );
+    // ARIS reviewer routing nudge (read live env, then defer to the pure helper
+    // so the three-state behavior — codex-mcp w/ fallback, codex-mcp w/o
+    // fallback, any other provider — stays unit-testable without filesystem I/O).
+    let reviewer_provider = std::env::var("ARIS_REVIEWER_PROVIDER").unwrap_or_default();
+    let reviewer_fallback = std::env::var("ARIS_REVIEWER_FALLBACK_PROVIDER")
+        .ok()
+        .filter(|s| !s.is_empty());
+    prompt.extend(reviewer_routing_nudge(
+        &reviewer_provider,
+        reviewer_fallback.as_deref(),
+    ));
 
     // ARIS persistent memory (multi-file index system)
     memories::migrate_legacy_memory();
@@ -3967,6 +4113,27 @@ fn build_runtime_feature_config(
     }
 }
 
+/// Human-readable label for a config scope (used in MCP skip notices + doctor).
+fn scope_label(scope: ConfigSource) -> &'static str {
+    match scope {
+        ConfigSource::User => "user",
+        ConfigSource::Project => "project",
+        ConfigSource::Local => "local",
+    }
+}
+
+/// v0.4.17 (codex R Track C2 P2): sanitize a raw MCP server name for terminal
+/// display. A project/local config can no longer SPAWN a server, but it can
+/// still put ANSI/control characters in a server NAME, which would corrupt the
+/// terminal when echoed in skip notices / approval prompts / doctor output.
+/// Replace any control character (incl. ESC) with `?`; leave everything else
+/// (including non-ASCII) intact.
+fn sanitize_for_display(raw: &str) -> String {
+    raw.chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect()
+}
+
 /// v0.4.17 (T4/RW5): the long-lived MCP state shared across the REPL.
 ///
 /// Holds the sync [`runtime::McpManagerHandle`] (which owns the spawned MCP
@@ -3985,16 +4152,41 @@ fn build_runtime_feature_config(
 struct McpRuntime {
     handle: runtime::McpManagerHandle,
     catalog: McpToolCatalog,
+    /// v0.4.17 (T5): raw server names the user PRE-TRUSTED (`trust: true`) AND
+    /// that come from a USER-scope config. Trust from project/local config is
+    /// NOT honored (a checked-out repo must not be able to self-authorize its
+    /// own MCP tools — codex R2 Track C2). A trusted server's tool calls skip
+    /// the dispatch approval prompt.
+    trusted_servers: HashSet<String>,
+    /// v0.4.17 (T5): raw server names the user approved "don't ask again" for
+    /// during THIS session (in-memory only, never persisted). Lives here (not
+    /// on the executor) so it survives `build_runtime` rebuilds (plan-mode
+    /// switches reuse the same `SharedMcpRuntime`).
+    session_approved: HashSet<String>,
 }
 
 type SharedMcpRuntime = Rc<RefCell<McpRuntime>>;
 
 impl McpRuntime {
-    /// Eager startup discovery (RW5). Builds the sync handle from the runtime
-    /// config, runs one `discover_tools` pass, and caches the resulting
-    /// advertisable catalog. Per-server discovery failures are non-fatal
-    /// (already surfaced by the manager via `discovery_failures` + a stderr
-    /// line); only a hard handle/runtime construction error returns `Err`.
+    /// Eager startup discovery (RW5) with a v0.4.17 (T5) pre-discovery scope
+    /// gate.
+    ///
+    /// **Security boundary (codex R2 Track C2 P0):** a checked-out repository
+    /// may carry `.claude/settings.json` (project scope) or
+    /// `.claude/settings.local.json` (local scope) declaring `mcpServers`.
+    /// Eager discovery SPAWNS each server's command, so discovering an
+    /// untrusted project/local server would be arbitrary command execution
+    /// triggered merely by `cd`-ing into a cloned repo. To close this, ONLY
+    /// USER-scope servers (`~/.claude*`, written by the user themselves) are
+    /// discovered/spawned/advertised. Project- and local-scope servers are
+    /// skipped entirely: not spawned, not advertised, not dispatchable (a name
+    /// the manager never indexed can't be called). The user can promote a
+    /// server to their user config to enable it. `trust: true` is likewise only
+    /// honored for user-scope servers.
+    ///
+    /// Per-server discovery failures (among the user-scope set) are non-fatal
+    /// (surfaced by the manager via `discovery_failures` + a stderr line); only
+    /// a hard handle/runtime construction error returns `Err`.
     ///
     /// MUST be called from outside any tokio runtime context (the handle's
     /// internal `block_on` would panic otherwise) — the CLI's `fn main` is not
@@ -4005,12 +4197,40 @@ impl McpRuntime {
         // v0.5.0 item; for now we just warn.
         const MCP_TOOL_WARN_THRESHOLD: usize = 40;
 
-        let mut handle = runtime::McpManagerHandle::from_runtime_config(config)?;
-        let managed = handle.discover_tools().unwrap_or_else(|error| {
+        // T5 pre-discovery scope gate: keep only user-scope servers; skip
+        // (don't spawn) project/local-scope servers with a one-line notice.
+        let mut user_scope: BTreeMap<String, runtime::ScopedMcpServerConfig> = BTreeMap::new();
+        let mut trusted_servers: HashSet<String> = HashSet::new();
+        for (name, scoped) in config.mcp().servers() {
+            match scoped.scope {
+                ConfigSource::User => {
+                    // Honor trust only from user scope.
+                    if let runtime::McpServerConfig::Stdio(stdio) = &scoped.config {
+                        if stdio.trust() == Some(true) {
+                            trusted_servers.insert(name.clone());
+                        }
+                    }
+                    user_scope.insert(name.clone(), scoped.clone());
+                }
+                ConfigSource::Project | ConfigSource::Local => {
+                    eprintln!(
+                        "aris mcp: skipping {}-scoped MCP server `{}` \
+                         (project/local config cannot authorize a process spawn); \
+                         move it to your user config (~/.claude) to enable.",
+                        scope_label(scoped.scope),
+                        sanitize_for_display(name)
+                    );
+                }
+            }
+        }
+
+        let user_manager = runtime::McpServerManager::from_servers(&user_scope);
+        let mut handle = runtime::McpManagerHandle::from_manager(user_manager)?;
+        let discovered_tools = handle.discover_tools().unwrap_or_else(|error| {
             eprintln!("aris mcp: tool discovery failed, continuing without MCP tools: {error}");
             Vec::new()
         });
-        let catalog = mcp_tool_specs(&managed);
+        let catalog = mcp_tool_specs(&discovered_tools);
 
         if catalog.len() > MCP_TOOL_WARN_THRESHOLD {
             eprintln!(
@@ -4020,13 +4240,28 @@ impl McpRuntime {
             );
         }
 
-        Ok(Self { handle, catalog })
+        Ok(Self {
+            handle,
+            catalog,
+            trusted_servers,
+            session_approved: HashSet::new(),
+        })
     }
 
     /// The advertisable MCP specs (cloned) for appending onto a provider's
     /// static tool catalogue.
     fn advertised_specs(&self) -> Vec<RuntimeToolSpec> {
         self.catalog.specs().to_vec()
+    }
+
+    /// v0.4.17 (T10/P1.3): does the live (startup-discovered) catalog already
+    /// advertise tools from the given raw MCP server name? The inline-`/setup`
+    /// restart notice uses this for `codex`: if the server's tools are already
+    /// in the catalog, an inline `/setup` that (re)wrote `mcpServers.codex`
+    /// needs no restart; if not (the server was added this session, or failed to
+    /// spawn at startup), the user must restart so it's actually spawned.
+    fn catalog_has_server(&self, server_name: &str) -> bool {
+        self.catalog.has_server(server_name)
     }
 }
 
@@ -4051,11 +4286,41 @@ fn build_shared_mcp_runtime() -> Option<SharedMcpRuntime> {
     }
 }
 
-/// Snapshot of the advertised MCP specs to hand to a freshly built executor.
-/// Empty when there is no MCP runtime (preserving the no-MCP byte-equivalence).
-fn advertised_mcp_specs(mcp: Option<&SharedMcpRuntime>) -> Vec<RuntimeToolSpec> {
-    mcp.map(|m| m.borrow().advertised_specs())
-        .unwrap_or_default()
+/// v0.4.17 (T8): apply an `--allowedTools` allowlist to a set of advertised MCP
+/// specs. Mirrors [`filter_tool_specs`]'s semantics for the static catalogue so
+/// the ADVERTISING side and the DISPATCH side
+/// ([`CliToolExecutor::execute`]'s allowlist gate) share one allowlist meaning:
+/// - `None` (no `--allowedTools` given) ⇒ advertise every MCP tool (status quo).
+/// - `Some(set)` ⇒ advertise only the MCP tools whose advertised name is in the
+///   set (an MCP name reaches the set only via the deferred-validation path in
+///   [`normalize_allowed_tools`]).
+///
+/// Pulled into one helper so the two provider advertising paths (`Anthropic` +
+/// `OpenAI`) never drift on which MCP tools they expose.
+fn filter_mcp_specs(
+    specs: Vec<RuntimeToolSpec>,
+    allowed_tools: Option<&AllowedToolSet>,
+) -> Vec<RuntimeToolSpec> {
+    match allowed_tools {
+        None => specs,
+        Some(allowed) => specs
+            .into_iter()
+            .filter(|spec| allowed.contains(&spec.name))
+            .collect(),
+    }
+}
+
+/// Snapshot of the advertised MCP specs to hand to a freshly built executor,
+/// filtered to the current `--allowedTools` allowlist (T8). Empty when there is
+/// no MCP runtime (preserving the no-MCP byte-equivalence).
+fn advertised_mcp_specs(
+    mcp: Option<&SharedMcpRuntime>,
+    allowed_tools: Option<&AllowedToolSet>,
+) -> Vec<RuntimeToolSpec> {
+    let specs = mcp
+        .map(|m| m.borrow().advertised_specs())
+        .unwrap_or_default();
+    filter_mcp_specs(specs, allowed_tools)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4068,8 +4333,9 @@ fn build_runtime(
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
     mcp: Option<SharedMcpRuntime>,
+    may_prompt: bool,
 ) -> Result<ConversationRuntime<ExecutorClient, CliToolExecutor>, Box<dyn std::error::Error>> {
-    let mcp_specs = advertised_mcp_specs(mcp.as_ref());
+    let mcp_specs = advertised_mcp_specs(mcp.as_ref(), allowed_tools.as_ref());
     let executor: ExecutorClient =
         if let Some(config) = openai_executor::resolve_openai_executor_config() {
             ExecutorClient::OpenAI(openai_executor::OpenAIRuntimeClient::new(
@@ -4090,13 +4356,29 @@ fn build_runtime(
             )?)
         };
 
+    // v0.4.17 (T5): register each ADVERTISED MCP tool with the generic
+    // PermissionPolicy at the MINIMAL required mode (ReadOnly). Rationale: an
+    // unregistered tool defaults to required=DangerFullAccess, which would make
+    // the generic gate silently DENY MCP tools in read-only/workspace mode
+    // (never reaching the executor's MCP approval) — and conversely the generic
+    // gate must not be the place that auto-grants them either. Registering at
+    // ReadOnly means the generic gate always passes an advertised MCP tool
+    // through to the executor (ReadOnly ≤ any active level; Prompt mode still
+    // prompts once; Allow bypasses), where the real MCP-specific safety
+    // confirmation runs (`CliToolExecutor::dispatch_mcp`). We register the
+    // ALLOWLIST-FILTERED advertised names so a name not exposed to the model
+    // also isn't registered.
+    let mcp_names = advertised_mcp_specs(mcp.as_ref(), allowed_tools.as_ref())
+        .into_iter()
+        .map(|spec| spec.name);
+
     let feature_config = build_runtime_feature_config()?;
     let event_sink = build_event_sink(&feature_config);
     Ok(ConversationRuntime::new_with_features(
         session,
         executor,
-        CliToolExecutor::new(allowed_tools, emit_output, mcp),
-        permission_policy(permission_mode),
+        CliToolExecutor::new(allowed_tools, emit_output, mcp, permission_mode, may_prompt),
+        permission_policy_with_mcp(permission_mode, mcp_names),
         system_prompt,
         feature_config,
     )
@@ -4137,6 +4419,16 @@ impl runtime::PermissionPrompter for CliPermissionPrompter {
         println!("  Current mode     {}", self.current_mode.as_str());
         println!("  Required mode    {}", request.required_mode.as_str());
         println!("  Input            {}", request.input);
+        // v0.4.17 (T5): in Prompt mode the generic gate confirms every tool,
+        // including MCP tools — and for MCP tools the executor-layer approval
+        // is intentionally skipped to avoid double-confirmation. So this generic
+        // prompt IS the confirmation for an MCP call; surface the external-
+        // process caveat here too.
+        if request.tool_name.starts_with("mcp__") {
+            println!(
+                "  Note             MCP servers run as external processes; the sandbox does NOT cover them."
+            );
+        }
         print!("Approve this tool call? [y/N]: ");
         let _ = io::stdout().flush();
 
@@ -5001,6 +5293,73 @@ fn response_to_events(
     Ok(events)
 }
 
+/// v0.4.17 (T5): outcome of the MCP-specific approval decision, computed by the
+/// pure [`mcp_approval_decision`] so it can be exhaustively unit-tested without
+/// touching stdin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum McpApprovalDecision {
+    /// Run the tool without prompting (trusted / session-approved / Prompt mode
+    /// already confirmed via the generic gate / explicit Allow bypass).
+    Allow,
+    /// Interactively confirm with the user before running.
+    Prompt,
+    /// Refuse without prompting (non-interactive + untrusted).
+    Deny,
+}
+
+/// v0.4.17 (T5): the MCP-specific safety decision, made AFTER the generic
+/// [`PermissionPolicy`] gate has already allowed the call through to the
+/// executor. MCP servers are out-of-process children the sandbox cannot
+/// contain, so even `DangerFullAccess` must confirm an MCP tool call — UNLESS
+/// the user pre-trusted the server or already approved it this session.
+///
+/// Pure (no I/O) so the full truth table is unit-tested. Inputs:
+/// - `mode`: the active [`PermissionMode`].
+/// - `trusted`: the originating server is in the user-scope `trust: true` set.
+/// - `session_approved`: the user picked "don't ask again" for this server
+///   earlier this session.
+/// - `may_prompt`: the run can interactively prompt (the REPL turn path).
+///   `false` for `--print`/one-shot/JSON output, where no prompt is possible.
+///
+/// Decision order:
+/// 1. `trusted` ⇒ Allow (explicit user pre-approval).
+/// 2. `session_approved` ⇒ Allow (already confirmed this session).
+/// 3. `Prompt` mode ⇒ Allow — the generic gate ALREADY prompted y/N for this
+///    tool (Prompt mode routes every tool to the prompter regardless of the
+///    registered required mode), so a second MCP-specific prompt would be a
+///    double confirmation. The generic prompt carries an MCP warning line (see
+///    `CliPermissionPrompter::decide`).
+/// 4. `Allow` mode ⇒ Allow — the explicit "bypass everything" mode (the generic
+///    gate short-circuits it too). Distinct from `DangerFullAccess`.
+/// 5. otherwise (`ReadOnly`/`WorkspaceWrite`/`DangerFullAccess`, untrusted):
+///    Prompt if interactive, else Deny.
+const fn mcp_approval_decision(
+    mode: PermissionMode,
+    trusted: bool,
+    session_approved: bool,
+    may_prompt: bool,
+) -> McpApprovalDecision {
+    if trusted || session_approved {
+        return McpApprovalDecision::Allow;
+    }
+    match mode {
+        // Generic gate already prompted (Prompt) / bypassed everything (Allow).
+        PermissionMode::Prompt | PermissionMode::Allow => McpApprovalDecision::Allow,
+        // Read-only / workspace-write / danger-full-access: the sandbox does
+        // not cover the out-of-process MCP child, so confirm interactively;
+        // when we can't prompt (non-interactive), deny.
+        PermissionMode::ReadOnly
+        | PermissionMode::WorkspaceWrite
+        | PermissionMode::DangerFullAccess => {
+            if may_prompt {
+                McpApprovalDecision::Prompt
+            } else {
+                McpApprovalDecision::Deny
+            }
+        }
+    }
+}
+
 struct CliToolExecutor {
     renderer: TerminalRenderer,
     emit_output: bool,
@@ -5010,6 +5369,15 @@ struct CliToolExecutor {
     /// an `mcp__` name falls through to `execute_tool` and gets the usual
     /// `unsupported tool` error (preserving pre-v0.4.17 behavior).
     mcp: Option<SharedMcpRuntime>,
+    /// v0.4.17 (T5): the active permission mode, used by the MCP-specific
+    /// approval decision (see [`mcp_approval_decision`]).
+    permission_mode: PermissionMode,
+    /// v0.4.17 (T5): whether this run may interactively prompt for MCP
+    /// approval. `true` only for the interactive REPL turn path; `false` for
+    /// `--print`/one-shot/JSON output (where an untrusted MCP call is denied
+    /// rather than silently run). Passed in explicitly — NOT derived from a
+    /// stdin TTY check alone (codex R1 Track C2 P1).
+    may_prompt: bool,
 }
 
 impl CliToolExecutor {
@@ -5017,38 +5385,105 @@ impl CliToolExecutor {
         allowed_tools: Option<AllowedToolSet>,
         emit_output: bool,
         mcp: Option<SharedMcpRuntime>,
+        permission_mode: PermissionMode,
+        may_prompt: bool,
     ) -> Self {
         Self {
             renderer: TerminalRenderer::new(),
             emit_output,
             allowed_tools,
             mcp,
+            permission_mode,
+            may_prompt,
         }
     }
 
-    /// v0.4.17 (T3): dispatch a single `mcp__`-prefixed tool call through the
-    /// shared MCP handle. Returns the flattened textual content. An MCP-level
-    /// `isError: true` result and any transport/JSON-RPC error both map to an
-    /// `Err(ToolError)` — the message never includes credentials or env var
-    /// names.
+    /// v0.4.17 (T3 + T5): dispatch a single `mcp__`-prefixed tool call through
+    /// the shared MCP handle, AFTER clearing the MCP-specific approval gate.
+    /// Returns the flattened textual content. An MCP-level `isError: true`
+    /// result and any transport/JSON-RPC error both map to an `Err(ToolError)`
+    /// — the message never includes credentials or env var names.
     ///
     /// SPIKE-A invariant: this runs in `CliToolExecutor::execute`, the pure
     /// synchronous tool-dispatch layer (outside any `block_on`), so the
     /// handle's internal `block_on` is safe.
+    ///
+    /// T5 approval flow (codex R1 Track C2): the route is resolved and the
+    /// trust/session state SNAPSHOTTED first, then the `RefCell` borrow is
+    /// dropped BEFORE any (blocking) interactive prompt — we never hold a
+    /// borrow across user input. The pure [`mcp_approval_decision`] picks
+    /// Allow/Prompt/Deny; a Prompt is resolved by a small executor-local stdin
+    /// confirmation (the generic [`CliPermissionPrompter`] is not reachable from
+    /// the executor, and threading it through the `ToolExecutor` trait would be
+    /// a runtime-crate change this step forbids).
     fn dispatch_mcp(
         mcp: &SharedMcpRuntime,
         tool_name: &str,
         value: &serde_json::Value,
+        permission_mode: PermissionMode,
+        may_prompt: bool,
     ) -> Result<String, ToolError> {
+        // Phase 1: resolve route + snapshot approval inputs, then DROP the
+        // borrow so a prompt can't deadlock the RefCell.
+        let (qualified, server_name, trusted, session_approved) = {
+            let mcp_ref = mcp.borrow();
+            // codex R2 Track C2: a name the catalog never produced has no
+            // server identity to authorize against — deny rather than fall back
+            // to the raw name (which would dispatch un-approved).
+            let route = mcp_ref
+                .catalog
+                .route_for_advertised_name(tool_name)
+                .ok_or_else(|| {
+                    // tool_name is model-supplied; sanitize before it reaches the
+                    // terminal renderer.
+                    ToolError::new(format!(
+                        "unknown MCP tool: {}",
+                        sanitize_for_display(tool_name)
+                    ))
+                })?;
+            let server_name = route.server_name.clone();
+            (
+                route.qualified_name.clone(),
+                server_name.clone(),
+                mcp_ref.trusted_servers.contains(&server_name),
+                mcp_ref.session_approved.contains(&server_name),
+            )
+        };
+
+        // Phase 2: pure decision (no borrow held).
+        match mcp_approval_decision(permission_mode, trusted, session_approved, may_prompt) {
+            McpApprovalDecision::Allow => {}
+            McpApprovalDecision::Deny => {
+                let safe_server = sanitize_for_display(&server_name);
+                return Err(ToolError::new(format!(
+                    "MCP tool `{}` (server `{safe_server}`) requires interactive \
+                     approval or `mcpServers.{safe_server}.trust: true` in your user config; \
+                     not run in a non-interactive session.",
+                    sanitize_for_display(tool_name)
+                )));
+            }
+            McpApprovalDecision::Prompt => {
+                // No borrow held while we block on stdin.
+                match prompt_mcp_approval(tool_name, &server_name) {
+                    McpPromptOutcome::AllowOnce => {}
+                    McpPromptOutcome::AllowSession => {
+                        mcp.borrow_mut()
+                            .session_approved
+                            .insert(server_name.clone());
+                    }
+                    McpPromptOutcome::Deny => {
+                        return Err(ToolError::new(format!(
+                            "MCP tool `{}` (server `{}`) denied by user.",
+                            sanitize_for_display(tool_name),
+                            sanitize_for_display(&server_name)
+                        )));
+                    }
+                }
+            }
+        }
+
+        // Phase 3: dispatch (re-borrow for the call).
         let mut mcp = mcp.borrow_mut();
-        // Map the advertised name back to its route (qualified name + raw
-        // server identity) the manager can resolve. Falls back to the
-        // advertised name verbatim for a name the catalog never produced (the
-        // manager will then surface an `unknown MCP tool` error).
-        let qualified = mcp
-            .catalog
-            .route_for_advertised_name(tool_name)
-            .map_or_else(|| tool_name.to_string(), |route| route.qualified_name.clone());
         let arguments = if value.is_null() {
             None
         } else {
@@ -5079,6 +5514,46 @@ impl CliToolExecutor {
     }
 }
 
+/// v0.4.17 (T5): the user's answer to the MCP approval prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum McpPromptOutcome {
+    /// Run this one call only; ask again next time.
+    AllowOnce,
+    /// Run this call and don't ask again for this server this session.
+    AllowSession,
+    /// Refuse this call.
+    Deny,
+}
+
+/// v0.4.17 (T5): interactively confirm an MCP tool call on stdin. Mirrors the
+/// style of [`CliPermissionPrompter::decide`] (no `RefCell` borrow is held by
+/// the caller while this blocks). Surfaces the RAW server name + tool name and
+/// the out-of-process / sandbox-uncovered caveat, and offers: allow once /
+/// don't-ask-again-for-this-server / deny. A read error or any unrecognized
+/// input is treated as Deny (fail-closed). Carries no credentials.
+fn prompt_mcp_approval(tool_name: &str, server_name: &str) -> McpPromptOutcome {
+    println!();
+    println!("MCP tool approval required");
+    // Sanitize raw config-sourced names against terminal control-char injection.
+    println!("  Server (raw)  {}", sanitize_for_display(server_name));
+    println!("  Tool          {}", sanitize_for_display(tool_name));
+    println!(
+        "  Note          MCP servers run as external processes; the sandbox does NOT cover them."
+    );
+    print!("Approve? [o]nce / [s]ession (don't ask again for this server) / [N]o deny: ");
+    let _ = io::stdout().flush();
+
+    let mut response = String::new();
+    match io::stdin().read_line(&mut response) {
+        Ok(_) => match response.trim().to_ascii_lowercase().as_str() {
+            "o" | "once" | "y" | "yes" => McpPromptOutcome::AllowOnce,
+            "s" | "session" => McpPromptOutcome::AllowSession,
+            _ => McpPromptOutcome::Deny,
+        },
+        Err(_) => McpPromptOutcome::Deny,
+    }
+}
+
 /// v0.4.17 (T3): flatten an MCP tool result's content blocks into a single
 /// string. `text` blocks contribute their text; any other block kind is
 /// serialized to a JSON line so nothing is silently dropped.
@@ -5095,7 +5570,10 @@ fn flatten_mcp_content(content: &[runtime::McpToolCallContent]) -> String {
         // the full block (kind + flattened data) so structured content
         // survives round-trip.
         let mut obj = serde_json::Map::new();
-        obj.insert("type".to_string(), serde_json::Value::String(block.kind.clone()));
+        obj.insert(
+            "type".to_string(),
+            serde_json::Value::String(block.kind.clone()),
+        );
         for (key, value) in &block.data {
             obj.insert(key.clone(), value.clone());
         }
@@ -5124,7 +5602,13 @@ impl ToolExecutor for CliToolExecutor {
         // pre-v0.4.17 behavior for users without `mcpServers`).
         if tool_name.starts_with("mcp__") {
             if let Some(mcp) = self.mcp.as_ref() {
-                let result = Self::dispatch_mcp(mcp, tool_name, &value);
+                let result = Self::dispatch_mcp(
+                    mcp,
+                    tool_name,
+                    &value,
+                    self.permission_mode,
+                    self.may_prompt,
+                );
                 if self.emit_output {
                     let (body, is_error) = match &result {
                         Ok(output) => (output.clone(), false),
@@ -5161,12 +5645,24 @@ impl ToolExecutor for CliToolExecutor {
     }
 }
 
-fn permission_policy(mode: PermissionMode) -> PermissionPolicy {
-    tool_permission_specs()
+/// v0.4.17 (T5): the generic [`PermissionPolicy`] plus the advertised MCP tool
+/// names registered at the MINIMAL required mode ([`PermissionMode::ReadOnly`]).
+/// See [`build_runtime`] for why the minimal mode (so the generic gate neither
+/// blocks nor auto-grants MCP tools — it passes them to the executor's
+/// MCP-specific approval). Static tools keep their own required modes from
+/// [`tool_permission_specs`].
+fn permission_policy_with_mcp(
+    mode: PermissionMode,
+    mcp_names: impl Iterator<Item = String>,
+) -> PermissionPolicy {
+    let policy = tool_permission_specs()
         .into_iter()
         .fold(PermissionPolicy::new(mode), |policy, spec| {
             policy.with_tool_requirement(spec.name, spec.required_permission)
-        })
+        });
+    mcp_names.fold(policy, |policy, name| {
+        policy.with_tool_requirement(name, PermissionMode::ReadOnly)
+    })
 }
 
 fn tool_permission_specs() -> Vec<ToolSpec> {
@@ -5370,6 +5866,201 @@ fn check_auth_status() -> &'static str {
     "NOT FOUND"
 }
 
+/// v0.4.17 (RW7): per-server outcome the doctor reports for a configured MCP
+/// server. Computed by `run_doctor` (which does the I/O — spawn/initialize/
+/// tools-list) and rendered by the pure [`mcp_doctor_section`] formatter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum McpDoctorStatus {
+    /// User-scope server that was spawned + initialized; `tool_count` tools
+    /// discovered.
+    Discovered { tool_count: usize },
+    /// User-scope server that failed to spawn/initialize/list (reason carried
+    /// for the user; never credentials).
+    Failed { reason: String },
+    /// User-scope server whose transport is not stdio (the only transport this
+    /// build spawns). The manager records these in `unsupported_servers()`, not
+    /// the spawn set — so without this they'd falsely render as "discovered, 0
+    /// tools" (codex R Track C2 P2).
+    Unsupported { transport: String },
+    /// Project/local-scope server skipped by the T5 pre-discovery scope gate
+    /// (not spawned).
+    SkippedScope,
+}
+
+/// v0.4.17 (RW7): one row of the doctor MCP section.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct McpDoctorServer {
+    name: String,
+    scope: ConfigSource,
+    trusted: bool,
+    status: McpDoctorStatus,
+}
+
+/// v0.4.17 (RW7) step ①: PURE formatter for the doctor MCP section. Takes the
+/// already-collected per-server outcomes and renders the section, or `None`
+/// when no MCP servers are configured (so users who don't use MCP see nothing).
+/// All I/O (spawn/initialize/discovery) stays in [`run_doctor`]; this function
+/// is side-effect-free so it can be unit-tested.
+///
+/// RW7 sequence note: this replaced the old inline Check-6 warning whose text
+/// claimed "Full tool dispatch into LLM context lands in v0.4.16" — that
+/// placeholder is now false (dispatch landed in v0.4.17). The baseline of the
+/// OLD text was captured + then updated here in one move (the section was never
+/// unit-tested before, so there was no separate locked baseline to break);
+/// `mcp_doctor_section_*` tests now lock this real-status text.
+fn mcp_doctor_section(servers: &[McpDoctorServer]) -> Option<String> {
+    use std::fmt::Write as _;
+    if servers.is_empty() {
+        return None;
+    }
+    let discovered: usize = servers
+        .iter()
+        .filter(|s| matches!(s.status, McpDoctorStatus::Discovered { .. }))
+        .count();
+    let mut out = String::new();
+    // `write!` to a String is infallible; ignore the Result.
+    let _ = writeln!(
+        out,
+        "  MCP servers:  {} configured ({} user-scope discovered)",
+        servers.len(),
+        discovered
+    );
+    for server in servers {
+        let trust = if server.trusted { ", trusted" } else { "" };
+        let scope = scope_label(server.scope);
+        // Sanitize the raw config-sourced name against terminal injection.
+        let name = sanitize_for_display(&server.name);
+        let _ = match &server.status {
+            McpDoctorStatus::Discovered { tool_count } => writeln!(
+                out,
+                "    - {name} [{scope}{trust}]: spawned + initialized, {tool_count} tool(s)"
+            ),
+            McpDoctorStatus::Failed { reason } => writeln!(
+                out,
+                "    - {name} [{scope}{trust}]: FAILED — {}",
+                sanitize_for_display(reason)
+            ),
+            McpDoctorStatus::Unsupported { transport } => writeln!(
+                out,
+                "    - {name} [{scope}]: unsupported transport ({transport}); only stdio is spawned"
+            ),
+            McpDoctorStatus::SkippedScope => writeln!(
+                out,
+                "    - {name} [{scope}]: skipped (project/local scope is not spawned; \
+                 move to user config to enable)"
+            ),
+        };
+    }
+    out.push_str(
+        "    Note: only user-scope servers are spawned at startup; tool CALLS are \
+         approval-gated (trusted servers skip the prompt).\n",
+    );
+    // v0.4.17 (T10/P2 / RW7 step ③, deliberately updated): make the path
+    // mismatch between the legacy "Codex MCP" check and the runtime's
+    // ConfigLoader scope user-visible (previously this was only a source
+    // comment). The "Codex MCP" line above reads ~/.claude.json; the runtime
+    // (and this per-server section) reads mcpServers from settings.json.
+    out.push_str(
+        "    Note: legacy ~/.claude.json is checked separately for Codex MCP; \
+         mcpServers used at runtime live in <config_home>/settings.json.",
+    );
+    Some(out)
+}
+
+/// v0.4.17 (RW7): collect per-server MCP doctor outcomes (the I/O side that
+/// feeds the pure [`mcp_doctor_section`]). Project/local servers are reported
+/// as scope-skipped without spawning; user-scope servers are spawned once and
+/// reported as discovered (with tool count) or failed. Best-effort: a hard
+/// config/handle error yields an empty list rather than failing `aris doctor`.
+fn collect_mcp_doctor_servers(cwd: &std::path::Path) -> Vec<McpDoctorServer> {
+    let Ok(config) = runtime::ConfigLoader::default_for(cwd).load() else {
+        return Vec::new();
+    };
+    let servers = config.mcp().servers();
+    if servers.is_empty() {
+        return Vec::new();
+    }
+
+    // Partition by scope (mirror McpRuntime::discover): only user-scope is
+    // spawned.
+    let mut user_scope: BTreeMap<String, runtime::ScopedMcpServerConfig> = BTreeMap::new();
+    let mut rows: Vec<McpDoctorServer> = Vec::new();
+    for (name, scoped) in servers {
+        let trusted = matches!(&scoped.config, runtime::McpServerConfig::Stdio(s) if s.trust() == Some(true))
+            && scoped.scope == ConfigSource::User;
+        match scoped.scope {
+            ConfigSource::User => {
+                user_scope.insert(name.clone(), scoped.clone());
+                // status filled in after discovery; placeholder Failed replaced
+                // below.
+                rows.push(McpDoctorServer {
+                    name: name.clone(),
+                    scope: scoped.scope,
+                    trusted,
+                    status: McpDoctorStatus::Failed {
+                        reason: "not discovered".to_string(),
+                    },
+                });
+            }
+            ConfigSource::Project | ConfigSource::Local => {
+                rows.push(McpDoctorServer {
+                    name: name.clone(),
+                    scope: scoped.scope,
+                    trusted: false,
+                    status: McpDoctorStatus::SkippedScope,
+                });
+            }
+        }
+    }
+
+    if !user_scope.is_empty() {
+        let manager = runtime::McpServerManager::from_servers(&user_scope);
+        if let Ok(mut handle) = runtime::McpManagerHandle::from_manager(manager) {
+            let discovered = handle.discover_tools().unwrap_or_default();
+            // Tools per server name.
+            let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+            for tool in &discovered {
+                *counts.entry(tool.server_name.clone()).or_insert(0) += 1;
+            }
+            // Per-server failures from this pass.
+            let failures: BTreeMap<String, String> = handle
+                .discovery_failures()
+                .iter()
+                .map(|f| (f.server_name.clone(), f.reason.clone()))
+                .collect();
+            // Non-stdio servers are recorded here (not the spawn set), so a
+            // user-scope SSE/HTTP/WS server must NOT render as "discovered, 0
+            // tools" (codex R Track C2 P2).
+            let unsupported: BTreeMap<String, String> = handle
+                .unsupported_servers()
+                .iter()
+                .map(|u| (u.server_name.clone(), format!("{:?}", u.transport)))
+                .collect();
+            for row in &mut rows {
+                if row.scope != ConfigSource::User {
+                    continue;
+                }
+                row.status = if let Some(transport) = unsupported.get(&row.name) {
+                    McpDoctorStatus::Unsupported {
+                        transport: transport.clone(),
+                    }
+                } else if let Some(reason) = failures.get(&row.name) {
+                    McpDoctorStatus::Failed {
+                        reason: reason.clone(),
+                    }
+                } else {
+                    McpDoctorStatus::Discovered {
+                        tool_count: counts.get(&row.name).copied().unwrap_or(0),
+                    }
+                };
+            }
+            let _ = handle.shutdown();
+        }
+    }
+
+    rows
+}
+
 fn run_doctor() -> Result<(), Box<dyn std::error::Error>> {
     println!("ARIS Doctor v{VERSION}");
     println!();
@@ -5512,22 +6203,34 @@ fn run_doctor() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         println!("NOT CONFIGURED (no ~/.claude.json)");
     }
+    // v0.4.17 (T10/P2): user-visible disclosure of the path mismatch (was only a
+    // source comment). Always printed so it shows even when no settings.json MCP
+    // servers exist (the per-server section below is omitted in that case).
+    println!(
+        "                note: legacy ~/.claude.json is checked for Codex MCP; \
+         mcpServers used at runtime live in <config_home>/settings.json"
+    );
 
-    // Check 6 (v0.4.14 M1/M2): MCP dispatch experimental warning.
-    // Surfaces only when mcpServers are actually configured so users
-    // who don't use MCP aren't bothered.
-    let mcp_server_count = runtime::ConfigLoader::default_for(&cwd)
-        .load()
-        .map(|rc| rc.mcp().servers().len())
-        .unwrap_or(0);
-    if mcp_server_count > 0 {
+    // Check 6 (v0.4.17 RW7 step ③): real per-server MCP status.
+    //
+    // Disclosure (plan RW7): the "Codex MCP" check above reads `~/.claude.json`
+    // directly, which is NOT the same path set the runtime `ConfigLoader`
+    // resolves (user `~/.claude/settings.json` + project `.claude/settings.json`
+    // + local `.claude/settings.local.json`). The section below uses the
+    // ConfigLoader-resolved `mcpServers`, so a codex server declared only in
+    // `~/.claude.json` may show under "Codex MCP" but not here, and vice versa.
+    // This is surfaced rather than reconciled (no path refactor this version).
+    //
+    // We do a one-shot discovery pass over USER-scope servers (the same scope
+    // gate as `McpRuntime::discover`): project/local servers are reported as
+    // skipped (never spawned). Per-server timeouts are honored by the manager's
+    // own `discover_tools` (per-server `requestTimeoutSecs`), so a hung server
+    // can't wedge the doctor. Discovery is best-effort: any hard error degrades
+    // to an empty/partial section rather than failing the whole command.
+    let doctor_servers = collect_mcp_doctor_servers(&cwd);
+    if let Some(section) = mcp_doctor_section(&doctor_servers) {
         println!();
-        println!(
-            "\x1b[33m⚠  MCP servers configured ({mcp_server_count}) but currently only stdio test/diagnostics.\x1b[0m"
-        );
-        println!(
-            "\x1b[33m   Full tool dispatch into LLM context lands in v0.4.16. (See README MCP section.)\x1b[0m"
-        );
+        println!("{section}");
     }
 
     println!();
@@ -5668,8 +6371,8 @@ mod tests {
         format_tool_call_start, format_tool_result, normalize_permission_mode, parse_args,
         parse_git_status_metadata, print_help_to, push_output_block, render_config_report,
         render_memory_report, render_repl_help, resolve_model_alias, response_to_events,
-        resume_supported_slash_commands, status_context, CliAction, CliOutputFormat, SlashCommand,
-        StatusUsage, DEFAULT_MODEL,
+        resume_supported_slash_commands, reviewer_routing_nudge, status_context, CliAction,
+        CliOutputFormat, SlashCommand, StatusUsage, DEFAULT_MODEL,
     };
     use api::{MessageResponse, OutputContentBlock, Usage};
     use runtime::{AssistantEvent, ContentBlock, ConversationMessage, MessageRole, PermissionMode};
@@ -5968,12 +6671,16 @@ mod tests {
         assert_eq!(names, vec!["bash", "grep_search"]);
     }
 
-    /// An `mcp__`-prefixed name in a hand-built allowlist is treated as
-    /// unknown by the CURRENT filter (it is not in the static catalogue)
-    /// and is dropped. T8 baseline, filter layer. Note: in the real CLI an
-    /// `mcp__` name never even reaches this filter — `normalize_allowed_tools`
-    /// rejects it at arg parsing (see
-    /// `char_normalize_allowed_tools_rejects_mcp_name`).
+    /// `filter_tool_specs` only ever filters the STATIC catalogue, so an
+    /// `mcp__`-prefixed name in its allowlist matches nothing there and is
+    /// dropped — and MUST be, because MCP tools are advertised via the separate
+    /// `filter_mcp_specs` path, not this one. (See `char_filter_mcp_specs_*` for
+    /// the MCP advertising filter.) deliberately flipped in v0.4.17 (T8): the
+    /// docstring previously claimed an mcp__ name "never even reaches this
+    /// filter" because `normalize_allowed_tools` rejected it; T8 now ACCEPTS
+    /// mcp__ names (deferred validation), so they can reach here — and this
+    /// filter still correctly drops them from the STATIC tool list while
+    /// `filter_mcp_specs` advertises them on the MCP side.
     #[test]
     fn char_filter_tool_specs_mcp_name_currently_dropped() {
         let allowed: super::AllowedToolSet = ["mcp__codex__codex", "read_file"]
@@ -5987,25 +6694,343 @@ mod tests {
         assert_eq!(names, vec!["read_file"]);
     }
 
-    /// T8 baseline, arg-parsing layer (the REAL entry point): today
-    /// `--allowedTools mcp__codex__codex` is rejected outright by
-    /// `normalize_allowed_tools` because the name is not in the static
-    /// catalogue. Phase 1 T8 will deliberately flip this to deferred
-    /// validation (accept `mcp__` prefix at parse time, filter at dispatch).
+    /// deliberately flipped in v0.4.17 (T8): `--allowedTools mcp__<server>__<tool>`
+    /// is now ACCEPTED at arg-parse time via deferred validation (the static
+    /// catalogue cannot know which MCP tools exist before runtime discovery).
+    /// Previously `normalize_allowed_tools` rejected any non-catalogue name,
+    /// including `mcp__` names; the new behavior records the mcp__ name verbatim
+    /// (case-preserved) so the advertising/dispatch layers can filter to it.
+    /// Non-mcp unknown names still hard-error (per-name validation unchanged).
     #[test]
-    fn char_normalize_allowed_tools_rejects_mcp_name() {
-        let err = super::normalize_allowed_tools(&["mcp__codex__codex".to_string()])
-            .expect_err("mcp__ names are not in the static catalogue today");
+    fn char_normalize_allowed_tools_accepts_mcp_name() {
+        let set = super::normalize_allowed_tools(&["mcp__codex__codex".to_string()])
+            .expect("mcp__ names are now accepted via deferred validation")
+            .expect("non-empty input yields a set");
         assert!(
-            err.contains("unsupported tool in --allowedTools: mcp__codex__codex"),
+            set.contains("mcp__codex__codex"),
+            "mcp__ name must be recorded verbatim (case-preserved): {set:?}"
+        );
+
+        // A NON-mcp unknown name still hard-errors (deferred validation is
+        // scoped to the mcp__ prefix only; per-name validation is unchanged).
+        let err = super::normalize_allowed_tools(&["totally_made_up".to_string()])
+            .expect_err("unknown non-mcp names still rejected");
+        assert!(
+            err.contains("unsupported tool in --allowedTools: totally_made_up"),
             "unexpected error shape: {err}"
         );
-        // Known-good names still parse (guards against the rejection being
-        // a blanket failure rather than per-name validation).
-        let ok = super::normalize_allowed_tools(&["read_file".to_string()])
-            .expect("catalogue names parse")
+
+        // Known-good static names still parse alongside mcp__ names.
+        let mixed = super::normalize_allowed_tools(&["read_file, mcp__codex__codex".to_string()])
+            .expect("mixed list parses")
             .expect("non-empty input yields a set");
-        assert!(ok.contains("read_file"));
+        assert!(mixed.contains("read_file") && mixed.contains("mcp__codex__codex"));
+    }
+
+    // ── v0.4.17 C2 (T8): MCP advertising filter consistency ─────────────────
+
+    fn runtime_spec(name: &str) -> super::RuntimeToolSpec {
+        super::RuntimeToolSpec {
+            name: name.to_string(),
+            description: format!("desc for {name}"),
+            input_schema: json!({ "type": "object" }),
+        }
+    }
+
+    /// T8 (advertising side): with NO `--allowedTools`, every discovered MCP
+    /// tool is advertised (status quo — the allowlist is the only gate).
+    #[test]
+    fn char_filter_mcp_specs_no_allowlist_advertises_all() {
+        let specs = vec![
+            runtime_spec("mcp__codex__codex"),
+            runtime_spec("mcp__gh__list_prs"),
+        ];
+        let out = super::filter_mcp_specs(specs.clone(), None);
+        let names: Vec<&str> = out.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["mcp__codex__codex", "mcp__gh__list_prs"]);
+    }
+
+    /// T8 (advertising side): an allowlist containing an MCP name advertises
+    /// EXACTLY that MCP tool and drops the others — the same allowlist that
+    /// `normalize_allowed_tools` accepted via deferred validation.
+    #[test]
+    fn char_filter_mcp_specs_allowlist_keeps_only_listed_mcp_name() {
+        let specs = vec![
+            runtime_spec("mcp__codex__codex"),
+            runtime_spec("mcp__gh__list_prs"),
+        ];
+        let allowed: super::AllowedToolSet = ["mcp__codex__codex", "read_file"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let out = super::filter_mcp_specs(specs, Some(&allowed));
+        let names: Vec<&str> = out.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["mcp__codex__codex"]);
+    }
+
+    /// T8 (advertising side): an allowlist with NO MCP name advertises ZERO MCP
+    /// tools (a `--allowedTools read_file` user gets no MCP tools, matching the
+    /// dispatch gate which would also reject them).
+    #[test]
+    fn char_filter_mcp_specs_allowlist_without_mcp_name_advertises_none() {
+        let specs = vec![runtime_spec("mcp__codex__codex")];
+        let allowed: super::AllowedToolSet =
+            ["read_file"].into_iter().map(str::to_string).collect();
+        let out = super::filter_mcp_specs(specs, Some(&allowed));
+        assert!(
+            out.is_empty(),
+            "no MCP name in allowlist => no MCP advertised"
+        );
+    }
+
+    /// T8 (dispatch side): the `CliToolExecutor` allowlist gate rejects an MCP
+    /// name that is NOT in the allowlist BEFORE any MCP dispatch is attempted —
+    /// the same allowlist semantics as the advertising filter, so advertising
+    /// and dispatch never disagree. (mcp: None here only proves the gate fires
+    /// first; the gate runs identically with an MCP runtime present.)
+    #[test]
+    fn char_cli_executor_allowlist_gate_rejects_unlisted_mcp_name() {
+        let allowed: super::AllowedToolSet = ["mcp__codex__codex"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let mut executor = super::CliToolExecutor::new(
+            Some(allowed),
+            false,
+            None,
+            super::PermissionMode::DangerFullAccess,
+            true,
+        );
+        let err = executor
+            .execute("mcp__other__tool", "{}")
+            .expect_err("an MCP name not in the allowlist must be gated");
+        assert!(
+            err.to_string()
+                .contains("not enabled by the current --allowedTools"),
+            "must be rejected by the allowlist gate, not dispatch: {err}"
+        );
+    }
+
+    // ── v0.4.17 C2 (T5): MCP approval decision truth table ──────────────────
+
+    /// The full truth table of `mcp_approval_decision` across the four active
+    /// modes the CLI exposes (read-only / workspace-write / danger-full-access /
+    /// prompt) × trusted/untrusted × interactive/non-interactive. The
+    /// interactive prompt itself is not unit-testable (stdin), so only this pure
+    /// decision is tested — it is the single source of truth for the gate.
+    #[test]
+    fn mcp_approval_decision_truth_table() {
+        use super::mcp_approval_decision as decide;
+        use super::McpApprovalDecision::{Allow as DAllow, Deny as DDeny, Prompt as DPrompt};
+        use runtime::PermissionMode::{
+            Allow as MAllow, DangerFullAccess, Prompt as MPrompt, ReadOnly, WorkspaceWrite,
+        };
+
+        // trusted => Allow, regardless of mode / interactivity / session.
+        for &mode in &[ReadOnly, WorkspaceWrite, DangerFullAccess, MPrompt, MAllow] {
+            for &interactive in &[true, false] {
+                for &session in &[true, false] {
+                    assert_eq!(
+                        decide(mode, true, session, interactive),
+                        DAllow,
+                        "trusted must always Allow (mode={mode:?}, interactive={interactive}, session={session})"
+                    );
+                }
+            }
+        }
+
+        // session_approved => Allow (even if not pre-trusted), regardless of
+        // mode / interactivity.
+        for &mode in &[ReadOnly, WorkspaceWrite, DangerFullAccess, MPrompt, MAllow] {
+            for &interactive in &[true, false] {
+                assert_eq!(
+                    decide(mode, false, true, interactive),
+                    DAllow,
+                    "session-approved must Allow (mode={mode:?}, interactive={interactive})"
+                );
+            }
+        }
+
+        // Untrusted + not-session-approved, by mode:
+        // Prompt mode => Allow (generic gate already prompted, no double-ask).
+        assert_eq!(decide(MPrompt, false, false, true), DAllow);
+        assert_eq!(decide(MPrompt, false, false, false), DAllow);
+        // Allow mode => Allow (explicit bypass-everything mode).
+        assert_eq!(decide(MAllow, false, false, true), DAllow);
+        assert_eq!(decide(MAllow, false, false, false), DAllow);
+        // ReadOnly / WorkspaceWrite / DangerFullAccess: Prompt if interactive,
+        // else Deny. DangerFullAccess is NOT auto-Allow (the sandbox can't
+        // contain the external MCP process, so it still confirms).
+        for &mode in &[ReadOnly, WorkspaceWrite, DangerFullAccess] {
+            assert_eq!(
+                decide(mode, false, false, true),
+                DPrompt,
+                "interactive untrusted {mode:?} must Prompt"
+            );
+            assert_eq!(
+                decide(mode, false, false, false),
+                DDeny,
+                "non-interactive untrusted {mode:?} must Deny"
+            );
+        }
+    }
+
+    /// v0.4.17 (T5): `permission_policy_with_mcp` registers each advertised MCP
+    /// name at the MINIMAL required mode (`ReadOnly`) so the generic gate passes
+    /// them through to the executor's MCP approval in every active mode (rather
+    /// than the unregistered default of `DangerFullAccess`, which would make the
+    /// generic gate deny them in read-only/workspace). Static tools keep their
+    /// own required modes.
+    #[test]
+    fn permission_policy_registers_mcp_names_at_readonly() {
+        use runtime::PermissionMode;
+        let policy = super::permission_policy_with_mcp(
+            PermissionMode::ReadOnly,
+            ["mcp__alpha__echo".to_string(), "mcp__beta__run".to_string()].into_iter(),
+        );
+        // MCP names registered at ReadOnly.
+        assert_eq!(
+            policy.required_mode_for("mcp__alpha__echo"),
+            PermissionMode::ReadOnly
+        );
+        assert_eq!(
+            policy.required_mode_for("mcp__beta__run"),
+            PermissionMode::ReadOnly
+        );
+        // Static tools keep their own required modes (bash = DangerFullAccess).
+        assert_eq!(
+            policy.required_mode_for("bash"),
+            PermissionMode::DangerFullAccess
+        );
+        assert_eq!(
+            policy.required_mode_for("read_file"),
+            PermissionMode::ReadOnly
+        );
+        // And in ReadOnly active mode the generic gate ALLOWS a ReadOnly-
+        // required MCP tool through to the executor (the executor then runs the
+        // MCP-specific approval). No prompter needed because ReadOnly >=
+        // ReadOnly short-circuits to Allow.
+        assert_eq!(
+            policy.authorize("mcp__alpha__echo", "{}", None),
+            runtime::PermissionOutcome::Allow
+        );
+    }
+
+    // ── v0.4.17 C2 (RW7): doctor MCP section formatter ──────────────────────
+
+    /// No MCP servers => no section at all (users without MCP see nothing).
+    #[test]
+    fn mcp_doctor_section_empty_is_none() {
+        assert_eq!(super::mcp_doctor_section(&[]), None);
+    }
+
+    /// v0.4.17 (codex R Track C2 P2): control characters in a (project-sourced)
+    /// raw server name must be neutralized before display so a cloned repo's
+    /// config cannot inject terminal escape sequences. Non-control (incl.
+    /// non-ASCII) characters pass through unchanged.
+    #[test]
+    fn sanitize_for_display_neutralizes_control_chars() {
+        assert_eq!(super::sanitize_for_display("plain_name"), "plain_name");
+        assert_eq!(super::sanitize_for_display("café-server"), "café-server");
+        // ESC + CSI sequence and a newline are all replaced with '?'.
+        assert_eq!(
+            super::sanitize_for_display("evil\x1b[31mRED\nx"),
+            "evil?[31mRED?x"
+        );
+    }
+
+    /// A user-scope server whose transport is not stdio renders as
+    /// "unsupported transport", NOT "discovered, 0 tools" (codex R Track C2 P2).
+    #[test]
+    fn mcp_doctor_section_renders_unsupported_transport() {
+        use super::{ConfigSource, McpDoctorServer, McpDoctorStatus};
+        let servers = vec![McpDoctorServer {
+            name: "remote".to_string(),
+            scope: ConfigSource::User,
+            trusted: false,
+            status: McpDoctorStatus::Unsupported {
+                transport: "Sse".to_string(),
+            },
+        }];
+        let section = super::mcp_doctor_section(&servers).expect("non-empty => Some");
+        assert!(
+            section.contains("remote [user]: unsupported transport (Sse); only stdio is spawned"),
+            "{section}"
+        );
+        // Not counted as discovered.
+        assert!(section.contains("0 user-scope discovered"), "{section}");
+    }
+
+    /// RW7 step ②/③: lock the REAL per-server status text and prove the stale
+    /// "lands in v0.4.16" placeholder is gone (it falsely promised a feature
+    /// that shipped in v0.4.17). deliberately updated in RW7 step ③: the old
+    /// inline Check-6 warning text is replaced by this formatter's output.
+    #[test]
+    fn mcp_doctor_section_renders_real_per_server_status() {
+        use super::{ConfigSource, McpDoctorServer, McpDoctorStatus};
+        let servers = vec![
+            McpDoctorServer {
+                name: "codex".to_string(),
+                scope: ConfigSource::User,
+                trusted: true,
+                status: McpDoctorStatus::Discovered { tool_count: 2 },
+            },
+            McpDoctorServer {
+                name: "broken".to_string(),
+                scope: ConfigSource::User,
+                trusted: false,
+                status: McpDoctorStatus::Failed {
+                    reason: "spawn failed: no such file".to_string(),
+                },
+            },
+            McpDoctorServer {
+                name: "repo_tool".to_string(),
+                scope: ConfigSource::Project,
+                trusted: false,
+                status: McpDoctorStatus::SkippedScope,
+            },
+        ];
+        let section = super::mcp_doctor_section(&servers).expect("non-empty => Some");
+
+        // Header reports total + user-scope discovered count.
+        assert!(
+            section.contains("3 configured (1 user-scope discovered)"),
+            "{section}"
+        );
+        // Per-server rows: discovered (with trust + tool count), failed, skipped.
+        assert!(
+            section.contains("codex [user, trusted]: spawned + initialized, 2 tool(s)"),
+            "{section}"
+        );
+        assert!(
+            section.contains("broken [user]: FAILED — spawn failed: no such file"),
+            "{section}"
+        );
+        assert!(
+            section.contains("repo_tool [project]: skipped")
+                && section.contains("move to user config to enable"),
+            "{section}"
+        );
+        // The approval-vs-spawn distinction is surfaced (codex R1 Track C2 P1).
+        assert!(
+            section.contains("only user-scope servers are spawned at startup")
+                && section.contains("tool CALLS are approval-gated"),
+            "{section}"
+        );
+        // The stale placeholder must be gone (it lied: dispatch landed in
+        // v0.4.17, not "lands in v0.4.16").
+        assert!(
+            !section.contains("lands in v0.4.16"),
+            "stale placeholder text must be removed: {section}"
+        );
+        // v0.4.17 (T10/P2, deliberately updated): the path-mismatch disclosure
+        // is now user-visible (was source-comment only). It names the legacy
+        // ~/.claude.json check and the runtime settings.json path.
+        assert!(
+            section.contains("legacy ~/.claude.json is checked separately for Codex MCP")
+                && section.contains("settings.json"),
+            "doctor section must disclose the legacy-vs-settings.json path mismatch: {section}"
+        );
     }
 
     // ── v0.4.17 C1 (T3/T4/RW5): MCP dispatch + no-MCP equivalence ───────────
@@ -6020,7 +7045,13 @@ mod tests {
     /// the no-MCP path — never reach MCP).
     #[test]
     fn char_cli_tool_executor_without_mcp_treats_mcp_name_as_unsupported() {
-        let mut executor = super::CliToolExecutor::new(None, false, None);
+        let mut executor = super::CliToolExecutor::new(
+            None,
+            false,
+            None,
+            super::PermissionMode::DangerFullAccess,
+            true,
+        );
         let err = executor
             .execute("mcp__fake__tool", "{}")
             .expect_err("mcp name without an MCP runtime must be unsupported");
@@ -6145,7 +7176,18 @@ mod tests {
             runtime::McpManagerHandle::from_manager(manager).expect("build sync handle");
         let managed = handle.discover_tools().expect("discover tools");
         let catalog = super::mcp_tool_specs(&managed);
-        std::rc::Rc::new(std::cell::RefCell::new(super::McpRuntime { handle, catalog }))
+        // Pre-trust `alpha` so the v0.4.17 (T5) dispatch approval is bypassed
+        // (this test drives dispatch mechanics, not the approval prompt — the
+        // approval decision itself is exhaustively covered by the
+        // `mcp_approval_decision_*` truth-table tests).
+        let mut trusted_servers = std::collections::HashSet::new();
+        trusted_servers.insert("alpha".to_string());
+        std::rc::Rc::new(std::cell::RefCell::new(super::McpRuntime {
+            handle,
+            catalog,
+            trusted_servers,
+            session_approved: std::collections::HashSet::new(),
+        }))
     }
 
     /// End-to-end (T3/T4): a `CliToolExecutor` holding a real MCP runtime backed
@@ -6158,12 +7200,17 @@ mod tests {
         let mcp = build_mcp_runtime_for_echo_server();
         // The catalog should advertise exactly the echo tool.
         assert_eq!(mcp.borrow().catalog.len(), 1);
-        assert_eq!(
-            mcp.borrow().catalog.specs()[0].name,
-            "mcp__alpha__echo"
-        );
+        assert_eq!(mcp.borrow().catalog.specs()[0].name, "mcp__alpha__echo");
 
-        let mut executor = super::CliToolExecutor::new(None, false, Some(mcp.clone()));
+        // `alpha` is pre-trusted (see helper), so DangerFullAccess + may_prompt
+        // both irrelevant: the approval bypasses to Allow and dispatch proceeds.
+        let mut executor = super::CliToolExecutor::new(
+            None,
+            false,
+            Some(mcp.clone()),
+            super::PermissionMode::DangerFullAccess,
+            false,
+        );
         let output = executor
             .execute("mcp__alpha__echo", &json!({"text": "hi"}).to_string())
             .expect("mcp dispatch succeeds");
@@ -6175,14 +7222,16 @@ mod tests {
             .expect_err("isError:true must map to a tool error");
         assert_eq!(err.to_string(), "echoed: BOOM");
 
-        // An mcp__ name the server never advertised surfaces a clean error
-        // (no credentials / env names leaked).
+        // An mcp__ name the catalog never produced is rejected at the approval
+        // layer (route miss => deny, no server identity to authorize) BEFORE any
+        // dispatch — clean error, no credentials / env names leaked.
         let unknown = executor
             .execute("mcp__alpha__missing", "{}")
             .expect_err("unknown mcp tool errors");
-        assert!(
-            unknown.to_string().contains("MCP tool call failed"),
-            "unexpected error: {unknown}"
+        assert_eq!(
+            unknown.to_string(),
+            "unknown MCP tool: mcp__alpha__missing",
+            "route miss must be a clean deny: {unknown}"
         );
 
         mcp.borrow_mut()
@@ -6670,8 +7719,8 @@ mod tests {
         let home = root.join("home");
         std::fs::create_dir_all(&home).expect("create home");
 
-        let report = deploy_meta_opt_hooks_to(&home, &cache_dir)
-            .expect("first deploy should succeed");
+        let report =
+            deploy_meta_opt_hooks_to(&home, &cache_dir).expect("first deploy should succeed");
         assert!(
             report.contains("Meta-Optimize hooks deployed"),
             "report missing header: {report}"
@@ -6682,8 +7731,14 @@ mod tests {
         // v0.4.13 codex round-1 #1: ARIS-namespaced destination names
         let log_event = hooks_dir.join("aris-meta-opt-log-event.sh");
         let check_ready = hooks_dir.join("aris-meta-opt-check-ready.sh");
-        assert!(log_event.is_file(), "aris-meta-opt-log-event.sh should exist");
-        assert!(check_ready.is_file(), "aris-meta-opt-check-ready.sh should exist");
+        assert!(
+            log_event.is_file(),
+            "aris-meta-opt-log-event.sh should exist"
+        );
+        assert!(
+            check_ready.is_file(),
+            "aris-meta-opt-check-ready.sh should exist"
+        );
 
         let log_event_body =
             std::fs::read_to_string(&log_event).expect("read aris-meta-opt-log-event.sh");
@@ -6904,17 +7959,24 @@ mod tests {
         let post_entry = settings_value
             .pointer("/hooks/PostToolUse/0")
             .expect("PostToolUse[0] entry");
-        assert_eq!(post_entry.pointer("/matcher").and_then(|v| v.as_str()), Some(""));
+        assert_eq!(
+            post_entry.pointer("/matcher").and_then(|v| v.as_str()),
+            Some("")
+        );
         assert_eq!(
             post_entry.pointer("/hooks/0/type").and_then(|v| v.as_str()),
             Some("command")
         );
         assert_eq!(
-            post_entry.pointer("/hooks/0/timeout").and_then(|v| v.as_u64()),
+            post_entry
+                .pointer("/hooks/0/timeout")
+                .and_then(|v| v.as_u64()),
             Some(5)
         );
         assert_eq!(
-            post_entry.pointer("/hooks/0/async").and_then(|v| v.as_bool()),
+            post_entry
+                .pointer("/hooks/0/async")
+                .and_then(|v| v.as_bool()),
             Some(true)
         );
 
@@ -6935,12 +7997,77 @@ mod tests {
         let post = loaded.hooks().post_tool_use();
         assert_eq!(post.len(), 1, "PostToolUse should flatten to one command");
         assert!(
-            post[0].contains("aris-meta-opt-log-event.sh")
-                && post[0].starts_with("bash "),
+            post[0].contains("aris-meta-opt-log-event.sh") && post[0].starts_with("bash "),
             "PostToolUse command should be the bash log_event invocation, got {}",
             post[0]
         );
 
         std::fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    // --- reviewer_routing_nudge: three-state system-prompt routing (codex R11) ---
+    //
+    // These pin the exact prompt the model receives for each reviewer provider
+    // state. The P1 bug was that a REPL session never re-derived this after
+    // /setup; the fix rebuilds the system prompt unconditionally, so the
+    // *content* this helper produces per state must stay correct.
+
+    #[test]
+    fn reviewer_nudge_codex_mcp_with_fallback_mentions_llmreview_fallback() {
+        let out = reviewer_routing_nudge("codex-mcp", Some("openai"));
+        assert_eq!(out.len(), 1, "codex-mcp + fallback emits exactly one line");
+        let line = &out[0];
+        // Codex MCP is primary; LlmReview is only the fallback.
+        assert!(
+            line.contains("Your external LLM reviewer is Codex MCP")
+                && line.contains("mcp__codex__codex"),
+            "must instruct the model to use the Codex MCP channel, got: {line}"
+        );
+        assert!(
+            line.contains("fall back to the `LlmReview` tool")
+                && line.contains("openai"),
+            "must name the configured HTTP fallback reviewer, got: {line}"
+        );
+        // Must NOT push the "use LlmReview instead" override.
+        assert!(
+            !line.contains("use the `LlmReview` tool instead"),
+            "codex-mcp must not contradict the chosen reviewer, got: {line}"
+        );
+    }
+
+    #[test]
+    fn reviewer_nudge_codex_mcp_without_fallback_is_silent() {
+        // No fallback configured → pure MCP path → emit nothing so the model
+        // keeps using mcp__codex__codex with no override at all.
+        assert!(
+            reviewer_routing_nudge("codex-mcp", None).is_empty(),
+            "codex-mcp without fallback should push no reviewer nudge"
+        );
+        assert!(
+            reviewer_routing_nudge("codex-mcp", Some("")).is_empty(),
+            "empty fallback string is treated as no fallback"
+        );
+    }
+
+    #[test]
+    fn reviewer_nudge_non_codex_provider_pushes_llmreview_override() {
+        // Any provider other than codex-mcp gets the LlmReview override so
+        // skills' MCP review calls are redirected to the HTTP reviewer.
+        for provider in ["", "openai", "gemini", "minimax", "codex"] {
+            let out = reviewer_routing_nudge(provider, None);
+            assert_eq!(
+                out.len(),
+                1,
+                "provider {provider:?} should emit exactly one override line"
+            );
+            assert!(
+                out[0].contains("use the `LlmReview` tool instead"),
+                "provider {provider:?} must push the LlmReview override, got: {}",
+                out[0]
+            );
+        }
+        // A non-codex-mcp provider ignores any fallback value (override is fixed).
+        let with_fb = reviewer_routing_nudge("openai", Some("gemini"));
+        assert_eq!(with_fb, reviewer_routing_nudge("openai", None));
     }
 }

@@ -62,6 +62,8 @@
 | **T8** | `--allowedTools` 放行动态名(**codex R1-P1.2**):main.rs:500 只从 `mvp_tool_specs()` 建合法名集,main.rs:526 unknown 直接报错——用户无法 `--allowedTools mcp__codex__codex`。改为 `mcp__` 前缀延迟校验(arg 解析期放行,dispatch 期实际过滤) | 加 char test 锁现有非-mcp 名的报错行为不变 |
 | **T6** | Subagent 明确不给 MCP 工具(注释 + 测试钉死),v0.4.18 随 P8 一起考虑 | 最小验证面 |
 | **T9** | fail-loud guard 文案修正(**codex R1-P1.6**):tools/lib.rs:1901 错误文案说 "lands in v0.4.17",P8 拆版后变假——改成 v0.4.18,**同步翻转断言 `msg.contains("v0.4.17")` 的 characterization test**(故意翻转,changelog 披露) | trivial 但不能漏 |
+| **T10** | **setup 集成 Codex MCP reviewer(2026-06-07 maintainer 决定加入)**:reviewer 菜单**追加 option 10 "Codex MCP (ChatGPT 订阅, 零 API key)" ★推荐**(追加不重排——重排会再炸 v0.4.14 P9 修过的 `aris --help` "option 7 DeepSeek" 引用)。选中后:① `which codex` 检测(缺失则给安装指引,可继续);② 把 `mcpServers.codex = {command:"codex", args:["mcp-server"]}` 写进 ConfigLoader 真正读的 settings 文件(复用 v0.4.13 原子写+备份机制,幂等不 clobber 已有条目);③ 显式询问后写 `trust: true`(明示同意 = 跳过逐次确认);④ 可选追问"再配一个 API reviewer 作 fallback?(可跳过)";⑤ reviewer_provider 存 "codex-mcp" + default_reviewer 映射加 "codex-mcp"=>"10"(防下次 setup 默认档漂移)。doctor MCP section 同步识别 | 装门:零 key 对抗审从 power-user 功能变成普通用户功能;#259 教训(手写 JSON 必出错)的正面解 |
+| **T11** | LlmReview 双无引导(cheap win):reviewer key 缺失错误信息追加一句引导 "configure mcpServers (ChatGPT subscription) or run aris setup for an API reviewer" | 一行文案 |
 | **RW7/T7** | doctor MCP section 升级,**三步次序(codex R3-P1.2)**:① 抽纯 formatter `mcp_doctor_section(count)->Option<String>`(行为保持);② 锁基线测试(含 'lands in v0.4.16' 现文案);③ 改文案为 per-server spawn/initialize/tools 真实状态 | doctor 'Codex MCP' 读 ~/.claude.json 与 ConfigLoader 路径不一致的问题顺手统一披露(不强修) |
 
 **Phase 1 出口**:配 codex MCP 的 settings.json,在 aris 里真实调用 `mcp__codex__codex` 跑通一次对抗审(零 API key 路径验收)+ 全部 char test 绿 + codex review GO。

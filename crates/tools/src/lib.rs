@@ -190,6 +190,21 @@ impl McpToolCatalog {
         self.routes.get(advertised_name)
     }
 
+    /// v0.4.17 (T10/P1.3): does this catalog advertise any tool from the given
+    /// raw MCP server name? Used by the inline-`/setup` restart notice to decide
+    /// whether the live (startup-discovered) catalog already contains the
+    /// `codex` server's tools — if it does, no restart is needed; if it doesn't,
+    /// the user must restart so the newly-written `mcpServers.codex` is spawned
+    /// and advertised. The match is against the route's raw `server_name` (the
+    /// un-normalized name carried from discovery), not the advertised/qualified
+    /// name, which is lossy under normalization.
+    #[must_use]
+    pub fn has_server(&self, server_name: &str) -> bool {
+        self.routes
+            .values()
+            .any(|route| route.server_name == server_name)
+    }
+
     /// Number of advertised MCP tools.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -2141,11 +2156,12 @@ fn build_agent_runtime(
     // `resolve_openai_executor_config`, so the detection set is exactly the
     // routing set and never misfires on anthropic / anthropic-compat
     // (Category A/B), whose EXECUTOR_PROVIDER is unset/cleared. Full
-    // OpenAI-family subagent routing lands in v0.4.17. The message carries no
+    // OpenAI-family subagent routing lands in v0.4.18 (P8 was split out of
+    // v0.4.17 — see idea-stage/v0.4.17/plan.md §0). The message carries no
     // credential names by design.
     if std::env::var("EXECUTOR_PROVIDER").as_deref() == Ok("openai") {
         return Err("subagents currently require an Anthropic-family executor; \
-                    OpenAI-family subagent dispatch lands in v0.4.17. \
+                    OpenAI-family subagent dispatch lands in v0.4.18. \
                     Your main session is unaffected."
             .to_string());
     }
@@ -2496,6 +2512,22 @@ impl ToolExecutor for SubagentToolExecutor {
     }
 }
 
+/// v0.4.17 (T6): the tool catalogue a SUB-AGENT may use.
+///
+/// This is **structurally** the static MVP catalogue only — it is built solely
+/// from [`mvp_tool_specs`], which never contains an `mcp__`-prefixed name. A
+/// sub-agent therefore can never be advertised, nor dispatch, an MCP tool:
+/// - it has no [`crate::McpToolCatalog`] / `SharedMcpRuntime` (only the main
+///   session's `CliToolExecutor` holds one), and
+/// - [`SubagentToolExecutor::execute`] routes through [`execute_tool`], which
+///   returns `unsupported tool` for any `mcp__` name (the main session
+///   intercepts MCP names ABOVE `execute_tool`, in `CliToolExecutor::execute`).
+///
+/// This is a deliberate v0.4.17 boundary: giving sub-agents their own MCP
+/// access is re-considered alongside P8 (OpenAI-family subagent routing) in
+/// v0.4.18 (plan.md T6). Until then the no-MCP property is enforced here purely
+/// by construction (no MCP source can flow in), pinned by
+/// `subagent_tool_directory_never_contains_mcp_names`.
 fn tool_specs_for_allowed_tools(allowed_tools: Option<&BTreeSet<String>>) -> Vec<ToolSpec> {
     mvp_tool_specs()
         .into_iter()
@@ -3690,12 +3722,37 @@ fn resolve_reviewer_model<'a>(
     requested
 }
 
+/// v0.4.17 (T11): the "double-no" guidance appended to every `LlmReview`
+/// missing-credential error. A user who hits this has neither an MCP reviewer
+/// nor an API reviewer configured; point them at both escape hatches. Carries
+/// NO key value (the callers interpolate only the env var NAME, never its
+/// contents).
+const LLM_REVIEW_NO_CREDENTIAL_GUIDANCE: &str =
+    " — configure mcpServers (ChatGPT subscription, see aris setup option 10) \
+     or set an API reviewer via aris setup";
+
 fn run_llm_review(input: LlmReviewInput) -> Result<String, String> {
     let env_reviewer_model = std::env::var("ARIS_REVIEWER_MODEL").ok().filter(|s| !s.is_empty());
     let configured_model = env_reviewer_model.as_deref().unwrap_or("gpt-5.5");
 
     // Check for user-configured reviewer provider and base URL
-    let reviewer_provider = std::env::var("ARIS_REVIEWER_PROVIDER").ok().filter(|s| !s.is_empty());
+    let raw_reviewer_provider = std::env::var("ARIS_REVIEWER_PROVIDER")
+        .ok()
+        .filter(|s| !s.is_empty());
+    // v0.4.17 (T10/P1.2): when the PRIMARY reviewer is Codex MCP, LlmReview is
+    // only ever reached as the explicit fallback path. The effective HTTP
+    // provider is therefore the configured fallback
+    // (ARIS_REVIEWER_FALLBACK_PROVIDER), not "codex-mcp" (which has no HTTP
+    // routing). If no fallback is set, the provider resolves to `None` and we
+    // fall through to the OpenAI-compat path below — whose missing-key error
+    // surfaces the T11 reviewer-setup guidance naturally.
+    let reviewer_provider = if raw_reviewer_provider.as_deref() == Some("codex-mcp") {
+        std::env::var("ARIS_REVIEWER_FALLBACK_PROVIDER")
+            .ok()
+            .filter(|s| !s.is_empty())
+    } else {
+        raw_reviewer_provider
+    };
     let custom_base_url = std::env::var("ARIS_REVIEWER_BASE_URL").ok().filter(|s| !s.is_empty());
 
     // Custom OpenAI-compatible reviewer mode. Uses ARIS_REVIEWER_AUTH_TOKEN as
@@ -3705,7 +3762,11 @@ fn run_llm_review(input: LlmReviewInput) -> Result<String, String> {
         let key = std::env::var("ARIS_REVIEWER_AUTH_TOKEN")
             .ok()
             .filter(|k| !k.is_empty())
-            .ok_or_else(|| "LlmReview: ARIS_REVIEWER_AUTH_TOKEN not set (needed for custom reviewer)".to_string())?;
+            .ok_or_else(|| {
+                format!(
+                    "LlmReview: ARIS_REVIEWER_AUTH_TOKEN not set (needed for custom reviewer){LLM_REVIEW_NO_CREDENTIAL_GUIDANCE}"
+                )
+            })?;
         // For Custom reviewer, refuse to fall back to gpt-5.5 — that would
         // silently send the user's request to the wrong model on their custom
         // proxy. Require explicit model from input or ARIS_REVIEWER_MODEL.
@@ -3721,7 +3782,9 @@ fn run_llm_review(input: LlmReviewInput) -> Result<String, String> {
                     .to_string()
             })?;
         let base = custom_base_url.ok_or_else(|| {
-            "LlmReview: ARIS_REVIEWER_BASE_URL not set (needed for custom reviewer)".to_string()
+            format!(
+                "LlmReview: ARIS_REVIEWER_BASE_URL not set (needed for custom reviewer){LLM_REVIEW_NO_CREDENTIAL_GUIDANCE}"
+            )
         })?;
         let trimmed = base.trim_end_matches('/');
         let url = if trimmed.ends_with("/chat/completions") {
@@ -3745,7 +3808,11 @@ fn run_llm_review(input: LlmReviewInput) -> Result<String, String> {
             .or_else(|_| std::env::var("ANTHROPIC_AUTH_TOKEN"))
             .ok()
             .filter(|k| !k.is_empty())
-            .ok_or_else(|| "LlmReview: ARIS_REVIEWER_AUTH_TOKEN not set (needed for anthropic-compat reviewer)".to_string())?;
+            .ok_or_else(|| {
+                format!(
+                    "LlmReview: ARIS_REVIEWER_AUTH_TOKEN not set (needed for anthropic-compat reviewer){LLM_REVIEW_NO_CREDENTIAL_GUIDANCE}"
+                )
+            })?;
         let model = input
             .model
             .as_deref()
@@ -3783,7 +3850,11 @@ fn run_llm_review(input: LlmReviewInput) -> Result<String, String> {
     let key = std::env::var(key_env)
         .ok()
         .filter(|k| !k.is_empty())
-        .ok_or_else(|| format!("LlmReview: {key_env} not set (needed for model '{model}')"))?;
+        .ok_or_else(|| {
+            format!(
+                "LlmReview: {key_env} not set (needed for model '{model}'){LLM_REVIEW_NO_CREDENTIAL_GUIDANCE}"
+            )
+        })?;
 
     call_openai_compat_reviewer(&key, &base_url, model, &input.prompt)
 }
@@ -4044,6 +4115,155 @@ mod tests {
             .expect("time")
             .as_nanos();
         std::env::temp_dir().join(format!("clawd-tools-{unique}-{name}"))
+    }
+
+    /// v0.4.17 (T11): when no reviewer credentials are set, the LlmReview error
+    /// must guide the user toward BOTH escape hatches (Codex MCP via
+    /// `aris setup option 10`, or an API reviewer via `aris setup`) and must
+    /// NOT leak any key value. We force the missing-credential branch by
+    /// clearing every reviewer env var while holding the env lock.
+    #[test]
+    fn llm_review_missing_key_error_guides_to_mcp_and_api_reviewer() {
+        let _guard = env_lock().lock().unwrap_or_else(|p| p.into_inner());
+        let reviewer_vars = [
+            "ARIS_REVIEWER_MODEL",
+            "ARIS_REVIEWER_PROVIDER",
+            "ARIS_REVIEWER_BASE_URL",
+            "ARIS_REVIEWER_AUTH_TOKEN",
+            "OPENAI_API_KEY",
+        ];
+        let saved: Vec<(&str, Option<String>)> = reviewer_vars
+            .iter()
+            .map(|k| (*k, std::env::var(k).ok()))
+            .collect();
+        for k in &reviewer_vars {
+            std::env::remove_var(k);
+        }
+
+        let err = super::run_llm_review(super::LlmReviewInput {
+            prompt: "review please".to_string(),
+            model: None,
+        })
+        .expect_err("no creds => Err");
+
+        // Default model gpt-5.5 routes to OPENAI_API_KEY (the var NAME may
+        // appear; its value must not — we never set one).
+        assert!(
+            err.contains("OPENAI_API_KEY"),
+            "error should name the missing key env var: {err}"
+        );
+        assert!(
+            err.contains("aris setup option 10"),
+            "error should point at the Codex MCP escape hatch: {err}"
+        );
+        assert!(
+            err.contains("set an API reviewer via aris setup"),
+            "error should point at the API-reviewer escape hatch: {err}"
+        );
+        assert!(
+            err.contains("ChatGPT subscription"),
+            "error should mention the no-API-key path: {err}"
+        );
+
+        for (k, v) in saved {
+            match v {
+                Some(val) => std::env::set_var(k, val),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
+    /// v0.4.17 (T10/P1.2): when the PRIMARY reviewer is Codex MCP and a
+    /// fallback provider is set, LlmReview's EFFECTIVE provider is the fallback —
+    /// NOT "codex-mcp". We prove this by setting the fallback to `custom` (whose
+    /// path has a distinctive, network-free error: it requires
+    /// ARIS_REVIEWER_AUTH_TOKEN before any HTTP call). If the effective provider
+    /// were still "codex-mcp", that string has no LlmReview routing arm and we'd
+    /// fall through to the OpenAI-compat path, producing a different error.
+    #[test]
+    fn llm_review_codex_mcp_with_fallback_routes_to_fallback_provider() {
+        let _guard = env_lock().lock().unwrap_or_else(|p| p.into_inner());
+        let vars = [
+            "ARIS_REVIEWER_MODEL",
+            "ARIS_REVIEWER_PROVIDER",
+            "ARIS_REVIEWER_FALLBACK_PROVIDER",
+            "ARIS_REVIEWER_BASE_URL",
+            "ARIS_REVIEWER_AUTH_TOKEN",
+            "OPENAI_API_KEY",
+        ];
+        let saved: Vec<(&str, Option<String>)> =
+            vars.iter().map(|k| (*k, std::env::var(k).ok())).collect();
+        for k in &vars {
+            std::env::remove_var(k);
+        }
+        std::env::set_var("ARIS_REVIEWER_PROVIDER", "codex-mcp");
+        std::env::set_var("ARIS_REVIEWER_FALLBACK_PROVIDER", "custom");
+
+        let err = super::run_llm_review(super::LlmReviewInput {
+            prompt: "review please".to_string(),
+            model: Some("some-model".to_string()),
+        })
+        .expect_err("custom fallback w/o auth token => Err");
+        // The custom-reviewer arm's error names ARIS_REVIEWER_AUTH_TOKEN — proof
+        // the effective provider resolved to `custom`, not `codex-mcp`.
+        assert!(
+            err.contains("ARIS_REVIEWER_AUTH_TOKEN") && err.contains("custom reviewer"),
+            "codex-mcp + custom fallback must route through the custom-reviewer arm: {err}"
+        );
+
+        for (k, v) in saved {
+            match v {
+                Some(val) => std::env::set_var(k, val),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
+    /// v0.4.17 (T10/P1.2): when the PRIMARY reviewer is Codex MCP and NO fallback
+    /// is set, the effective provider resolves to `None`, so LlmReview falls
+    /// through to the OpenAI-compat path — whose missing-key error surfaces the
+    /// T11 reviewer-setup guidance (the natural "no fallback configured" signal).
+    #[test]
+    fn llm_review_codex_mcp_without_fallback_falls_through_to_openai_compat() {
+        let _guard = env_lock().lock().unwrap_or_else(|p| p.into_inner());
+        let vars = [
+            "ARIS_REVIEWER_MODEL",
+            "ARIS_REVIEWER_PROVIDER",
+            "ARIS_REVIEWER_FALLBACK_PROVIDER",
+            "ARIS_REVIEWER_BASE_URL",
+            "ARIS_REVIEWER_AUTH_TOKEN",
+            "OPENAI_API_KEY",
+        ];
+        let saved: Vec<(&str, Option<String>)> =
+            vars.iter().map(|k| (*k, std::env::var(k).ok())).collect();
+        for k in &vars {
+            std::env::remove_var(k);
+        }
+        std::env::set_var("ARIS_REVIEWER_PROVIDER", "codex-mcp");
+        // No ARIS_REVIEWER_FALLBACK_PROVIDER set.
+
+        let err = super::run_llm_review(super::LlmReviewInput {
+            prompt: "review please".to_string(),
+            model: None,
+        })
+        .expect_err("no fallback + no creds => Err");
+        // Default model gpt-5.5 routes to the OpenAI-compat path → OPENAI_API_KEY
+        // missing, with the T11 guidance (Codex MCP escape hatch).
+        assert!(
+            err.contains("OPENAI_API_KEY"),
+            "no-fallback codex-mcp should fall through to OpenAI-compat: {err}"
+        );
+        assert!(
+            err.contains("aris setup option 10"),
+            "missing-key error should carry the T11 reviewer-setup guidance: {err}"
+        );
+
+        for (k, v) in saved {
+            match v {
+                Some(val) => std::env::set_var(k, val),
+                None => std::env::remove_var(k),
+            }
+        }
     }
 
     #[test]
@@ -4320,6 +4540,26 @@ mod tests {
         assert_eq!(catalog.route_for_advertised_name("mcp__codex__nope"), None);
     }
 
+    /// v0.4.17 (T10/P1.3): `has_server` matches against the route's raw
+    /// `server_name` (not the advertised/qualified name), so the inline-`/setup`
+    /// restart notice can tell whether the live catalog already advertises the
+    /// `codex` server's tools. Empty catalog ⇒ false; a catalog with `codex`
+    /// tools ⇒ true for "codex" and false for an unrelated name.
+    #[test]
+    fn catalog_has_server_matches_raw_server_name() {
+        let empty = super::McpToolCatalog::default();
+        assert!(!empty.has_server("codex"));
+
+        let tools = vec![
+            managed_tool("codex", "codex", None),
+            managed_tool("other", "thing", None),
+        ];
+        let catalog = super::mcp_tool_specs(&tools);
+        assert!(catalog.has_server("codex"));
+        assert!(catalog.has_server("other"));
+        assert!(!catalog.has_server("nonexistent"));
+    }
+
     /// T2 collision strategy (**last-wins**, matching the runtime tool_index):
     /// two tools that normalize to the SAME qualified name cannot both be
     /// advertised. The runtime's `tool_index.insert` is last-writer-wins
@@ -4439,6 +4679,47 @@ mod tests {
         tool.tool.description = Some(String::new());
         let catalog = super::mcp_tool_specs(std::slice::from_ref(&tool));
         assert!(!catalog.specs()[0].description.is_empty());
+    }
+
+    /// v0.4.17 (T6): pin the structural guarantee that a SUB-AGENT's tool
+    /// directory never contains an `mcp__`-prefixed name. `SubagentToolExecutor`
+    /// derives its catalogue from `tool_specs_for_allowed_tools`, which is built
+    /// only from the static `mvp_tool_specs()`. Even when the user's main
+    /// session has `mcpServers` configured (which would add `mcp__*` names to
+    /// the MAIN session's `McpToolCatalog`), that catalog never reaches a
+    /// sub-agent — the sub-agent has no `SharedMcpRuntime`. Here we assert the
+    /// directory unconditionally (with and without an allowlist) so any future
+    /// change that tried to thread MCP into the subagent path would break this
+    /// pin. MCP-for-subagents is re-considered with P8 in v0.4.18 (plan.md T6).
+    #[test]
+    fn subagent_tool_directory_never_contains_mcp_names() {
+        // No allowlist: the full static catalogue, never any mcp__ name.
+        let full = super::tool_specs_for_allowed_tools(None);
+        assert!(
+            !full.is_empty(),
+            "static catalogue must be non-empty (guards against vacuous pass)"
+        );
+        assert!(
+            full.iter().all(|spec| !spec.name.starts_with("mcp__")),
+            "subagent tool directory must never contain an mcp__ tool"
+        );
+
+        // Even if a caller hand-builds an allowlist that NAMES an mcp__ tool,
+        // the filter only ever yields static specs (the mcp__ name matches
+        // nothing in mvp_tool_specs and is dropped). This mirrors the main
+        // session's filter-layer behavior but here it is the only layer.
+        let mut allow: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        allow.insert("read_file".to_string());
+        allow.insert("mcp__codex__codex".to_string());
+        let filtered = super::tool_specs_for_allowed_tools(Some(&allow));
+        assert!(
+            filtered.iter().all(|spec| !spec.name.starts_with("mcp__")),
+            "an mcp__ name in a subagent allowlist must not surface an MCP tool"
+        );
+        assert!(
+            filtered.iter().any(|spec| spec.name == "read_file"),
+            "static names in the allowlist still resolve"
+        );
     }
 
     #[test]
@@ -6240,7 +6521,8 @@ printf 'pwsh:%s' "$1"
     // For OpenAI-family executors (C: EXECUTOR_PROVIDER=="openai") the P8
     // v0.4.16 minimal guard now FAILS LOUD (was: silently built an Anthropic
     // client and billed the user's Anthropic credential). The C tests assert
-    // that fail-loud contract; full OpenAI subagent routing lands in v0.4.17.
+    // that fail-loud contract; full OpenAI subagent routing lands in v0.4.18
+    // (P8 was split out of v0.4.17 — plan.md §0).
     //
     // The auth BRANCH (x-api-key vs Bearer) is not observable through the
     // built `ConversationRuntime` (its inner api_client is private with no
@@ -6353,8 +6635,8 @@ printf 'pwsh:%s' "$1"
     // an OpenAI-family executor instead of silently building an Anthropic
     // client (which would bill the user's Anthropic credential). The baseline
     // (anthropic) path is unchanged. Full OpenAI subagent routing lands in
-    // v0.4.17, at which point the openai run should build an OpenAI runtime
-    // instead of erroring.
+    // v0.4.18 (P8 was split out of v0.4.17 — plan.md §0), at which point the
+    // openai run should build an OpenAI runtime instead of erroring.
     #[test]
     fn char_build_agent_runtime_rejects_openai_provider() {
         let _g = env_lock_reviewer().lock().unwrap();
@@ -6387,9 +6669,13 @@ printf 'pwsh:%s' "$1"
         let Err(err) = openai else {
             panic!("EXECUTOR_PROVIDER=openai must fail loud, not build an Anthropic client");
         };
+        // deliberately flipped in v0.4.17 (T9): the guard message's version
+        // marker moved from "v0.4.17" to "v0.4.18" because P8 (OpenAI-family
+        // subagent routing) was split out of v0.4.17 into v0.4.18 (plan.md §0).
+        // The fail-loud contract itself is unchanged.
         assert!(
-            err.contains("Anthropic-family") && err.contains("v0.4.17"),
-            "openai subagent must fail with the v0.4.16 guard message. got: {err}"
+            err.contains("Anthropic-family") && err.contains("v0.4.18"),
+            "openai subagent must fail with the v0.4.16 guard message (v0.4.18 marker). got: {err}"
         );
     }
 
@@ -6413,9 +6699,12 @@ printf 'pwsh:%s' "$1"
         let Err(msg) = result else {
             panic!("EXECUTOR_PROVIDER=openai subagent must fail loud");
         };
+        // deliberately flipped in v0.4.17 (T9): version marker moved
+        // "v0.4.17" -> "v0.4.18" (P8 split out of v0.4.17, plan.md §0). The
+        // fail-loud + credential-free contract is otherwise unchanged.
         assert!(
-            msg.contains("Anthropic-family") && msg.contains("v0.4.17"),
-            "must be the v0.4.16 guard message: {msg}"
+            msg.contains("Anthropic-family") && msg.contains("v0.4.18"),
+            "must be the v0.4.16 guard message (v0.4.18 marker): {msg}"
         );
         // Anti-leak: the guard message must never echo a credential env NAME
         // nor the actual key VALUE (the sentinel set above).
