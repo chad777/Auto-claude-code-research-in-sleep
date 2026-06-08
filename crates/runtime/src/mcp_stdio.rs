@@ -1127,8 +1127,11 @@ impl McpStdioProcess {
         let request = JsonRpcRequest::new(id.clone(), method, params);
         let timeout = mcp_request_timeout(self.request_timeout_override_secs);
 
-        // Encode the request frame up front so the write task owns a
-        // plain `Vec<u8>` and doesn't need to borrow `self`.
+        // Encode the request as one NDJSON frame up front (v0.4.17 /
+        // Track R) so the write task owns a plain `Vec<u8>` and doesn't
+        // need to borrow `self`. `serde_json::to_vec` produces a single
+        // line (any `\n` inside string values is escaped), and
+        // `encode_frame` appends the terminating `\n`.
         let frame = serde_json::to_vec(&request)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         let encoded = encode_frame(&frame);
@@ -1237,12 +1240,13 @@ impl McpStdioProcess {
     /// Send a fire-and-forget JSON-RPC notification (no `id`, no
     /// response read).
     ///
-    /// Unlike [`request`], this writes a single `Content-Length` frame
-    /// and returns immediately — it must not enter the response read
-    /// loop, because a notification frame never gets a reply. We reuse
-    /// [`write_frame`] (so the wire framing stays identical to every
-    /// other message) but build the body by hand to guarantee the `id`
-    /// field is entirely absent (an explicit `id: null` would be a
+    /// Unlike [`request`], this writes a single NDJSON frame (v0.4.17 /
+    /// Track R: one JSON object + `\n`, the canonical MCP stdio wire
+    /// format) and returns immediately — it must not enter the response
+    /// read loop, because a notification frame never gets a reply. We
+    /// reuse [`write_frame`] (so the wire framing stays identical to
+    /// every other message) but build the body by hand to guarantee the
+    /// `id` field is entirely absent (an explicit `id: null` would be a
     /// *response* shape, not a notification).
     pub async fn notify(
         &mut self,
@@ -1337,24 +1341,132 @@ fn apply_env(command: &mut Command, env: &BTreeMap<String, String>) {
     }
 }
 
+/// v0.4.17 (Track R): encode one JSON-RPC message as a **newline-
+/// delimited JSON** (NDJSON) frame — the canonical MCP stdio transport
+/// wire format (one JSON object per line, terminated by `\n`).
+///
+/// The real-machine e2e blocker this fixes: we previously emitted the
+/// LSP-style `Content-Length: N\r\n\r\n{json}` header framing, which is
+/// LSP's dialect, NOT MCP stdio's. Spec-correct servers (e.g.
+/// `codex mcp-server`) read line-by-line and stayed completely silent
+/// on our header-prefixed bytes, so every request timed out. MCP stdio
+/// is newline-delimited JSON-RPC: exactly one message per line.
+///
+/// `payload` is an already-serialised JSON object's bytes (no embedded
+/// raw newline — `serde_json` escapes any `\n` inside string values as
+/// `\\n`, so a single object never spans lines). We simply append the
+/// `\n` terminator. A `\r` is intentionally NOT added: bare-LF is the
+/// MCP convention and the legacy reader tolerates either anyway.
 fn encode_frame(payload: &[u8]) -> Vec<u8> {
-    let header = format!("Content-Length: {}\r\n\r\n", payload.len());
-    let mut framed = header.into_bytes();
+    let mut framed = Vec::with_capacity(payload.len() + 1);
     framed.extend_from_slice(payload);
+    framed.push(b'\n');
     framed
 }
 
-/// Read one `Content-Length`-framed message from `stdout`.
+/// Read one JSON-RPC message frame from `stdout`, auto-detecting the
+/// wire dialect (v0.4.17 / Track R).
 ///
 /// Factored out of `McpStdioProcess::read_frame` so the read pump in
 /// `request` (RW9 / #286) can borrow the stdout half on its own while
-/// the write task independently borrows stdin. The header parser is
-/// tolerant (v0.4.17 / M6): bare-LF separators, case-insensitive
-/// `Content-Length`, and a `MAX_CONTENT_LENGTH` cap to prevent OOM.
+/// the write task independently borrows stdin.
+///
+/// Two dialects are accepted on the *read* side for maximum
+/// interoperability (we only ever *write* NDJSON):
+///   * **NDJSON (canonical MCP stdio)** — one JSON object per line. This
+///     is what real servers (codex, the official SDK servers) speak. A
+///     non-`content-length:` line is taken verbatim as one message's
+///     bytes (trailing CR/LF stripped).
+///   * **Legacy LSP `Content-Length` framing** — a line beginning
+///     `content-length:` (case-insensitive, leading whitespace
+///     tolerated) switches to [`read_legacy_lsp_frame`], which reads the
+///     remaining headers + the exact body (M6's bare-LF / case /
+///     leading-space tolerance and 64 MiB cap all live there). This keeps
+///     us bidirectionally tolerant of any server still on the LSP dialect.
+///
+/// Blank / all-whitespace lines are skipped before classification (some
+/// servers pad output with stray newlines). The NDJSON path bounds each
+/// line at `MAX_CONTENT_LENGTH` via [`read_line_capped`] so a server
+/// that never emits a newline can't make us buffer unboundedly and OOM.
 async fn read_frame_from<R: AsyncBufReadExt + AsyncReadExt + Unpin>(
     stdout: &mut R,
 ) -> io::Result<Vec<u8>> {
-    let mut content_length = None;
+    loop {
+        let line = read_line_capped(stdout).await?;
+        // Skip blank / all-whitespace lines (stray padding newlines).
+        let trimmed_end = line.trim_end_matches(['\r', '\n']);
+        if trimmed_end.trim().is_empty() {
+            continue;
+        }
+        // Legacy LSP framing: a `content-length:` header line (case-
+        // insensitive, leading whitespace tolerated) switches dialects.
+        if let Some((key, value)) = trimmed_end.split_once(':') {
+            if key.trim().eq_ignore_ascii_case("content-length") {
+                return read_legacy_lsp_frame(stdout, value).await;
+            }
+        }
+        // NDJSON: the whole line (minus its terminator) is one message.
+        return Ok(trimmed_end.as_bytes().to_vec());
+    }
+}
+
+/// Read a single line from `stdout`, bounding its length at
+/// `MAX_CONTENT_LENGTH` so a server that never emits a newline cannot
+/// drive unbounded buffering (the NDJSON analogue of M6's
+/// `Content-Length` cap). Reads byte-by-byte through the `BufReader`'s
+/// own buffer (cheap — the reader batches the underlying syscalls) and
+/// stops at the first `\n` (kept) or at EOF.
+///
+/// EOF with zero bytes read surfaces `UnexpectedEof` (stream closed),
+/// matching the legacy reader's "stream closed while reading" contract.
+async fn read_line_capped<R: AsyncBufReadExt + AsyncReadExt + Unpin>(
+    stdout: &mut R,
+) -> io::Result<String> {
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        let mut byte = [0_u8; 1];
+        let n = stdout.read(&mut byte).await?;
+        if n == 0 {
+            if buf.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "MCP stdio stream closed while reading line",
+                ));
+            }
+            break;
+        }
+        buf.push(byte[0]);
+        if byte[0] == b'\n' {
+            break;
+        }
+        if buf.len() > MAX_CONTENT_LENGTH {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "MCP NDJSON line exceeds maximum {MAX_CONTENT_LENGTH} bytes without a newline"
+                ),
+            ));
+        }
+    }
+    String::from_utf8(buf).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+/// Legacy LSP `Content-Length` framing reader (v0.4.17 / M6 tolerance,
+/// preserved on the legacy path). Entered from [`read_frame_from`] once
+/// the first line is recognised as a `content-length:` header;
+/// `first_value` is that header's value portion (after the `:`). Reads
+/// any further headers, then the empty separator line, then exactly
+/// `Content-Length` body bytes.
+///
+/// Tolerances (all from M6): bare-LF (`\n`) header/body separators,
+/// case-insensitive + leading-whitespace `Content-Length`, and the
+/// `MAX_CONTENT_LENGTH` cap rejecting an oversized declared length
+/// before the receive buffer is allocated (anti-OOM).
+async fn read_legacy_lsp_frame<R: AsyncBufReadExt + AsyncReadExt + Unpin>(
+    stdout: &mut R,
+    first_value: &str,
+) -> io::Result<Vec<u8>> {
+    let mut content_length = Some(parse_content_length(first_value)?);
     loop {
         let mut line = String::new();
         let bytes_read = stdout.read_line(&mut line).await?;
@@ -1378,23 +1490,7 @@ async fn read_frame_from<R: AsyncBufReadExt + AsyncReadExt + Unpin>(
         // servers occasionally emit `content-length:`.
         if let Some((key, value)) = line.split_once(':') {
             if key.trim().eq_ignore_ascii_case("content-length") {
-                let parsed = value
-                    .trim()
-                    .parse::<usize>()
-                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-                // v0.4.17 (M6): cap the declared length so a
-                // malicious/buggy server can't make us allocate an
-                // unbounded buffer (`vec![0u8; len]`) and OOM the
-                // process.
-                if parsed > MAX_CONTENT_LENGTH {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "MCP frame Content-Length {parsed} exceeds maximum {MAX_CONTENT_LENGTH}"
-                        ),
-                    ));
-                }
-                content_length = Some(parsed);
+                content_length = Some(parse_content_length(value)?);
             }
         }
     }
@@ -1405,6 +1501,23 @@ async fn read_frame_from<R: AsyncBufReadExt + AsyncReadExt + Unpin>(
     let mut payload = vec![0_u8; content_length];
     stdout.read_exact(&mut payload).await?;
     Ok(payload)
+}
+
+/// Parse + bound-check a `Content-Length` header value (M6). Rejects a
+/// declared length above `MAX_CONTENT_LENGTH` before any buffer is
+/// allocated so a malicious/buggy server can't OOM the process.
+fn parse_content_length(value: &str) -> io::Result<usize> {
+    let parsed = value
+        .trim()
+        .parse::<usize>()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    if parsed > MAX_CONTENT_LENGTH {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("MCP frame Content-Length {parsed} exceeds maximum {MAX_CONTENT_LENGTH}"),
+        ));
+    }
+    Ok(parsed)
 }
 
 /// Resolve the MCP request read timeout. Priority is:
@@ -1515,6 +1628,16 @@ mod tests {
         script_path
     }
 
+    // v0.4.17 (Track R): the fake MCP servers speak NDJSON (one JSON
+    // object per line), the canonical MCP stdio dialect — same as the
+    // real `codex mcp-server`. The earlier `Content-Length` framing was
+    // an LSP-ism that real servers never speak; using it here meant our
+    // tests were self-consistently testing the wrong wire format (the
+    // client and the fake both spoke a dialect no real server uses),
+    // which is exactly why a green suite still shipped a protocol-level
+    // blocker. A separate legacy `Content-Length` fake (see
+    // `write_legacy_lsp_mcp_server_script`) covers the bidirectional
+    // read tolerance.
     fn write_jsonrpc_script() -> PathBuf {
         let root = temp_dir();
         fs::create_dir_all(&root).expect("temp dir");
@@ -1522,18 +1645,10 @@ mod tests {
         let script = [
             "#!/usr/bin/env python3",
             "import json, sys",
-            "header = b''",
-            r"while not header.endswith(b'\r\n\r\n'):",
-            "    chunk = sys.stdin.buffer.read(1)",
-            "    if not chunk:",
-            "        raise SystemExit(1)",
-            "    header += chunk",
-            "length = 0",
-            r"for line in header.decode().split('\r\n'):",
-            r"    if line.lower().startswith('content-length:'):",
-            r"        length = int(line.split(':', 1)[1].strip())",
-            "payload = sys.stdin.buffer.read(length)",
-            "request = json.loads(payload.decode())",
+            "line = sys.stdin.readline()",
+            "if not line:",
+            "    raise SystemExit(1)",
+            "request = json.loads(line)",
             r"assert request['jsonrpc'] == '2.0'",
             r"assert request['method'] == 'initialize'",
             r"response = json.dumps({",
@@ -1544,9 +1659,9 @@ mod tests {
             r"        'capabilities': {'tools': {}},",
             r"        'serverInfo': {'name': 'fake-mcp', 'version': '0.1.0'}",
             r"    }",
-            r"}).encode()",
-            r"sys.stdout.buffer.write(f'Content-Length: {len(response)}\r\n\r\n'.encode() + response)",
-            "sys.stdout.buffer.flush()",
+            r"})",
+            r"sys.stdout.write(response + '\n')",
+            "sys.stdout.flush()",
             "",
         ]
         .join("\n");
@@ -1565,23 +1680,14 @@ mod tests {
             "import json, sys",
             "",
             "def read_message():",
-            "    header = b''",
-            r"    while not header.endswith(b'\r\n\r\n'):",
-            "        chunk = sys.stdin.buffer.read(1)",
-            "        if not chunk:",
-            "            return None",
-            "        header += chunk",
-            "    length = 0",
-            r"    for line in header.decode().split('\r\n'):",
-            r"        if line.lower().startswith('content-length:'):",
-            r"            length = int(line.split(':', 1)[1].strip())",
-            "    payload = sys.stdin.buffer.read(length)",
-            "    return json.loads(payload.decode())",
+            "    line = sys.stdin.readline()",
+            "    if not line:",
+            "        return None",
+            "    return json.loads(line)",
             "",
             "def send_message(message):",
-            "    payload = json.dumps(message).encode()",
-            r"    sys.stdout.buffer.write(f'Content-Length: {len(payload)}\r\n\r\n'.encode() + payload)",
-            "    sys.stdout.buffer.flush()",
+            r"    sys.stdout.write(json.dumps(message) + '\n')",
+            "    sys.stdout.flush()",
             "",
             "while True:",
             "    request = read_message()",
@@ -1698,23 +1804,14 @@ mod tests {
             "            handle.write(f'{method}\\n')",
             "",
             "def read_message():",
-            "    header = b''",
-            r"    while not header.endswith(b'\r\n\r\n'):",
-            "        chunk = sys.stdin.buffer.read(1)",
-            "        if not chunk:",
-            "            return None",
-            "        header += chunk",
-            "    length = 0",
-            r"    for line in header.decode().split('\r\n'):",
-            r"        if line.lower().startswith('content-length:'):",
-            r"            length = int(line.split(':', 1)[1].strip())",
-            "    payload = sys.stdin.buffer.read(length)",
-            "    return json.loads(payload.decode())",
+            "    line = sys.stdin.readline()",
+            "    if not line:",
+            "        return None",
+            "    return json.loads(line)",
             "",
             "def send_message(message):",
-            "    payload = json.dumps(message).encode()",
-            r"    sys.stdout.buffer.write(f'Content-Length: {len(payload)}\r\n\r\n'.encode() + payload)",
-            "    sys.stdout.buffer.flush()",
+            r"    sys.stdout.write(json.dumps(message) + '\n')",
+            "    sys.stdout.flush()",
             "",
             "while True:",
             "    request = read_message()",
@@ -1926,7 +2023,7 @@ mod tests {
     }
 
     #[test]
-    fn write_jsonrpc_request_emits_content_length_frame() {
+    fn write_jsonrpc_request_round_trips_over_ndjson_frame() {
         let runtime = Builder::new_current_thread()
             .enable_all()
             .build()
@@ -2121,13 +2218,21 @@ mod tests {
     }
 
     // ============================================================
-    // v0.4.17 RW2 / M6 — read_frame header parser tolerance.
+    // v0.4.17 RW2 / M6 — legacy LSP-framing tolerance.
+    //
+    // These cover the *legacy* `Content-Length` read path
+    // (`read_legacy_lsp_frame`), which `read_frame_from` switches into
+    // when the first line is a `content-length:` header (Track R: we
+    // write NDJSON, but still *read* either dialect). The M6 tolerances
+    // all live on that path now:
     //   • bare LF (`\n`) header/body separator (no CRLF),
     //   • case-insensitive `Content-Length` name,
+    //   • leading whitespace on the header name,
     //   • MAX_CONTENT_LENGTH guard against OOM.
     // Each uses a tiny printf-based emitter so we control the exact
-    // bytes on the wire (the python fake servers always send canonical
-    // CRLF + canonical casing).
+    // bytes on the wire (the python fake servers now speak NDJSON, the
+    // canonical MCP stdio dialect — these emitters are the only legacy
+    // `Content-Length` producers left).
     // ============================================================
 
     /// Write a `/bin/sh` script that `printf`s `body` verbatim to
@@ -2299,23 +2404,16 @@ mod tests {
             "        '_pad': pad,",
             "    },",
             "}",
-            "encoded = json.dumps(response).encode()",
-            r"sys.stdout.buffer.write(f'Content-Length: {len(encoded)}\r\n\r\n'.encode() + encoded)",
+            "# NDJSON: emit the (large) one-line response BEFORE reading",
+            "# the request. A serial client never reaches its read until",
+            "# its write completes, so it deadlocks against this stdout.",
+            r"encoded = (json.dumps(response) + '\n').encode()",
+            "sys.stdout.buffer.write(encoded)",
             "sys.stdout.buffer.flush()",
-            "# Only now drain stdin so the client's (large) write can",
-            "# finish. A serial client never reaches its read until its",
-            "# write completes, so it deadlocks against our stdout above.",
-            "header = b''",
-            r"while not header.endswith(b'\r\n\r\n'):",
-            "    chunk = sys.stdin.buffer.read(1)",
-            "    if not chunk:",
-            "        raise SystemExit(0)",
-            "    header += chunk",
-            "length = 0",
-            r"for line in header.decode().split('\r\n'):",
-            r"    if line.lower().startswith('content-length:'):",
-            r"        length = int(line.split(':', 1)[1].strip())",
-            "sys.stdin.buffer.read(length)",
+            "# Only now drain stdin (one NDJSON line) so the client's",
+            "# (large) write can finish.",
+            "if not sys.stdin.readline():",
+            "    raise SystemExit(0)",
             "import time; time.sleep(30)",
             "",
         ]
@@ -2792,18 +2890,10 @@ mod tests {
         let script = [
             "#!/usr/bin/env python3",
             "import json, sys",
-            "header = b''",
-            r"while not header.endswith(b'\r\n\r\n'):",
-            "    chunk = sys.stdin.buffer.read(1)",
-            "    if not chunk:",
-            "        raise SystemExit(1)",
-            "    header += chunk",
-            "length = 0",
-            r"for line in header.decode().split('\r\n'):",
-            r"    if line.lower().startswith('content-length:'):",
-            r"        length = int(line.split(':', 1)[1].strip())",
-            "payload = sys.stdin.buffer.read(length)",
-            "request = json.loads(payload.decode())",
+            "line = sys.stdin.readline()",
+            "if not line:",
+            "    raise SystemExit(1)",
+            "request = json.loads(line)",
             "# Intentionally respond with a different id so we exercise",
             "# the correlation check.",
             r"response = json.dumps({",
@@ -2814,9 +2904,9 @@ mod tests {
             r"        'capabilities': {},",
             r"        'serverInfo': {'name': 'wrong-id', 'version': '0.1.0'}",
             r"    }",
-            r"}).encode()",
-            r"sys.stdout.buffer.write(f'Content-Length: {len(response)}\r\n\r\n'.encode() + response)",
-            "sys.stdout.buffer.flush()",
+            r"})",
+            r"sys.stdout.write(response + '\n')",
+            "sys.stdout.flush()",
             "# Keep the process alive so the test can observe the kill.",
             "import time; time.sleep(30)",
             "",
@@ -2834,20 +2924,11 @@ mod tests {
         let script = [
             "#!/usr/bin/env python3",
             "import sys, time",
-            "# Read the request header + body so the client's send_request",
-            "# completes, then deliberately hang. The client should",
-            "# trip MCP_REQUEST_TIMEOUT_SECS and kill us.",
-            "header = b''",
-            r"while not header.endswith(b'\r\n\r\n'):",
-            "    chunk = sys.stdin.buffer.read(1)",
-            "    if not chunk:",
-            "        raise SystemExit(0)",
-            "    header += chunk",
-            "length = 0",
-            r"for line in header.decode().split('\r\n'):",
-            r"    if line.lower().startswith('content-length:'):",
-            r"        length = int(line.split(':', 1)[1].strip())",
-            "sys.stdin.buffer.read(length)",
+            "# Read the request line so the client's write completes, then",
+            "# deliberately hang. The client should trip",
+            "# MCP_REQUEST_TIMEOUT_SECS and kill us.",
+            "if not sys.stdin.readline():",
+            "    raise SystemExit(0)",
             "time.sleep(30)",
             "",
         ]
@@ -2872,23 +2953,14 @@ mod tests {
             "            handle.write(f'{method}\\n')",
             "",
             "def read_message():",
-            "    header = b''",
-            r"    while not header.endswith(b'\r\n\r\n'):",
-            "        chunk = sys.stdin.buffer.read(1)",
-            "        if not chunk:",
-            "            return None",
-            "        header += chunk",
-            "    length = 0",
-            r"    for line in header.decode().split('\r\n'):",
-            r"        if line.lower().startswith('content-length:'):",
-            r"            length = int(line.split(':', 1)[1].strip())",
-            "    payload = sys.stdin.buffer.read(length)",
-            "    return json.loads(payload.decode())",
+            "    line = sys.stdin.readline()",
+            "    if not line:",
+            "        return None",
+            "    return json.loads(line)",
             "",
             "def send_message(message):",
-            "    payload = json.dumps(message).encode()",
-            r"    sys.stdout.buffer.write(f'Content-Length: {len(payload)}\r\n\r\n'.encode() + payload)",
-            "    sys.stdout.buffer.flush()",
+            r"    sys.stdout.write(json.dumps(message) + '\n')",
+            "    sys.stdout.flush()",
             "",
             "while True:",
             "    request = read_message()",
@@ -3373,23 +3445,14 @@ mod tests {
             "#!/usr/bin/env python3",
             "import json, os, sys",
             "n = int(os.environ.get('NOTIFICATION_COUNT', '1'))",
-            "header = b''",
-            r"while not header.endswith(b'\r\n\r\n'):",
-            "    chunk = sys.stdin.buffer.read(1)",
-            "    if not chunk:",
-            "        raise SystemExit(1)",
-            "    header += chunk",
-            "length = 0",
-            r"for line in header.decode().split('\r\n'):",
-            r"    if line.lower().startswith('content-length:'):",
-            r"        length = int(line.split(':', 1)[1].strip())",
-            "payload = sys.stdin.buffer.read(length)",
-            "request = json.loads(payload.decode())",
+            "line = sys.stdin.readline()",
+            "if not line:",
+            "    raise SystemExit(1)",
+            "request = json.loads(line)",
             "",
             "def emit(body):",
-            "    encoded = json.dumps(body).encode()",
-            r"    sys.stdout.buffer.write(f'Content-Length: {len(encoded)}\r\n\r\n'.encode() + encoded)",
-            "    sys.stdout.buffer.flush()",
+            r"    sys.stdout.write(json.dumps(body) + '\n')",
+            "    sys.stdout.flush()",
             "",
             "# Emit N notifications first.",
             "for i in range(n):",
@@ -3427,22 +3490,12 @@ mod tests {
         let script = [
             "#!/usr/bin/env python3",
             "import json, sys, time",
-            "header = b''",
-            r"while not header.endswith(b'\r\n\r\n'):",
-            "    chunk = sys.stdin.buffer.read(1)",
-            "    if not chunk:",
-            "        raise SystemExit(1)",
-            "    header += chunk",
-            "length = 0",
-            r"for line in header.decode().split('\r\n'):",
-            r"    if line.lower().startswith('content-length:'):",
-            r"        length = int(line.split(':', 1)[1].strip())",
-            "sys.stdin.buffer.read(length)",
+            "if not sys.stdin.readline():",
+            "    raise SystemExit(1)",
             "",
             "def emit(body):",
-            "    encoded = json.dumps(body).encode()",
-            r"    sys.stdout.buffer.write(f'Content-Length: {len(encoded)}\r\n\r\n'.encode() + encoded)",
-            "    sys.stdout.buffer.flush()",
+            r"    sys.stdout.write(json.dumps(body) + '\n')",
+            "    sys.stdout.flush()",
             "",
             "# Stream notifications indefinitely, never the response.",
             "# The client should still hit the read timeout because the",
@@ -3592,5 +3645,348 @@ mod tests {
             None => std::env::remove_var("MCP_REQUEST_TIMEOUT_SECS"),
         }
         drop(guard);
+    }
+
+    // ============================================================
+    // v0.4.17 Track R — NDJSON framing (the canonical MCP stdio
+    // dialect) + bidirectional read tolerance.
+    //
+    // The real-machine blocker: we emitted LSP `Content-Length` frames;
+    // spec-correct servers (e.g. `codex mcp-server`) read NDJSON
+    // (one JSON object per line) and went silent on our header bytes,
+    // so every request timed out. These tests lock:
+    //   • the wire encoder is NDJSON (one line + `\n`),
+    //   • the reader auto-detects NDJSON vs legacy `Content-Length`,
+    //   • blank lines are skipped and over-long lines rejected,
+    //   • a real NDJSON server completes the full handshake.
+    // ============================================================
+
+    /// Run `read_frame_from` over an in-memory NDJSON byte stream so we
+    /// can assert the pure decode behaviour without spawning a process.
+    fn decode_one_frame(bytes: &[u8]) -> std::io::Result<Vec<u8>> {
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let mut reader = tokio::io::BufReader::new(bytes);
+            super::read_frame_from(&mut reader).await
+        })
+    }
+
+    #[test]
+    fn encode_frame_appends_single_newline_terminator() {
+        // The NDJSON encoder must append exactly one `\n` and nothing
+        // else (no `Content-Length` header, no CR).
+        let framed = super::encode_frame(b"{\"jsonrpc\":\"2.0\"}");
+        assert_eq!(framed, b"{\"jsonrpc\":\"2.0\"}\n");
+    }
+
+    #[test]
+    fn read_frame_parses_single_ndjson_line() {
+        // A bare JSON line (no header) is taken verbatim as one message,
+        // with its trailing newline stripped.
+        let frame = decode_one_frame(b"{\"id\":1,\"jsonrpc\":\"2.0\"}\n")
+            .expect("ndjson line should parse");
+        assert_eq!(frame, b"{\"id\":1,\"jsonrpc\":\"2.0\"}");
+    }
+
+    #[test]
+    fn read_frame_strips_crlf_from_ndjson_line() {
+        // Some servers terminate lines with CRLF; the trailing CR must
+        // be stripped along with the LF so the JSON parses cleanly.
+        let frame =
+            decode_one_frame(b"{\"id\":2}\r\n").expect("crlf-terminated ndjson line should parse");
+        assert_eq!(frame, b"{\"id\":2}");
+    }
+
+    #[test]
+    fn read_frame_skips_blank_lines_before_ndjson() {
+        // Blank / whitespace-only padding lines are skipped before the
+        // real message line is returned.
+        let frame = decode_one_frame(b"\n  \n\t\n{\"id\":3}\n")
+            .expect("blank lines should be skipped, then message returned");
+        assert_eq!(frame, b"{\"id\":3}");
+    }
+
+    #[test]
+    fn read_frame_rejects_overlong_ndjson_line() {
+        // A line longer than MAX_CONTENT_LENGTH without a newline must
+        // be rejected (the NDJSON analogue of the Content-Length cap),
+        // before it can drive unbounded buffering.
+        let mut bytes = vec![b'a'; super::MAX_CONTENT_LENGTH + 16];
+        // No trailing newline: forces the cap to trip.
+        let last = bytes.len() - 1;
+        bytes[last] = b'a';
+        let err = decode_one_frame(&bytes).expect_err("overlong ndjson line should be rejected");
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("exceeds maximum"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn read_frame_reports_eof_on_closed_stream() {
+        // An empty stream surfaces UnexpectedEof (stream closed),
+        // matching the legacy reader's contract.
+        let err = decode_one_frame(b"").expect_err("empty stream should be UnexpectedEof");
+        assert_eq!(err.kind(), ErrorKind::UnexpectedEof);
+    }
+
+    /// Legacy LSP-framing MCP server (still speaks `Content-Length`).
+    /// Proves the *read* path stays bidirectionally tolerant: our client
+    /// writes NDJSON, but a server that replies in the old LSP dialect is
+    /// still understood end-to-end (initialize → tools/list → tools/call).
+    /// (legacy LSP-framing tolerance)
+    #[allow(clippy::too_many_lines)]
+    fn write_legacy_lsp_mcp_server_script() -> PathBuf {
+        let root = temp_dir();
+        fs::create_dir_all(&root).expect("temp dir");
+        let script_path = root.join("legacy-lsp-mcp-server.py");
+        let script = [
+            "#!/usr/bin/env python3",
+            "import json, sys",
+            "",
+            "# Reads NDJSON (the client always writes NDJSON now) but",
+            "# REPLIES in the legacy LSP Content-Length dialect, so the",
+            "# client's bidirectional read tolerance is exercised.",
+            "def read_message():",
+            "    line = sys.stdin.readline()",
+            "    if not line:",
+            "        return None",
+            "    return json.loads(line)",
+            "",
+            "def send_message(message):",
+            "    payload = json.dumps(message).encode()",
+            r"    sys.stdout.buffer.write(f'Content-Length: {len(payload)}\r\n\r\n'.encode() + payload)",
+            "    sys.stdout.buffer.flush()",
+            "",
+            "while True:",
+            "    request = read_message()",
+            "    if request is None:",
+            "        break",
+            "    method = request['method']",
+            "    if 'id' not in request:",
+            "        continue",
+            "    if method == 'initialize':",
+            "        send_message({",
+            "            'jsonrpc': '2.0',",
+            "            'id': request['id'],",
+            "            'result': {",
+            "                'protocolVersion': request['params']['protocolVersion'],",
+            "                'capabilities': {'tools': {}},",
+            "                'serverInfo': {'name': 'legacy-lsp', 'version': '0.1.0'}",
+            "            }",
+            "        })",
+            "    elif method == 'tools/list':",
+            "        send_message({",
+            "            'jsonrpc': '2.0',",
+            "            'id': request['id'],",
+            "            'result': {",
+            "                'tools': [",
+            "                    {",
+            "                        'name': 'echo',",
+            "                        'description': 'legacy echo',",
+            "                        'inputSchema': {'type': 'object'}",
+            "                    }",
+            "                ]",
+            "            }",
+            "        })",
+            "    elif method == 'tools/call':",
+            "        args = request['params'].get('arguments') or {}",
+            "        text = args.get('text', '')",
+            "        send_message({",
+            "            'jsonrpc': '2.0',",
+            "            'id': request['id'],",
+            "            'result': {",
+            "                'content': [{'type': 'text', 'text': f'legacy:{text}'}],",
+            "                'isError': False",
+            "            }",
+            "        })",
+            "    else:",
+            "        send_message({",
+            "            'jsonrpc': '2.0',",
+            "            'id': request['id'],",
+            "            'error': {'code': -32601, 'message': f'unknown method: {method}'},",
+            "        })",
+            "",
+        ]
+        .join("\n");
+        fs::write(&script_path, script).expect("write script");
+        make_executable(&script_path);
+        script_path
+    }
+
+    #[test]
+    fn legacy_lsp_server_round_trips_against_ndjson_client() {
+        // legacy LSP-framing tolerance: client writes NDJSON, server
+        // replies Content-Length — the full discover+call still works.
+        let script_path = write_legacy_lsp_mcp_server_script();
+        let root = script_path.parent().expect("script parent");
+        let log_path = root.join("legacy.log");
+        let servers = BTreeMap::from([(
+            "legacy".to_string(),
+            manager_server_config(&script_path, "legacy", &log_path),
+        )]);
+        let mut handle = McpManagerHandle::from_manager(McpServerManager::from_servers(&servers))
+            .expect("build sync handle");
+
+        let tools = handle.discover_tools().expect("discover via legacy server");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].raw_name, "echo");
+        assert!(handle.discovery_failures().is_empty());
+
+        let response = handle
+            .call_tool(&mcp_tool_name("legacy", "echo"), Some(json!({"text": "hi"})))
+            .expect("call tool on legacy server");
+        let result = response.result.expect("tool result");
+        assert_eq!(result.content.len(), 1);
+        assert_eq!(
+            result.content[0].data.get("text"),
+            Some(&json!("legacy:hi"))
+        );
+
+        handle.shutdown().expect("shutdown");
+        cleanup_script(&script_path);
+    }
+
+    /// NDJSON MCP server that logs the EXACT method of every message it
+    /// receives (requests AND notifications), so the protocol-level
+    /// regression test below can assert the full canonical handshake
+    /// order over the real wire dialect.
+    #[allow(clippy::too_many_lines)]
+    fn write_ndjson_protocol_server_script() -> PathBuf {
+        let root = temp_dir();
+        fs::create_dir_all(&root).expect("temp dir");
+        let script_path = root.join("ndjson-protocol-server.py");
+        let script = [
+            "#!/usr/bin/env python3",
+            "import json, os, sys",
+            "LOG_PATH = os.environ.get('MCP_LOG_PATH')",
+            "",
+            "def log(method):",
+            "    if LOG_PATH:",
+            "        with open(LOG_PATH, 'a', encoding='utf-8') as handle:",
+            "            handle.write(f'{method}\\n')",
+            "",
+            "def read_message():",
+            "    line = sys.stdin.readline()",
+            "    if not line:",
+            "        return None",
+            "    return json.loads(line)",
+            "",
+            "def send_message(message):",
+            r"    sys.stdout.write(json.dumps(message) + '\n')",
+            "    sys.stdout.flush()",
+            "",
+            "while True:",
+            "    request = read_message()",
+            "    if request is None:",
+            "        break",
+            "    method = request['method']",
+            "    log(method)",
+            "    if 'id' not in request:",
+            "        continue",
+            "    if method == 'initialize':",
+            "        send_message({",
+            "            'jsonrpc': '2.0',",
+            "            'id': request['id'],",
+            "            'result': {",
+            "                'protocolVersion': request['params']['protocolVersion'],",
+            "                'capabilities': {'tools': {}},",
+            "                'serverInfo': {'name': 'ndjson-proto', 'version': '1.0.0'}",
+            "            }",
+            "        })",
+            "    elif method == 'tools/list':",
+            "        send_message({",
+            "            'jsonrpc': '2.0',",
+            "            'id': request['id'],",
+            "            'result': {",
+            "                'tools': [",
+            "                    {",
+            "                        'name': 'echo',",
+            "                        'description': 'ndjson echo',",
+            "                        'inputSchema': {'type': 'object'}",
+            "                    }",
+            "                ]",
+            "            }",
+            "        })",
+            "    elif method == 'tools/call':",
+            "        args = request['params'].get('arguments') or {}",
+            "        text = args.get('text', '')",
+            "        send_message({",
+            "            'jsonrpc': '2.0',",
+            "            'id': request['id'],",
+            "            'result': {",
+            "                'content': [{'type': 'text', 'text': f'echo:{text}'}],",
+            "                'isError': False",
+            "            }",
+            "        })",
+            "    else:",
+            "        send_message({",
+            "            'jsonrpc': '2.0',",
+            "            'id': request['id'],",
+            "            'error': {'code': -32601, 'message': f'unknown method: {method}'},",
+            "        })",
+            "",
+        ]
+        .join("\n");
+        fs::write(&script_path, script).expect("write script");
+        make_executable(&script_path);
+        script_path
+    }
+
+    #[test]
+    fn ndjson_server_completes_full_protocol_handshake() {
+        // The most important Track R regression: against a server that
+        // speaks the REAL MCP stdio dialect (NDJSON, like codex), the
+        // client must drive initialize → notifications/initialized →
+        // tools/list → tools/call in order. The pre-fix LSP framing made
+        // a real NDJSON server go silent, so this would have hung at the
+        // initialize timeout.
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let script_path = write_ndjson_protocol_server_script();
+            let root = script_path.parent().expect("script parent");
+            let log_path = root.join("proto.log");
+            let servers = BTreeMap::from([(
+                "proto".to_string(),
+                manager_server_config(&script_path, "proto", &log_path),
+            )]);
+            let mut manager = McpServerManager::from_servers(&servers);
+
+            let tools = manager.discover_tools().await.expect("ndjson discover");
+            assert_eq!(tools.len(), 1);
+            assert_eq!(tools[0].raw_name, "echo");
+
+            let call = manager
+                .call_tool(&mcp_tool_name("proto", "echo"), Some(json!({"text": "live"})))
+                .await
+                .expect("ndjson tool call");
+            let result = call.result.expect("tool result");
+            assert_eq!(
+                result.content[0].data.get("text"),
+                Some(&json!("echo:live"))
+            );
+
+            // Exact canonical handshake order over the real wire dialect.
+            let log = fs::read_to_string(&log_path).expect("read log");
+            assert_eq!(
+                log.lines().collect::<Vec<_>>(),
+                vec![
+                    "initialize",
+                    "notifications/initialized",
+                    "tools/list",
+                    "tools/call"
+                ]
+            );
+
+            manager.shutdown().await.expect("shutdown");
+            cleanup_script(&script_path);
+        });
     }
 }

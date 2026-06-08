@@ -7097,27 +7097,26 @@ mod tests {
         let root = std::env::temp_dir().join(format!("aris-cli-mcp-it-{nanos}"));
         std::fs::create_dir_all(&root).expect("temp dir");
         let script_path = root.join("echo-server.py");
+        // v0.4.17 (Track R): NDJSON framing — one JSON object per line,
+        // the canonical MCP stdio dialect the runtime client now speaks
+        // (matching the real `codex mcp-server`). The earlier
+        // `Content-Length` framing was an LSP-ism no real MCP server
+        // reads; keeping it here would have this fixture silently speak a
+        // dialect the fixed client never writes, re-creating the exact
+        // self-consistent test hallucination Track R removed.
         let script = [
             "#!/usr/bin/env python3",
             "import json, sys",
             "",
             "def read_message():",
-            "    header = b''",
-            r"    while not header.endswith(b'\r\n\r\n'):",
-            "        chunk = sys.stdin.buffer.read(1)",
-            "        if not chunk:",
-            "            return None",
-            "        header += chunk",
-            "    length = 0",
-            r"    for line in header.decode().split('\r\n'):",
-            r"        if line.lower().startswith('content-length:'):",
-            r"            length = int(line.split(':', 1)[1].strip())",
-            "    return json.loads(sys.stdin.buffer.read(length).decode())",
+            "    line = sys.stdin.readline()",
+            "    if not line:",
+            "        return None",
+            "    return json.loads(line)",
             "",
             "def send(message):",
-            "    payload = json.dumps(message).encode()",
-            r"    sys.stdout.buffer.write(f'Content-Length: {len(payload)}\r\n\r\n'.encode() + payload)",
-            "    sys.stdout.buffer.flush()",
+            r"    sys.stdout.write(json.dumps(message) + '\n')",
+            "    sys.stdout.flush()",
             "",
             "while True:",
             "    req = read_message()",
