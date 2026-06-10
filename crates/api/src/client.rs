@@ -400,8 +400,38 @@ impl AuthSource {
     }
 }
 
+/// True when the `ARIS_DISABLE_KEYCHAIN` escape hatch is set to a truthy
+/// value. Truthy = any value other than empty / `0` / `false` / `no` / `off`
+/// (case-insensitive); an unset variable is falsy — exactly the
+/// `ARIS_NO_HISTORY` truthy semantics (`history.rs::history_disabled`).
+///
+/// v0.4.17 A5.1 — this is a **public escape hatch**, not just a test gate:
+/// it skips every macOS Keychain fallback (both `from_env_or_saved` and
+/// `resolve_startup_auth_source` route through `load_keychain_oauth_token`),
+/// which is useful on machines where the official Claude Code credential is
+/// installed but the user wants `ANTHROPIC_API_KEY`/saved-credentials-only
+/// auth, on GUI-less macs, and in CI/test environments where reading the
+/// real Keychain would be nondeterministic.
+pub fn keychain_disabled() -> bool {
+    match std::env::var("ARIS_DISABLE_KEYCHAIN") {
+        Ok(v) => {
+            let v = v.trim().to_ascii_lowercase();
+            !matches!(v.as_str(), "" | "0" | "false" | "no" | "off")
+        }
+        Err(_) => false,
+    }
+}
+
 /// Try to load OAuth token set from macOS Keychain (where official Claude Code stores it).
+///
+/// Honors the `ARIS_DISABLE_KEYCHAIN` escape hatch (see [`keychain_disabled`]):
+/// when set to a truthy value this returns `None` unconditionally, so both
+/// callers (`AuthSource::from_env_or_saved` and `resolve_startup_auth_source`)
+/// skip the Keychain fallback in one place.
 fn load_keychain_oauth_token() -> Option<OAuthTokenSet> {
+    if keychain_disabled() {
+        return None;
+    }
     #[cfg(target_os = "macos")]
     {
         let output = std::process::Command::new("security")
@@ -804,6 +834,38 @@ fn should_retry_on_premature_eof(
         && stream_retries_remaining > 0
 }
 
+/// v0.4.17 A5.2 (CL2) — classify whether an event signals that the stream
+/// reached a terminal state, symmetric to the `OpenAI` executor's v0.4.15
+/// `observed_done || observed_finish_reason` semantics:
+///
+/// * `MessageStop` — the canonical Anthropic terminal frame (pre-CL2 this
+///   was the ONLY signal that flipped `observed_terminal`).
+/// * `MessageDelta` with a **non-empty** `stop_reason` — anthropic-compat
+///   proxies may emit `message_delta` carrying `stop_reason` and then close
+///   the connection without ever sending `message_stop`; treating the delta
+///   as terminal turns that clean EOF into a complete response instead of a
+///   spurious premature-EOF retry. Empty-string `stop_reason` is NOT
+///   terminal (mirrors `choice_finish_reason`'s non-empty filter on the
+///   `OpenAI` side).
+///
+/// Like the `OpenAI` `stream_eof_action` philosophy, this only relaxes how a
+/// *clean* EOF is judged — the reader never stops early at a terminal
+/// signal, so trailing `MessageStop` / usage frames are still consumed, and
+/// a true truncation (no terminal signal at all) still hard-errors. The
+/// meaningful-content retry gate (`event_is_meaningful_content`) is
+/// deliberately untouched.
+fn event_signals_terminal(event: &StreamEvent) -> bool {
+    match event {
+        StreamEvent::MessageStop(_) => true,
+        StreamEvent::MessageDelta(e) => e
+            .delta
+            .stop_reason
+            .as_deref()
+            .is_some_and(|reason| !reason.is_empty()),
+        _ => false,
+    }
+}
+
 impl MessageStream {
     #[must_use]
     pub fn request_id(&self) -> Option<&str> {
@@ -834,7 +896,9 @@ impl MessageStream {
                     });
                 }
                 // Track terminal signal + meaningful-content flag + counter.
-                if matches!(event, StreamEvent::MessageStop(_)) {
+                // v0.4.17 A5.2 (CL2): MessageStop OR a stop_reason-bearing
+                // MessageDelta both count as terminal — see event_signals_terminal.
+                if event_signals_terminal(&event) {
                     self.observed_terminal = true;
                 }
                 if event_is_meaningful_content(&event) {
@@ -876,7 +940,9 @@ impl MessageStream {
                 let remaining = finish_result?;
                 self.pending.extend(remaining);
                 if let Some(event) = self.pending.pop_front() {
-                    if matches!(event, StreamEvent::MessageStop(_)) {
+                    // v0.4.17 A5.2 (CL2): same terminal classification as the
+                    // main pop path above.
+                    if event_signals_terminal(&event) {
                         self.observed_terminal = true;
                     }
                     if event_is_meaningful_content(&event) {
@@ -1089,21 +1155,28 @@ mod tests {
     #[test]
     fn read_api_key_requires_presence() {
         let _guard = env_lock();
+        // v0.4.17 A5.1: without the gate, a developer machine with the
+        // official Claude Code Keychain credential would resolve a real
+        // token here and the expect_err would fail (local-red/CI-green).
+        std::env::set_var("ARIS_DISABLE_KEYCHAIN", "1");
         std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
         std::env::remove_var("ANTHROPIC_API_KEY");
         std::env::remove_var("CLAUDE_CONFIG_HOME");
         let error = super::read_api_key().expect_err("missing key should error");
         assert!(matches!(error, crate::error::ApiError::MissingApiKey));
+        std::env::remove_var("ARIS_DISABLE_KEYCHAIN");
     }
 
     #[test]
     fn read_api_key_requires_non_empty_value() {
         let _guard = env_lock();
+        std::env::set_var("ARIS_DISABLE_KEYCHAIN", "1");
         std::env::set_var("ANTHROPIC_AUTH_TOKEN", "");
         std::env::remove_var("ANTHROPIC_API_KEY");
         let error = super::read_api_key().expect_err("empty key should error");
         assert!(matches!(error, crate::error::ApiError::MissingApiKey));
         std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
+        std::env::remove_var("ARIS_DISABLE_KEYCHAIN");
     }
 
     #[test]
@@ -1122,9 +1195,11 @@ mod tests {
     #[test]
     fn read_auth_token_reads_auth_token_env() {
         let _guard = env_lock();
+        std::env::set_var("ARIS_DISABLE_KEYCHAIN", "1");
         std::env::set_var("ANTHROPIC_AUTH_TOKEN", "auth-token");
         assert_eq!(super::read_auth_token().as_deref(), Some("auth-token"));
         std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
+        std::env::remove_var("ARIS_DISABLE_KEYCHAIN");
     }
 
     #[test]
@@ -1193,6 +1268,7 @@ mod tests {
     #[test]
     fn resolve_saved_oauth_token_refreshes_expired_credentials() {
         let _guard = env_lock();
+        std::env::set_var("ARIS_DISABLE_KEYCHAIN", "1");
         let config_home = temp_config_home();
         std::env::set_var("CLAUDE_CONFIG_HOME", &config_home);
         std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
@@ -1219,12 +1295,14 @@ mod tests {
 
         clear_oauth_credentials().expect("clear credentials");
         std::env::remove_var("CLAUDE_CONFIG_HOME");
+        std::env::remove_var("ARIS_DISABLE_KEYCHAIN");
         std::fs::remove_dir_all(config_home).expect("cleanup temp dir");
     }
 
     #[test]
     fn resolve_startup_auth_source_uses_saved_oauth_without_loading_config() {
         let _guard = env_lock();
+        std::env::set_var("ARIS_DISABLE_KEYCHAIN", "1");
         let config_home = temp_config_home();
         std::env::set_var("CLAUDE_CONFIG_HOME", &config_home);
         std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
@@ -1243,12 +1321,14 @@ mod tests {
 
         clear_oauth_credentials().expect("clear credentials");
         std::env::remove_var("CLAUDE_CONFIG_HOME");
+        std::env::remove_var("ARIS_DISABLE_KEYCHAIN");
         std::fs::remove_dir_all(config_home).expect("cleanup temp dir");
     }
 
     #[test]
     fn resolve_startup_auth_source_errors_when_refreshable_token_lacks_config() {
         let _guard = env_lock();
+        std::env::set_var("ARIS_DISABLE_KEYCHAIN", "1");
         let config_home = temp_config_home();
         std::env::set_var("CLAUDE_CONFIG_HOME", &config_home);
         std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
@@ -1275,12 +1355,14 @@ mod tests {
 
         clear_oauth_credentials().expect("clear credentials");
         std::env::remove_var("CLAUDE_CONFIG_HOME");
+        std::env::remove_var("ARIS_DISABLE_KEYCHAIN");
         std::fs::remove_dir_all(config_home).expect("cleanup temp dir");
     }
 
     #[test]
     fn resolve_saved_oauth_token_preserves_refresh_token_when_refresh_response_omits_it() {
         let _guard = env_lock();
+        std::env::set_var("ARIS_DISABLE_KEYCHAIN", "1");
         let config_home = temp_config_home();
         std::env::set_var("CLAUDE_CONFIG_HOME", &config_home);
         std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
@@ -1308,7 +1390,31 @@ mod tests {
 
         clear_oauth_credentials().expect("clear credentials");
         std::env::remove_var("CLAUDE_CONFIG_HOME");
+        std::env::remove_var("ARIS_DISABLE_KEYCHAIN");
         std::fs::remove_dir_all(config_home).expect("cleanup temp dir");
+    }
+
+    /// v0.4.17 A5.1 — the gate's own unit test: with `ARIS_DISABLE_KEYCHAIN`
+    /// set, no env keys, and a fresh (credential-less) config home,
+    /// `from_env_or_saved` must surface `MissingApiKey` — i.e. the Keychain
+    /// fallback is skipped even on a macOS machine that has the official
+    /// Claude Code credential installed. (Without the gate this would
+    /// nondeterministically return a real `BearerToken` locally.)
+    #[test]
+    fn keychain_gate_skips_keychain_fallback() {
+        let _guard = env_lock();
+        std::env::set_var("ARIS_DISABLE_KEYCHAIN", "1");
+        let config_home = temp_config_home();
+        std::env::set_var("CLAUDE_CONFIG_HOME", &config_home);
+        std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
+        std::env::remove_var("ANTHROPIC_API_KEY");
+
+        let error = AuthSource::from_env_or_saved()
+            .expect_err("gated keychain + no env + no saved credentials must error");
+        assert!(matches!(error, crate::error::ApiError::MissingApiKey));
+
+        std::env::remove_var("CLAUDE_CONFIG_HOME");
+        std::env::remove_var("ARIS_DISABLE_KEYCHAIN");
     }
 
     #[test]
@@ -1556,23 +1662,61 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
-    // v0.4.17 Phase 0 — CHARACTERIZATION TEST (CL2 baseline)
-    //
-    // A5.2/CL2 will make Anthropic's `MessageDelta.stop_reason` participate
-    // in completion detection (symmetric to v0.4.15's OpenAI finish_reason).
-    // TODAY, `observed_terminal` flips ONLY on `MessageStop`: a `MessageDelta`
-    // carrying `stop_reason` is treated as protocol-only (NOT meaningful
-    // content) and does NOT mark the stream terminal. Consequence: a clean
-    // EOF after a stop_reason-bearing MessageDelta but WITHOUT a MessageStop
-    // is still retry-eligible (observed_terminal=false). This locks both
-    // facts so the CL2 change is visible and bounded.
+    // v0.4.17 A5.2 (CL2) — the Phase 0 characterization baseline
+    // (`char_message_delta_with_stop_reason_is_not_meaningful_today`) was
+    // DELIBERATELY FLIPPED here: a `MessageDelta` carrying a non-empty
+    // `stop_reason` now signals stream-terminal (symmetric to v0.4.15's
+    // OpenAI finish_reason handling), while its meaningful-content
+    // classification — the retry gate — is deliberately UNCHANGED.
     #[test]
-    fn char_message_delta_with_stop_reason_is_not_meaningful_today() {
+    fn message_delta_with_stop_reason_is_terminal_but_not_meaningful() {
         use crate::types::{MessageDelta, MessageDeltaEvent, StreamEvent, Usage};
 
-        // A MessageDelta that DOES carry a stop_reason ("end_turn"). Today
-        // this is classified as NOT meaningful content (protocol-only),
-        // exactly like a stop_reason-less delta.
+        fn delta_event(stop_reason: Option<&str>) -> StreamEvent {
+            StreamEvent::MessageDelta(MessageDeltaEvent {
+                delta: MessageDelta {
+                    stop_reason: stop_reason.map(ToOwned::to_owned),
+                    stop_sequence: None,
+                },
+                usage: Usage {
+                    input_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: 0,
+                    output_tokens: 0,
+                },
+            })
+        }
+
+        // CL2 flip: a non-empty stop_reason now marks the stream terminal.
+        assert!(
+            super::event_signals_terminal(&delta_event(Some("end_turn"))),
+            "MessageDelta with non-empty stop_reason must be terminal (CL2)"
+        );
+        // ...but it is STILL not meaningful content — the premature-EOF
+        // retry gate (`has_emitted_meaningful_content`) is untouched.
+        assert!(
+            !super::event_is_meaningful_content(&delta_event(Some("end_turn"))),
+            "stop_reason delta must remain NON-meaningful (retry gate unchanged)"
+        );
+        // Empty-string stop_reason is NOT a terminal signal (mirrors the
+        // OpenAI choice_finish_reason non-empty filter).
+        assert!(!super::event_signals_terminal(&delta_event(Some(""))));
+        // stop_reason-less delta: neither terminal nor meaningful.
+        assert!(!super::event_signals_terminal(&delta_event(None)));
+        assert!(!super::event_is_meaningful_content(&delta_event(None)));
+    }
+
+    /// v0.4.17 A5.2 (CL2) — flip of Phase 0's
+    /// `char_clean_eof_after_stop_reason_delta_is_still_retry_eligible_today`:
+    /// a `stop_reason`-bearing `MessageDelta` now sets `observed_terminal`, so a
+    /// clean EOF afterwards (anthropic-compat proxy that never sends
+    /// `message_stop`) is judged COMPLETE — no retry fires.
+    #[test]
+    fn clean_eof_after_stop_reason_delta_is_complete_not_retried() {
+        use crate::types::{MessageDelta, MessageDeltaEvent, MessageStopEvent, StreamEvent, Usage};
+
+        // The stream produced a stop_reason-bearing MessageDelta; per CL2 it
+        // flips observed_terminal...
         let delta_with_stop = StreamEvent::MessageDelta(MessageDeltaEvent {
             delta: MessageDelta {
                 stop_reason: Some("end_turn".to_string()),
@@ -1585,33 +1729,61 @@ mod tests {
                 output_tokens: 0,
             },
         });
-        assert!(
-            !super::event_is_meaningful_content(&delta_with_stop),
-            "MessageDelta with stop_reason must still be NON-meaningful today"
-        );
-    }
+        let observed_terminal = super::event_signals_terminal(&delta_with_stop);
+        assert!(observed_terminal);
 
-    /// CL2 companion: because a stop_reason-bearing MessageDelta does not set
-    /// `observed_terminal`, a clean-EOF stream that only ever produced such a
-    /// delta (no MessageStop, no meaningful content) is STILL retry-eligible.
-    /// This pins `observed_terminal=false` as the retry-gate input that CL2
-    /// will change.
-    #[test]
-    fn char_clean_eof_after_stop_reason_delta_is_still_retry_eligible_today() {
-        // Scenario: MessageStart + a stop_reason-bearing MessageDelta were
-        // consumed (neither is "meaningful"), then a clean EOF with empty
-        // leftover. Because MessageStop was never seen, observed_terminal is
-        // false, so the premature-EOF retry fires.
+        // ...so the clean-EOF retry gate no longer fires: complete response.
         assert!(
-            super::should_retry_on_premature_eof(
+            !super::should_retry_on_premature_eof(
                 /* has_emitted_meaningful_content */ false,
-                /* observed_terminal */ false,
+                observed_terminal,
                 /* parser_errored */ false,
                 /* leftover_empty */ true,
                 /* stream_retries_remaining */ 2,
             ),
-            "stop_reason in a MessageDelta does not yet count as terminal"
+            "stop_reason delta + clean EOF must be complete, not retried (CL2)"
         );
+
+        // MessageStop is unchanged as the canonical terminal frame, so the
+        // native Anthropic flow (delta-with-stop_reason THEN message_stop)
+        // just sets observed_terminal twice — no behavior change.
+        assert!(super::event_signals_terminal(&StreamEvent::MessageStop(
+            MessageStopEvent {}
+        )));
+    }
+
+    /// CL2 companion: a stream with NO terminal signal at all (no
+    /// `MessageStop`, no `stop_reason`-bearing delta) is still retry-eligible on
+    /// clean EOF — true truncations keep hard-failing/retrying exactly as
+    /// before.
+    #[test]
+    fn clean_eof_without_any_terminal_signal_remains_retry_eligible() {
+        use crate::types::{MessageDelta, MessageDeltaEvent, StreamEvent, Usage};
+
+        // A usage-only MessageDelta (stop_reason: None) — common mid-stream
+        // frame — must NOT count as terminal...
+        let plain_delta = StreamEvent::MessageDelta(MessageDeltaEvent {
+            delta: MessageDelta {
+                stop_reason: None,
+                stop_sequence: None,
+            },
+            usage: Usage {
+                input_tokens: 0,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+                output_tokens: 7,
+            },
+        });
+        assert!(!super::event_signals_terminal(&plain_delta));
+
+        // ...so the premature-EOF retry still fires with budget remaining.
+        assert!(super::should_retry_on_premature_eof(
+            /* has_emitted_meaningful_content */ false,
+            /* observed_terminal */ false,
+            /* parser_errored */ false,
+            /* leftover_empty */ true,
+            /* stream_retries_remaining */ 2,
+        ));
     }
 
     /// v0.4.14 C11 — chunk-idle timeout env parser truth table. Pure

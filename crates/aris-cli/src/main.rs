@@ -1196,6 +1196,16 @@ fn run_repl(
                     break;
                 }
                 if let Some(command) = SlashCommand::parse(&trimmed) {
+                    // v0.4.17 A5.4 — deliberately flipped in v0.4.17 (A5.4):
+                    // slash commands now enter history per maintainer decision
+                    // 2026-06-05. Same call shape as the free-text path below:
+                    // disk append first (honors ARIS_NO_HISTORY + the
+                    // disk-only secret-skip, which applies to slash entries
+                    // too), then the raw untrimmed in-memory push for Up/Down
+                    // and Ctrl+R. `/exit` and `/quit` break above and so stay
+                    // out of history, as before.
+                    history::append_entry(&history_path, &input);
+                    editor.push_history(input);
                     // Clear interrupt flag before command
                     runtime::clear_interrupt();
                     match cli.handle_repl_command(command) {
@@ -5849,7 +5859,13 @@ fn check_auth_status() -> &'static str {
     if creds_path.exists() {
         return "OK (OAuth saved)";
     }
-    // Check macOS Keychain for Claude Code's OAuth token
+    // Check macOS Keychain for Claude Code's OAuth token. Respect the same
+    // ARIS_DISABLE_KEYCHAIN escape hatch as the api crate's auth fallback so
+    // the gate's "never touch the real Keychain" promise holds for doctor
+    // too (codex R15).
+    if api::keychain_disabled() {
+        return "missing (Keychain check disabled)";
+    }
     if let Ok(output) = Command::new("security")
         .args([
             "find-generic-password",

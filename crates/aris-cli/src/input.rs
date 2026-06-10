@@ -1376,4 +1376,28 @@ mod tests {
         ed.push_history("third");
         assert_eq!(ed.history, vec!["first", "second", "third"]);
     }
+
+    /// v0.4.17 A5.4 — slash commands now enter the in-memory history
+    /// (deliberately flipped in v0.4.17 (A5.4): slash commands now enter
+    /// history per maintainer decision 2026-06-05). The v0.4.16 REPL
+    /// `continue`d past `push_history` for slash input — a call-site-only
+    /// contract with no explicit test. This locks the new positive contract:
+    /// a slash entry is stored like any other, lands NEWEST (so a single
+    /// Up-arrow recalls it), and is recallable via reverse search (Ctrl+R).
+    #[test]
+    fn slash_commands_enter_in_memory_history() {
+        let mut ed = make_editor();
+        ed.push_history("explain tokenization");
+        ed.push_history("/status");
+        assert_eq!(ed.history, vec!["explain tokenization", "/status"]);
+        // Up-arrow walks backward from the end: newest entry (the slash
+        // command) is recalled first.
+        assert_eq!(ed.history.last().map(String::as_str), Some("/status"));
+        // Ctrl+R can find it too.
+        let q: Vec<char> = "/sta".chars().collect();
+        assert_eq!(
+            super::reverse_search_match(&ed.history, &q, ed.history.len() - 1),
+            Some(1)
+        );
+    }
 }

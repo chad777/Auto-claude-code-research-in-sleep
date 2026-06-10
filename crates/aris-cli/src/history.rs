@@ -465,6 +465,39 @@ mod tests {
         let _ = fs::remove_file(&path);
     }
 
+    /// v0.4.17 A5.4 — slash commands now enter history (deliberately flipped
+    /// in v0.4.17 per maintainer decision 2026-06-05; v0.4.16 had the REPL
+    /// `continue` past the history calls for slash input, a contract that
+    /// existed only at the `run_repl` call-site, with no test locking it).
+    /// This locks the disk half of the new behavior: a slash command line
+    /// persists via `append_entry`, round-trips through `load_history`, and
+    /// the secret-skip still applies to slash entries carrying credentials.
+    #[test]
+    fn append_persists_slash_commands() {
+        let _g = crate::env_test_guard();
+        std::env::remove_var("ARIS_NO_HISTORY");
+        let path = tmp_path("slash");
+
+        append_entry(&path, "/model gpt-5.5");
+        append_entry(&path, "plain question");
+
+        let loaded = load_history(&path);
+        assert_eq!(loaded, vec!["/model gpt-5.5", "plain question"]);
+        let raw = fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("/model gpt-5.5\n"), "slash line must be on disk");
+
+        // Secret-skip is entry-shape based, so it guards slash commands too:
+        // a credential-bearing slash line stays OFF disk.
+        append_entry(&path, "/setup --api-key sk-abcdefghijklmnopqrstuvwxyz");
+        assert_eq!(
+            load_history(&path),
+            vec!["/model gpt-5.5", "plain question"],
+            "credential-bearing slash command must not persist"
+        );
+
+        let _ = fs::remove_file(&path);
+    }
+
     #[test]
     fn load_filters_blank_lines_from_file() {
         let _g = crate::env_test_guard();

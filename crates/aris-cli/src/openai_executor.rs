@@ -254,8 +254,26 @@ fn choice_finish_reason(choice: &Value) -> Option<&str> {
 /// (slot index → (id, name, arguments)). Tool-call fields arrive
 /// incrementally across chunks: `id` is overwritten whenever the field is
 /// present, a non-empty `name` is retained, and `arguments` concatenate.
+///
+/// v0.4.17 A5.3 (OE6) — when the delta omits `index` (`OpenAI` always sends
+/// it; some compat providers may not), fall back to matching an existing
+/// slot by the delta's non-empty `id` before defaulting to slot 0. This is
+/// the conservative fix for the parallel-tool-call clobber: an index-less
+/// continuation chunk that names an already-known call lands in that call's
+/// slot instead of merging into slot 0. If the delta has no id, or the id
+/// matches no existing slot, the long-standing slot-0 default applies
+/// unchanged (no new-slot semantics are invented). The index-present path
+/// is byte-identical to before.
 fn accumulate_tool_call(pending: &mut Vec<(String, String, String)>, tc: &Value) {
-    let idx = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
+    let idx = match tc.get("index").and_then(Value::as_u64) {
+        Some(i) => i as usize,
+        None => tc
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .and_then(|id| pending.iter().position(|slot| slot.0 == id))
+            .unwrap_or(0),
+    };
     while pending.len() <= idx {
         pending.push((String::new(), String::new(), String::new()));
     }
@@ -274,6 +292,41 @@ fn accumulate_tool_call(pending: &mut Vec<(String, String, String)>, tc: &Value)
     }
 }
 
+/// Parse a streaming chunk's `usage` object into a [`TokenUsage`].
+///
+/// v0.4.17 A5.3 (OE5) — reads the OpenAI-canonical fields first and falls
+/// back to the Anthropic-style variant names some OpenAI-compatible
+/// providers emit instead:
+///
+/// * input:  `prompt_tokens`, else `input_tokens`
+/// * output: `completion_tokens`, else `output_tokens`
+///
+/// The canonical field wins whenever it carries a number; a missing,
+/// `null`, or non-numeric canonical field falls through to the variant.
+/// Cache-read stays `prompt_tokens_details.cached_tokens` only (v0.4.10
+/// T35) — no variant is known for it. Absent/unparseable values are 0, as
+/// before.
+fn parse_stream_usage(usage: &Value) -> TokenUsage {
+    let read = |canonical: &str, variant: &str| -> u32 {
+        usage
+            .get(canonical)
+            .and_then(Value::as_u64)
+            .or_else(|| usage.get(variant).and_then(Value::as_u64))
+            .unwrap_or(0) as u32
+    };
+    let cached_tokens = usage
+        .get("prompt_tokens_details")
+        .and_then(|d| d.get("cached_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as u32;
+    TokenUsage {
+        input_tokens: read("prompt_tokens", "input_tokens"),
+        output_tokens: read("completion_tokens", "output_tokens"),
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: cached_tokens,
+    }
+}
+
 /// Extract the trimmed payload of an SSE `data:` line (OE3 / #249).
 /// Tolerates both `data: {...}` (OpenAI canonical, one space) and
 /// `data:{...}` (no space — W3C EventSource permits zero or one space
@@ -281,6 +334,13 @@ fn accumulate_tool_call(pending: &mut Vec<(String, String, String)>, tc: &Value)
 /// which the old `strip_prefix("data: ")` silently dropped). Returns
 /// `None` for blank lines, comment lines, and non-`data:` field lines
 /// (`event:`, `id:`, `retry:`), which the streaming loop skips.
+///
+/// OE8 (v0.4.17 A5.3) evaluated, skipped: skipping `event:` lines IS the
+/// correct tolerance for the Chat Completions protocol — `OpenAI` never emits
+/// them, no known compat provider attaches semantics to the event name, and
+/// `data:` payloads are processed regardless of any preceding `event:`
+/// field. Wiring an event-name parser would be dead code with no trigger
+/// surface.
 fn sse_data_payload(line: &str) -> Option<&str> {
     line.strip_prefix("data:").map(str::trim)
 }
@@ -904,24 +964,11 @@ on a compatible third-party proxy, or use Claude/another provider as executor an
                     // doesn't have a direct equivalent on OpenAI; we leave
                     // it 0 (their automatic write-on-first-use is not
                     // reported as a separate quantity).
+                    // v0.4.17 A5.3 (OE5): parsing extracted to the pure
+                    // `parse_stream_usage`, which also accepts the
+                    // input_tokens/output_tokens variant field names.
                     if let Some(usage) = parsed.get("usage") {
-                        let input_tokens =
-                            usage.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-                        let output_tokens = usage
-                            .get("completion_tokens")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0) as u32;
-                        let cached_tokens = usage
-                            .get("prompt_tokens_details")
-                            .and_then(|d| d.get("cached_tokens"))
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0) as u32;
-                        events.push(AssistantEvent::Usage(TokenUsage {
-                            input_tokens,
-                            output_tokens,
-                            cache_creation_input_tokens: 0,
-                            cache_read_input_tokens: cached_tokens,
-                        }));
+                        events.push(AssistantEvent::Usage(parse_stream_usage(usage)));
                     }
 
                     let Some(choices) = parsed.get("choices").and_then(|c| c.as_array()) else {
@@ -1535,9 +1582,9 @@ mod tests {
         assert_eq!(pending[1].1, "fetch");
         assert_eq!(pending[1].2, "{}");
 
-        // Missing index defaults to slot 0 (OpenAI always sends index; this
-        // is the documented fallback, not a guarantee of correctness for
-        // parallel tool calls — see OE6 deferred to v0.4.16).
+        // Missing index with an UNKNOWN id still defaults to slot 0 (OpenAI
+        // always sends index; the v0.4.17 OE6 id-fallback only redirects to
+        // an EXISTING slot whose id matches — it never invents a new slot).
         let mut p2: Vec<(String, String, String)> = Vec::new();
         accumulate_tool_call(&mut p2, &json!({"id": "x", "function": {"name": "n"}}));
         assert_eq!(p2.len(), 1);
@@ -1545,44 +1592,127 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
-    // v0.4.17 Phase 0 — CHARACTERIZATION TEST (OE6 baseline)
-    //
-    // A5.3/OE6 will make `accumulate_tool_call` fall back to `id` when the
-    // streaming delta omits `index`. This fixture locks the CURRENT
-    // (buggy-but-known) behavior: a delta WITHOUT `index` defaults to slot
-    // 0, so when slot 0 is already occupied by a different tool, the
-    // index-less delta CLOBBERS / MERGES INTO slot 0 rather than landing in
-    // its own slot. Phase 3 must change this on purpose; the test makes the
-    // change visible and bounded.
+    // v0.4.17 A5.3 (OE6) — the Phase 0 characterization baseline
+    // (`char_accumulate_tool_call_missing_index_merges_into_slot_zero`) was
+    // DELIBERATELY FLIPPED here: an index-less delta now falls back to
+    // matching an existing slot by `id` before defaulting to slot 0. The
+    // slot-0 default is preserved for deltas whose id is unknown or absent
+    // (no new-slot semantics), and the index-present path is unchanged.
     #[test]
-    fn char_accumulate_tool_call_missing_index_merges_into_slot_zero() {
+    fn accumulate_tool_call_missing_index_falls_back_to_id_match() {
         use serde_json::json;
-        let mut pending: Vec<(String, String, String)> = Vec::new();
 
-        // Slot 0 established by a properly-indexed first tool call.
+        // --- id HIT: index-less continuation routed to the matching slot ---
+        let mut pending: Vec<(String, String, String)> = Vec::new();
         accumulate_tool_call(
             &mut pending,
             &json!({"index": 0, "id": "call_A", "function": {"name": "alpha", "arguments": "{\"a\":1}"}}),
         );
-
-        // A SECOND, conceptually-distinct tool call arrives WITHOUT an
-        // `index`. Today it defaults to slot 0 and overwrites id/name +
-        // appends its arguments onto slot 0 — there is NO id-based fallback
-        // that would give it a separate slot.
         accumulate_tool_call(
             &mut pending,
-            &json!({"id": "call_B", "function": {"name": "beta", "arguments": "{\"b\":2}"}}),
+            &json!({"index": 1, "id": "call_B", "function": {"name": "beta", "arguments": "{\"b\":"}}),
+        );
+        // A continuation for call_B arrives WITHOUT an index. Pre-OE6 this
+        // merged into slot 0 (clobbering call_A); now the id match routes it
+        // into slot 1.
+        accumulate_tool_call(
+            &mut pending,
+            &json!({"id": "call_B", "function": {"arguments": "2}"}}),
+        );
+        assert_eq!(pending.len(), 2, "id-matched delta must not grow pending");
+        assert_eq!(
+            (pending[0].0.as_str(), pending[0].1.as_str(), pending[0].2.as_str()),
+            ("call_A", "alpha", "{\"a\":1}"),
+            "slot 0 must be untouched by the index-less call_B continuation"
+        );
+        assert_eq!(
+            (pending[1].0.as_str(), pending[1].1.as_str(), pending[1].2.as_str()),
+            ("call_B", "beta", "{\"b\":2}"),
+            "call_B's arguments must concatenate in ITS slot, not slot 0"
         );
 
-        // Current behavior: still ONE slot; call_A was clobbered by call_B's
-        // id/name, and the arguments concatenated into the same slot.
-        assert_eq!(pending.len(), 1, "missing-index delta must NOT open a new slot today");
-        assert_eq!(pending[0].0, "call_B", "id overwritten to the index-less call");
-        assert_eq!(pending[0].1, "beta", "name overwritten to the index-less call");
-        assert_eq!(
-            pending[0].2, "{\"a\":1}{\"b\":2}",
-            "arguments concatenated into slot 0 (the clobber that OE6 will fix)"
+        // --- id MISS: unknown id keeps the long-standing slot-0 default ---
+        let mut miss: Vec<(String, String, String)> = Vec::new();
+        accumulate_tool_call(
+            &mut miss,
+            &json!({"index": 0, "id": "call_A", "function": {"name": "alpha", "arguments": "{\"a\":1}"}}),
         );
+        accumulate_tool_call(
+            &mut miss,
+            &json!({"id": "call_NEW", "function": {"name": "nu", "arguments": "{\"n\":3}"}}),
+        );
+        assert_eq!(miss.len(), 1, "unknown-id delta must NOT open a new slot");
+        assert_eq!(miss[0].0, "call_NEW", "slot-0 default: id overwritten");
+        assert_eq!(miss[0].1, "nu");
+        assert_eq!(miss[0].2, "{\"a\":1}{\"n\":3}");
+
+        // --- no id at all: slot-0 default unchanged ---
+        let mut no_id: Vec<(String, String, String)> = Vec::new();
+        accumulate_tool_call(
+            &mut no_id,
+            &json!({"index": 0, "id": "call_A", "function": {"name": "alpha", "arguments": "x"}}),
+        );
+        accumulate_tool_call(&mut no_id, &json!({"function": {"arguments": "y"}}));
+        assert_eq!(no_id.len(), 1);
+        assert_eq!(no_id[0].2, "xy");
+
+        // --- empty-string id never matches the empty-id padding slots ---
+        let mut padded: Vec<(String, String, String)> = Vec::new();
+        // index 1 first → slot 0 is an empty-id padding slot.
+        accumulate_tool_call(
+            &mut padded,
+            &json!({"index": 1, "id": "call_B", "function": {"name": "beta", "arguments": "b"}}),
+        );
+        accumulate_tool_call(&mut padded, &json!({"id": "", "function": {"arguments": "z"}}));
+        assert_eq!(padded.len(), 2);
+        assert_eq!(padded[0].2, "z", "empty id falls to slot 0 by default, not by match");
+        assert_eq!(padded[1].2, "b");
+    }
+
+    // v0.4.17 A5.3 (OE5): usage parsing — canonical fields, variant
+    // fallback, and precedence.
+    #[test]
+    fn parse_stream_usage_reads_canonical_and_variant_fields() {
+        use serde_json::json;
+
+        // Canonical OpenAI fields (pre-OE5 behavior, must be unchanged).
+        let u = parse_stream_usage(&json!({
+            "prompt_tokens": 10,
+            "completion_tokens": 20,
+            "prompt_tokens_details": {"cached_tokens": 4}
+        }));
+        assert_eq!(u.input_tokens, 10);
+        assert_eq!(u.output_tokens, 20);
+        assert_eq!(u.cache_read_input_tokens, 4);
+        assert_eq!(u.cache_creation_input_tokens, 0);
+
+        // OE5 core: variant names only (input_tokens/output_tokens).
+        let u = parse_stream_usage(&json!({"input_tokens": 7, "output_tokens": 9}));
+        assert_eq!(u.input_tokens, 7);
+        assert_eq!(u.output_tokens, 9);
+        assert_eq!(u.cache_read_input_tokens, 0);
+
+        // Canonical wins when both are present.
+        let u = parse_stream_usage(&json!({
+            "prompt_tokens": 10, "input_tokens": 99,
+            "completion_tokens": 20, "output_tokens": 99
+        }));
+        assert_eq!(u.input_tokens, 10);
+        assert_eq!(u.output_tokens, 20);
+
+        // A null/non-numeric canonical field falls through to the variant.
+        let u = parse_stream_usage(&json!({
+            "prompt_tokens": null, "input_tokens": 7,
+            "completion_tokens": "n/a", "output_tokens": 9
+        }));
+        assert_eq!(u.input_tokens, 7);
+        assert_eq!(u.output_tokens, 9);
+
+        // Nothing usable → all zeros (pre-OE5 behavior, unchanged).
+        let u = parse_stream_usage(&json!({}));
+        assert_eq!(u.input_tokens, 0);
+        assert_eq!(u.output_tokens, 0);
+        assert_eq!(u.cache_read_input_tokens, 0);
     }
 
     // OE3 (#249): SSE `data:` payload parsing tolerates missing space.
