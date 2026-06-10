@@ -20,11 +20,14 @@
 > Executor acts · Reviewer critiques · Iterate to excellence
 
 [![GitHub Release](https://img.shields.io/github/v/release/wanshuiyin/Auto-claude-code-research-in-sleep?style=flat-square)](https://github.com/wanshuiyin/Auto-claude-code-research-in-sleep/releases)
+[![Downloads](https://img.shields.io/github/downloads/wanshuiyin/Auto-claude-code-research-in-sleep/total?style=flat-square&color=brightgreen)](https://github.com/wanshuiyin/Auto-claude-code-research-in-sleep/releases)
 [![Platform](https://img.shields.io/badge/platform-macOS%20|%20Linux%20|%20Windows-black?style=flat-square)](https://github.com/wanshuiyin/Auto-claude-code-research-in-sleep)
 [![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
 
 
 ## 📰 What's New
+
+> **v0.4.17** (2026-06-10) — **The MCP release**: `mcpServers` in settings.json finally drive **real tool dispatch**. **🆕 MCP wiring (M1/M2)**: configured stdio servers are spawned at startup, their tools advertised as `mcp__<server>__<tool>` on both provider paths (Anthropic + OpenAI-family) and dispatched end-to-end; per-server failures degrade softly (healthy servers keep working); `aris doctor` shows real per-server status. Untrusted MCP tools **prompt for approval even under danger-full-access** (they're external processes the sandbox can't cover) — `mcpServers.<name>.trust: true` or a session-level "always for this server" skips it; `--allowedTools` accepts `mcp__` names. **🔴 NDJSON framing fix**: our stdio transport spoke LSP-style `Content-Length:` framing, but the MCP spec (and `codex mcp-server`) use newline-delimited JSON-RPC — discovery silently timed out against real servers (fake-server tests passed because they spoke the same wrong dialect; only real-machine e2e caught it). Writes are now NDJSON, reads auto-detect both dialects, verified end-to-end against codex. Plus: spec-mandated `notifications/initialized`, concurrent write/read (no large-payload pipe deadlock, the [#286](https://github.com/wanshuiyin/Auto-claude-code-research-in-sleep/issues/286) failure mode). **🆕 `aris setup` option 10 — Codex MCP reviewer, zero API key**: one guided step detects the codex CLI, writes an idempotent `mcpServers.codex` entry (atomic + backup, never clobbers), asks consent for `trust: true`, and optionally keeps an API reviewer as **fallback** (new `reviewer_fallback_provider`; MCP stays primary). Cross-model adversarial review on a ChatGPT subscription — no OpenAI API key. **🆕 Hooks**: object-style schema preserved (matcher/timeout/async no longer dropped); anchored-regex matcher filtering; ⚠️ hooks are now **killed after 30 s by default** (was: wait forever; per-hook `timeout` 1–600 s overrides; timeout warns, never denies). **🧹 Long tail**: `ARIS_DISABLE_KEYCHAIN` escape hatch (api tests green locally for the first time since v0.4.15), Anthropic `stop_reason` clean-EOF symmetry (CL2), OpenAI tool-call id-fallback (OE6), slash commands enter history. Tests (CI mode): runtime 199 / aris-cli 165 / tools 67 / api 30 / commands 5, all green. Codex MCP (gpt-5.5 xhigh) reviewed each phase: 16 rounds (R1–R16), 7 NO-GOs all resolved. Deferred to v0.4.18: P8 full OpenAI subagent routing, hook async execution, protocolVersion bump.
 
 > **v0.4.16** (2026-05-30) — **REPL UX + provider hardening**, on a zero-regression discipline: 64 characterization ("golden") tests were written first to lock the *current* provider-routing / pricing / reviewer / subagent / REPL behavior, then kept green through every change. **🆕 Command history ([#274](https://github.com/wanshuiyin/Auto-claude-code-research-in-sleep/issues/274))**: prompts now persist to `~/.config/aris/history` (0600) and reload on startup; `ARIS_NO_HISTORY` kill-switch; a **disk-only** secret-skip refuses to write credential-looking lines (they still stay in in-session history). **🆕 Ctrl+R reverse search** (`(reverse-i-search)`, bash-style; CJK-aware single-line render; no new dependency; no existing key binding changed). **🔒 OpenAI-family subagents fail loud**: an OpenAI-family main session (Kimi/GLM/Gemini/MiniMax/…) spawning a sub-agent previously **silently billed the user's Anthropic OAuth/Keychain credential**; it now returns a clear error (no credential names) instead — Anthropic-family executors are unaffected. Full OpenAI sub-agent *routing* is a cross-crate change deferred to v0.4.17; this closes the credential-leak window now. **🧱 Provider groundwork (no behavior change)**: the 3 byte-identical word-boundary matchers consolidate into one canonical `runtime::word_match` (callers forward, truth values unchanged); a new pure `runtime::ProviderFamily` classifier (unwired). Tests (CI mode): runtime 164 / aris-cli 128 / tools 49 / commands 5 — all green incl. the 64 golden tests; the dangerous code (config env-writing, order-sensitive pricing chain, reviewer routing, `provider_match`, `push_history`, every key binding) is byte-identical. Codex MCP (gpt-5.5 xhigh) reviewed each phase + a final integration pass. Deferred to v0.4.17: full OpenAI subagent routing, hook-schema + MCP wiring, `api` test isolation.
 
@@ -321,18 +324,43 @@ The system prompt explicitly informs the model of its exact identity (ARIS-Code)
 
 ---
 
-## 🔌 MCP servers (experimental)
+## 🔌 MCP servers
 
-> ⚠ **Experimental**: As of v0.4.14, MCP servers configured in
-> `settings.json` are parsed and surfaced in `aris doctor`,
-> but **tool calls from MCP servers are not yet dispatched into the
-> LLM context**. Full MCP tool dispatch is planned for v0.4.16.
+> ✅ **Live since v0.4.17**: stdio MCP servers configured in
+> `settings.json` are spawned at startup, their tools are advertised to
+> the model as `mcp__<server>__<tool>`, and calls dispatch end-to-end —
+> on both Anthropic and OpenAI-family executors.
 
-`aris doctor` will print a warning whenever `mcpServers` are present
-in the merged settings so you don't silently assume tools are wired
-through. The Codex MCP integration (used by review skills) is the
-exception — it is invoked through the dedicated reviewer path, not
-through the generic MCP tool-dispatch pipeline.
+```jsonc
+// <config_home>/settings.json  (config_home = $CLAUDE_CONFIG_HOME or ~/.claude)
+{
+  "mcpServers": {
+    "codex": {
+      "type": "stdio",
+      "command": "codex",
+      "args": ["mcp-server"],
+      "trust": true,              // optional: skip per-call approval
+      "requestTimeoutSecs": 240   // optional: per-server timeout
+    }
+  }
+}
+```
+
+The easiest way to set this up is `aris setup` → reviewer option 10
+(Codex MCP), which writes the entry for you. Notes:
+
+- MCP servers are **external processes the sandbox does not cover** —
+  untrusted MCP tools therefore prompt for approval on every call (even
+  under `danger-full-access`) until you set `trust: true` or choose
+  "always for this server" in-session.
+- A server that fails to start is skipped with a warning; the rest keep
+  working. `aris doctor` shows per-server status (spawned / initialized /
+  tool count / failures / trust).
+- Transport is newline-delimited JSON-RPC per the MCP spec; legacy
+  `Content-Length:`-framed servers are still accepted on the read side.
+- Adding a new server requires an `aris` restart to spawn + discover
+  (ARIS prints a notice when this applies). Subagents do not receive
+  MCP tools in this release.
 
 ---
 

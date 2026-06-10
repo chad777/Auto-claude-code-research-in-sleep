@@ -1,5 +1,145 @@
 # ARIS-Code Changelog
 
+## v0.4.17 (2026-06-10)
+
+The **MCP release**: user-configured `mcpServers` finally drive real tool
+dispatch — and `aris setup` can now configure a **zero-API-key Codex MCP
+reviewer** (ChatGPT subscription) in one step. Plus hooks schema fidelity
+with matcher filtering and per-hook timeouts, and a batch of long-tail
+robustness fixes. Built with the v0.4.16 zero-regression methodology:
+24 new characterization tests locked current behavior first (commit
+`90c8c91` = rollback anchor) and every deliberate behavior flip is
+annotated in the test that locks it. Reviewed phase-by-phase by Codex MCP
+(gpt-5.5 xhigh) across 16 rounds (R1–R16, 7 NO-GOs all resolved); design
+trail in `idea-stage/v0.4.17/`.
+
+### 🆕 MCP tool dispatch is real now (M1/M2)
+
+Before v0.4.17, `mcpServers` in `settings.json` parsed, showed in
+`aris doctor` — and did nothing. Now:
+
+- **Tools enter the model's catalogue.** On startup ARIS spawns each
+  configured stdio server, runs the MCP handshake, discovers tools, and
+  advertises them as `mcp__<server>__<tool>` alongside the built-in tools
+  on **both** provider paths (Anthropic and OpenAI-family executors).
+- **Calls dispatch end-to-end.** The executor routes `mcp__*` calls
+  through the managed server process and returns the tool result
+  (text blocks flattened; `isError` mapped to a tool error).
+- **Per-server failure degrades softly.** A server that fails to spawn /
+  initialize / list is skipped with a one-line warning and recorded for
+  `aris doctor`; healthy servers keep working (previously an all-or-
+  nothing discover). Server stderr no longer pollutes the terminal
+  (`ARIS_MCP_STDERR=inherit` restores pass-through).
+- **Approval gate.** MCP servers are external processes — the sandbox
+  does not cover them — so untrusted MCP tool calls prompt for
+  confirmation even under `danger-full-access` (allow once / always for
+  this server this session / deny). `mcpServers.<name>.trust: true`
+  skips the prompt; non-interactive runs deny untrusted MCP tools with a
+  clear error. `--allowedTools` now accepts `mcp__` names (deferred
+  validation), and advertising and dispatch share one filter.
+- **`aris doctor`** shows real per-server status (spawned / initialized /
+  tool count / failure reason / trust) instead of the old placeholder
+  warning, and discloses the legacy `~/.claude.json` vs
+  `<config_home>/settings.json` path split.
+- **Subagents deliberately get no MCP tools** in this release (pinned by
+  test); revisited in v0.4.18 with P8 full routing.
+
+### 🔴 Protocol fix the fakes couldn't catch: NDJSON framing
+
+Real-machine e2e against `codex mcp-server` exposed that our stdio
+transport spoke LSP-style `Content-Length:` framing while the MCP spec
+(and codex) use **newline-delimited JSON-RPC** — codex silently ignored
+every frame and discovery timed out. Every prior MCP test passed because
+the fake servers spoke the same wrong dialect. Fixed: writes are NDJSON;
+reads auto-detect both dialects (legacy `Content-Length:` servers still
+work, with the M6 tolerances — LF-only, case-insensitive header, 64 MiB
+cap — preserved on that path). A full NDJSON protocol-handshake
+regression test now locks the real dialect, verified end-to-end against
+codex (`initialize → notifications/initialized → tools/list → tools/call`).
+
+Also hardened while in there: the spec-mandated `notifications/initialized`
+is now sent after initialize (strict servers refuse `tools/list` without
+it), and `request()` writes/reads concurrently with a select-based
+round-trip (a large request no longer deadlocks against a server that
+writes before reading — the failure mode behind [#286](https://github.com/wanshuiyin/Auto-claude-code-research-in-sleep/issues/286);
+a failed write now short-circuits immediately instead of waiting out the
+timeout).
+
+### 🆕 `aris setup` option 10: Codex MCP reviewer, zero API key
+
+The reviewer menu gains **`10. Codex MCP (ChatGPT subscription, no API
+key)`** — the recommended path. Selecting it detects the codex CLI,
+writes an idempotent `mcpServers.codex` entry into the settings file the
+runtime actually reads (atomic write + backup; existing entries never
+clobbered; a write failure aborts without touching your reviewer
+config), asks explicit consent before setting `trust: true`, and
+optionally configures an API reviewer as **fallback** — tracked in a new
+`reviewer_fallback_provider` field so MCP stays primary
+(`ARIS_REVIEWER_PROVIDER=codex-mcp` + `ARIS_REVIEWER_FALLBACK_PROVIDER`).
+`LlmReview` resolves the fallback automatically, and every
+missing-credential error now points at both escape hatches (subscription
+via option 10, or an API reviewer). `/setup` inside the REPL now rebuilds
+the system prompt and runtime unconditionally, so reviewer changes take
+effect without quitting (new MCP servers still need a restart — ARIS
+tells you when).
+
+### 🆕 Hooks: schema fidelity, matcher filtering, per-hook timeout
+
+- Object-style Claude Code hooks (`{matcher, hooks:[{type, command,
+  timeout}]}`) no longer flatten to bare command strings: **matcher**,
+  **timeout**, and **async** are preserved. Metadata parses leniently —
+  wrong JSON types degrade to `None`, never a load error; any
+  settings.json that loaded yesterday loads today.
+- **Matcher filtering**: PreToolUse/PostToolUse hooks run only when the
+  anchored regex matches the tool name (`"Edit"` matches Edit, not
+  MultiEdit; `"Edit|Write"` works). Missing/empty matcher = match-all
+  (existing behavior; `aris init` meta_opt hooks unaffected). An invalid
+  pattern warns once and falls back to literal matching.
+- **Per-hook timeout** — ⚠️ *behavior change*: hooks are now killed after
+  **30 s by default** (previously ARIS waited forever); the hook's
+  `timeout` field (seconds, clamped 1–600) overrides. Timeout is a
+  **warning, not a deny** — tool execution continues (a blocking hook
+  must exit 2 within budget). The direct child is killed and reaped;
+  grandchildren a hook backgrounds itself are not torn down.
+- `async: true` is parsed and stored but **not yet executed**
+  (known-unsupported; honest in the schema, on the v0.4.18 list).
+
+### 🧹 Long tail
+
+- **`ARIS_DISABLE_KEYCHAIN`**: skips the macOS Keychain OAuth fallback
+  (auth + `aris doctor`) — for GUI-less macs, CI, and dev machines where
+  the real Claude Code credential made `api` tests nondeterministic
+  (the 7 locally-failing tests are green for the first time since
+  v0.4.15).
+- **CL2**: Anthropic clean-EOF now also accepts a `message_delta` with a
+  non-empty `stop_reason` as the terminal signal (symmetric with the
+  v0.4.15 OpenAI `finish_reason` fix) — anthropic-compat proxies that
+  never send `message_stop` no longer misclassify completion as
+  truncation. Reads are not stopped early; retry semantics unchanged.
+- **OE6**: OpenAI tool-call deltas missing an `index` now merge by `id`
+  when one matches (slot-0 fallback retained otherwise). **OE5**: stream
+  usage parsing accepts `input_tokens`/`output_tokens` variants.
+- **Slash commands enter history** (in-memory + disk, `/exit` and
+  `/quit` excluded, secret-skip applies) — a deliberate flip of the
+  v0.4.16 convention.
+- The OpenAI-family subagent fail-loud guard now says v0.4.18 (P8 full
+  routing moved there so this release stays MCP-focused).
+
+### Tests
+
+CI mode (`--test-threads=1`): **runtime 199 / aris-cli 165 / tools 67 /
+api 30 / commands 5** — all green, including the Phase 0
+characterization suite (deliberate flips annotated in-place). E2E:
+zero-API-key `mcp__codex__codex` call returns a literal round-trip
+through a real ChatGPT-subscription codex server; no-MCP baseline
+byte-equivalent; `aris setup` option 10 PTY smoke passes.
+
+**Deferred to v0.4.18**: P8 full OpenAI-family subagent routing (design
+in `idea-stage/v0.4.16/p8_design.json`), MCP `protocolVersion` bump to
+2025-06-18 (negotiation works today), hook `async` execution + event
+expansion (SessionStart…), process-tree teardown on hook timeout,
+`~/.aris/config.yaml` misconfig hint ([#259](https://github.com/wanshuiyin/Auto-claude-code-research-in-sleep/issues/259) follow-up).
+
 ## v0.4.16 (2026-05-30)
 
 A **REPL UX + provider-hardening** release built on a zero-regression

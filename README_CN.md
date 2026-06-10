@@ -20,11 +20,14 @@
 > Executor 执行 · Reviewer 审查 · 迭代精进
 
 [![GitHub Release](https://img.shields.io/github/v/release/wanshuiyin/Auto-claude-code-research-in-sleep?style=flat-square)](https://github.com/wanshuiyin/Auto-claude-code-research-in-sleep/releases)
+[![Downloads](https://img.shields.io/github/downloads/wanshuiyin/Auto-claude-code-research-in-sleep/total?style=flat-square&color=brightgreen)](https://github.com/wanshuiyin/Auto-claude-code-research-in-sleep/releases)
 [![Platform](https://img.shields.io/badge/platform-macOS%20|%20Linux%20|%20Windows-black?style=flat-square)](https://github.com/wanshuiyin/Auto-claude-code-research-in-sleep)
 [![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
 
 
 ## 📰 最新动态
+
+> **v0.4.17** (2026-06-10) — **MCP release**：settings.json 里的 `mcpServers` 终于驱动**真实工具分发**。**🆕 MCP 接线（M1/M2）**：启动时 spawn 配置的 stdio server,工具以 `mcp__<server>__<tool>` 进入模型目录（Anthropic + OpenAI-family 两条 provider 路径都广告）,调用端到端分发;单个 server 失败软降级（健康的照常工作）;`aris doctor` 显示逐 server 真实状态。未受信 MCP 工具**即使 danger-full-access 也会弹确认**（它们是 sandbox 管不到的外部进程）—— `mcpServers.<name>.trust: true` 或会话级"本 server 不再问"可跳过;`--allowedTools` 接受 `mcp__` 名。**🔴 NDJSON 帧修复**：我们的 stdio transport 说的是 LSP 式 `Content-Length:` 帧,而 MCP spec（和 `codex mcp-server`）用的是 newline-delimited JSON-RPC —— 对真实 server 发现阶段静默超时（fake-server 测试全绿是因为 fake 说同一种错误方言,只有真机 e2e 抓到）。现在写侧纯 NDJSON,读侧自动识别双方言,已对 codex 真机端到端验证。顺带:补发 spec 强制的 `notifications/initialized`,写读并发（大 payload 不再管道死锁,即 [#286](https://github.com/wanshuiyin/Auto-claude-code-research-in-sleep/issues/286) 的失败模式）。**🆕 `aris setup` 选项 10 —— Codex MCP reviewer,零 API key**：一步引导:检测 codex CLI、幂等写入 `mcpServers.codex`（原子 + 备份,绝不覆盖已有条目）、显式同意后写 `trust: true`、可选配一个 API reviewer 作 **fallback**（新 `reviewer_fallback_provider` 字段,MCP 保持 primary）。用 ChatGPT 订阅跑跨模型对抗审 —— 不需要 OpenAI API key。**🆕 Hooks**：object-style schema 保真（matcher/timeout/async 不再被丢弃）;anchored regex matcher 过滤;⚠️ hook 现在**默认 30 秒超时被 kill**（以前永远等;per-hook `timeout` 字段 1–600 秒覆盖;超时只警告不阻断）。**🧹 长尾**：`ARIS_DISABLE_KEYCHAIN` 逃生口（api 测试本地首次全绿,自 v0.4.15 以来）、Anthropic `stop_reason` clean-EOF 对称（CL2）、OpenAI tool-call id-fallback（OE6）、slash 命令进历史。测试（CI 模式）:runtime 199 / aris-cli 165 / tools 67 / api 30 / commands 5 全绿。Codex MCP（gpt-5.5 xhigh）逐 phase 审:16 轮（R1–R16）、7 次 NO-GO 全部修复。推 v0.4.18:P8 完整 OpenAI subagent 路由、hook async 执行、protocolVersion 升级。
 
 > **v0.4.16** (2026-05-30) — **REPL 体验 + provider 加固**，全程零回归纪律:先写 64 个 characterization（golden）测试锁住**当前**的 provider 路由 / pricing / reviewer / subagent / REPL 行为，之后每步改动都保持它们绿。**🆕 命令历史（[#274](https://github.com/wanshuiyin/Auto-claude-code-research-in-sleep/issues/274)）**：提交的 prompt 现在持久化到 `~/.config/aris/history`（0600），启动时重新加载（退出不再丢）；`ARIS_NO_HISTORY` kill-switch；**只作用于磁盘**的 secret-skip 拒绝写像凭据的行（这些行仍进 session 内存历史，↑/↓ 不变）。**🆕 Ctrl+R 反向搜索**（`(reverse-i-search)` bash 风格；CJK 宽字符感知的单行渲染；零新依赖；不改任何现有按键）。**🔒 OpenAI-family subagent 明确报错**：OpenAI-family 主会话（Kimi/GLM/Gemini/MiniMax/…）spawn 子代理时，此前会**静默盗刷你的 Anthropic OAuth/Keychain 凭据**计费；现在改返回明确错误（不含任何凭据名）—— Anthropic-family executor 完全不受影响。完整 OpenAI 子代理**路由**是跨 crate 改动，推 v0.4.17；本版先关掉盗刷窗口。**🧱 Provider 地基（零行为变化）**：3 个逐字相同的 word-boundary 匹配器合并成 1 个 canonical `runtime::word_match`（调用点转发，真值不变）；新增纯分类器 `runtime::ProviderFamily`（未接入路由）。测试（CI 模式）：runtime 164 / aris-cli 128 / tools 49 / commands 5 全绿（含 64 golden）；危险代码（config env-writing、顺序敏感 pricing 链、reviewer 路由、`provider_match`、`push_history`、每个按键）逐字未动。Codex MCP（gpt-5.5 xhigh）逐 phase + 整合 review。推 v0.4.17：完整 OpenAI subagent 路由、hook-schema + MCP 接入、`api` test 隔离。
 
@@ -314,15 +317,39 @@ sudo mv aris /usr/local/bin/aris
 
 ---
 
-## 🔌 MCP servers（实验性）
+## 🔌 MCP servers
 
-> ⚠ **实验性**：截至 v0.4.14，`settings.json` 中配置的 MCP servers 仅在
-> `aris doctor` 中被解析展示，**MCP server 的工具调用尚未被分发进 LLM 的
-> 工具上下文**。完整的 MCP 工具分发计划在 v0.4.16 落地。
->
-> 当 `mcpServers` 字段存在于合并后的设置时，`aris doctor` 会打印警告，
-> 避免你误以为工具已经接通。Codex MCP（被 review 系列技能使用）是例外
-> ——它走的是专用 reviewer 路径，而不是通用的 MCP tool-dispatch pipeline。
+> ✅ **v0.4.17 起正式可用**：`settings.json` 中配置的 stdio MCP server
+> 会在启动时被 spawn,其工具以 `mcp__<server>__<tool>` 广告给模型,
+> 调用端到端分发 —— Anthropic 与 OpenAI-family executor 两条路径都支持。
+
+```jsonc
+// <config_home>/settings.json（config_home = $CLAUDE_CONFIG_HOME 或 ~/.claude）
+{
+  "mcpServers": {
+    "codex": {
+      "type": "stdio",
+      "command": "codex",
+      "args": ["mcp-server"],
+      "trust": true,              // 可选:跳过逐次确认
+      "requestTimeoutSecs": 240   // 可选:per-server 超时
+    }
+  }
+}
+```
+
+最简单的配置方式是 `aris setup` → reviewer 选项 10(Codex MCP),
+它会自动写好这个条目。注意:
+
+- MCP server 是 **sandbox 管不到的外部进程** —— 未受信的 MCP 工具每次
+  调用都会弹确认(即使 `danger-full-access`),直到你设 `trust: true`
+  或在会话内选"本 server 不再问"。
+- 启动失败的 server 会被跳过并警告,其余照常工作;`aris doctor` 显示
+  逐 server 状态(spawn / initialize / 工具数 / 失败原因 / trust)。
+- 传输层是 MCP spec 规定的 newline-delimited JSON-RPC;读侧仍兼容
+  legacy `Content-Length:` 帧的 server。
+- 新增 server 需要重启 `aris` 才会 spawn + 发现(适用时 ARIS 会提示)。
+  本版 subagent 不携带 MCP 工具。
 
 ---
 
