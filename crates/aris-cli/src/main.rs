@@ -7921,18 +7921,18 @@ mod tests {
     // ---------------------------------------------------------------
     // v0.4.17 Phase 0 — CHARACTERIZATION TEST (meta_opt hook PARSE result)
     //
-    // SCHEMA-1/2 will replace the flatten-to-Vec<String> with a richer
-    // RuntimeHookConfig that keeps matcher/timeout/async. This locks the
-    // CURRENT parse result of the EXACT object-style shape that
-    // `aris init` (ensure_hook_entry) writes for meta_opt hooks, fed
-    // through the real runtime::ConfigLoader:
+    // deliberately flipped in v0.4.17 Phase 2: schema now preserves
+    // matcher/timeout/async. SCHEMA-1/2 replaced the flatten-to-Vec<String>
+    // parse with RuntimeHookSpec, so the EXACT object-style shape that
+    // `aris init` (ensure_hook_entry) writes for meta_opt hooks now parses
+    // to a single PostToolUse spec that KEEPS matcher ("") / timeout (5) /
+    // async (true) instead of dropping them. matcher="" means match-all
+    // under SCHEMA-3 filtering, so meta_opt hooks keep firing for every
+    // tool — runtime behavior unchanged. Still locked as before:
     //
-    //   * `aris init` writes 5 events, but the parser only reads PreToolUse
-    //     / PostToolUse keys. So PreToolUse stays empty (meta_opt writes no
-    //     PreToolUse), and PostToolUse flattens to a single command,
-    //     DROPPING matcher ("") / timeout (5) / async (true) — the exact
-    //     drop-field behavior Phase 2 will deliberately change.
-    //   * Unknown/extra events (PostToolUseFailure / UserPromptSubmit /
+    //   * the parser only reads PreToolUse / PostToolUse keys, so
+    //     PreToolUse stays empty (meta_opt writes no PreToolUse);
+    //   * unknown/extra events (PostToolUseFailure / UserPromptSubmit /
     //     SessionStart / SessionEnd) are silently ignored by the parser.
     // ---------------------------------------------------------------
     #[test]
@@ -7991,15 +7991,24 @@ mod tests {
             loaded.hooks().pre_tool_use()
         );
 
-        // PostToolUse: flattened to a SINGLE command; matcher / timeout /
-        // async all DROPPED (this is the behavior Phase 2 changes).
+        // PostToolUse: a SINGLE spec whose command is unchanged and whose
+        // matcher ("") / timeout (5) / async (true) are now PRESERVED
+        // (deliberately flipped in v0.4.17 Phase 2).
         let post = loaded.hooks().post_tool_use();
-        assert_eq!(post.len(), 1, "PostToolUse should flatten to one command");
+        assert_eq!(post.len(), 1, "PostToolUse should parse to one spec");
         assert!(
-            post[0].contains("aris-meta-opt-log-event.sh") && post[0].starts_with("bash "),
+            post[0].command.contains("aris-meta-opt-log-event.sh")
+                && post[0].command.starts_with("bash "),
             "PostToolUse command should be the bash log_event invocation, got {}",
-            post[0]
+            post[0].command
         );
+        assert_eq!(
+            post[0].matcher.as_deref(),
+            Some(""),
+            "meta_opt matcher \"\" must be preserved (and means match-all)"
+        );
+        assert_eq!(post[0].timeout_secs, Some(5), "timeout must be preserved");
+        assert_eq!(post[0].async_flag, Some(true), "async must be preserved");
 
         std::fs::remove_dir_all(&root).expect("cleanup");
     }

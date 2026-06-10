@@ -756,6 +756,15 @@ fn render_mcp_servers_summary(value: &crate::json::JsonValue) -> Vec<String> {
 /// Command strings are never rendered because they routinely contain
 /// secrets (e.g. `curl -H "Authorization: Bearer xxx"` or
 /// `OPENAI_API_KEY=sk-... script.sh`).
+///
+/// v0.4.17 Phase 2 note: this counts entries straight off the merged JSON
+/// (string-style item = 1, object-style item = its `hooks` array length),
+/// independently of the `RuntimeHookSpec` parse in config.rs. SCHEMA-1/2
+/// preserving matcher/timeout/async does NOT change the count basis: the
+/// executable parse still yields one spec per `command`-type nested entry,
+/// so the per-event totals the model sees stay aligned with what loads
+/// (modulo the pre-existing inclusion of non-`command` `type` entries in
+/// the raw count, unchanged by Phase 2).
 fn render_hooks_summary(value: &crate::json::JsonValue) -> Vec<String> {
     use crate::json::JsonValue;
     let mut lines = Vec::new();
@@ -1543,6 +1552,50 @@ mod tests {
         assert!(
             rendered.contains("PostToolUse: 3 hook(s)"),
             "expected mixed-style count of 3 hooks: {rendered}"
+        );
+    }
+
+    /// v0.4.17 Phase 2 (SCHEMA-1/2 sync): the schema now PRESERVES
+    /// matcher/timeout/async, and the summary count basis must not drift —
+    /// those metadata fields contribute nothing to the per-event hook
+    /// count, so the total the model sees still equals the number of
+    /// command entries the runtime actually loads for this shape.
+    #[test]
+    fn hooks_summary_count_unaffected_by_matcher_timeout_async_fields() {
+        let mut hook_a = std::collections::BTreeMap::new();
+        hook_a.insert("type".to_string(), JsonValue::String("command".to_string()));
+        hook_a.insert("command".to_string(), JsonValue::String("a".to_string()));
+        hook_a.insert("timeout".to_string(), JsonValue::Number(5));
+        hook_a.insert("async".to_string(), JsonValue::Bool(true));
+        let mut hook_b = std::collections::BTreeMap::new();
+        hook_b.insert("command".to_string(), JsonValue::String("b".to_string()));
+        hook_b.insert("timeout".to_string(), JsonValue::Number(42));
+
+        let mut group = std::collections::BTreeMap::new();
+        group.insert(
+            "matcher".to_string(),
+            JsonValue::String("Edit|Write".to_string()),
+        );
+        group.insert(
+            "hooks".to_string(),
+            JsonValue::Array(vec![JsonValue::Object(hook_a), JsonValue::Object(hook_b)]),
+        );
+
+        let mut events = std::collections::BTreeMap::new();
+        events.insert(
+            "PreToolUse".to_string(),
+            JsonValue::Array(vec![JsonValue::Object(group)]),
+        );
+
+        let rendered = render_hooks_summary(&JsonValue::Object(events)).join("\n");
+        assert!(
+            rendered.contains("PreToolUse: 2 hook(s)"),
+            "matcher/timeout/async must not change the hook count: {rendered}"
+        );
+        // Redaction guard: the matcher text must not leak into the summary.
+        assert!(
+            !rendered.contains("Edit|Write"),
+            "matcher text must never be rendered: {rendered}"
         );
     }
 }

@@ -557,7 +557,7 @@ mod tests {
         DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
     };
     use crate::compact::CompactionConfig;
-    use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
+    use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig, RuntimeHookSpec};
     use crate::permissions::{
         PermissionMode, PermissionPolicy, PermissionPromptDecision, PermissionPrompter,
         PermissionRequest,
@@ -768,7 +768,9 @@ mod tests {
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
             RuntimeFeatureConfig::default().with_hooks(RuntimeHookConfig::new(
-                vec![shell_snippet("printf 'blocked by hook'; exit 2")],
+                vec![RuntimeHookSpec::from_command(shell_snippet(
+                    "printf 'blocked by hook'; exit 2",
+                ))],
                 Vec::new(),
             )),
         );
@@ -834,8 +836,12 @@ mod tests {
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
             RuntimeFeatureConfig::default().with_hooks(RuntimeHookConfig::new(
-                vec![shell_snippet("printf 'pre hook ran'")],
-                vec![shell_snippet("printf 'post hook ran'")],
+                vec![RuntimeHookSpec::from_command(shell_snippet(
+                    "printf 'pre hook ran'",
+                ))],
+                vec![RuntimeHookSpec::from_command(shell_snippet(
+                    "printf 'post hook ran'",
+                ))],
             )),
         );
 

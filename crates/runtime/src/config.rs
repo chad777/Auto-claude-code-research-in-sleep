@@ -65,8 +65,43 @@ impl RuntimeFeatureConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RuntimeHookConfig {
-    pre_tool_use: Vec<String>,
-    post_tool_use: Vec<String>,
+    pre_tool_use: Vec<RuntimeHookSpec>,
+    post_tool_use: Vec<RuntimeHookSpec>,
+}
+
+/// v0.4.17 Phase 2 (SCHEMA-1): one configured hook command with the Claude
+/// Code object-style metadata preserved instead of flattened away.
+///
+/// * `matcher` lives at the GROUP level in the settings schema
+///   (`{matcher, hooks:[...]}`); the parser copies it onto every command in
+///   the group. `None` (string-style entry / absent field) and `Some("")`
+///   both mean "match every tool" — that is what `aris init` writes
+///   (`matcher: ""`).
+/// * `timeout_secs` is the per-hook `timeout` field in SECONDS (Claude Code
+///   units). `None` means "use the default" (30s); clamping to 1..=600
+///   happens at consumption time in `hooks.rs` so the parse stays lossless.
+/// * `async_flag` is parsed and stored only — execution is still
+///   synchronous in v0.4.17 (known-unsupported, see CHANGELOG).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeHookSpec {
+    pub matcher: Option<String>,
+    pub command: String,
+    pub timeout_secs: Option<u64>,
+    pub async_flag: Option<bool>,
+}
+
+impl RuntimeHookSpec {
+    /// Upgrade a string-style hook entry (bare command string) into a spec:
+    /// all metadata absent, command preserved verbatim.
+    #[must_use]
+    pub fn from_command(command: impl Into<String>) -> Self {
+        Self {
+            matcher: None,
+            command: command.into(),
+            timeout_secs: None,
+            async_flag: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -404,7 +439,7 @@ impl RuntimeFeatureConfig {
 
 impl RuntimeHookConfig {
     #[must_use]
-    pub fn new(pre_tool_use: Vec<String>, post_tool_use: Vec<String>) -> Self {
+    pub fn new(pre_tool_use: Vec<RuntimeHookSpec>, post_tool_use: Vec<RuntimeHookSpec>) -> Self {
         Self {
             pre_tool_use,
             post_tool_use,
@@ -412,12 +447,12 @@ impl RuntimeHookConfig {
     }
 
     #[must_use]
-    pub fn pre_tool_use(&self) -> &[String] {
+    pub fn pre_tool_use(&self) -> &[RuntimeHookSpec] {
         &self.pre_tool_use
     }
 
     #[must_use]
-    pub fn post_tool_use(&self) -> &[String] {
+    pub fn post_tool_use(&self) -> &[RuntimeHookSpec] {
         &self.post_tool_use
     }
 }
@@ -529,9 +564,9 @@ fn parse_optional_hooks_config(root: &JsonValue) -> Result<RuntimeHookConfig, Co
     };
     let hooks = expect_object(hooks_value, "merged settings.hooks")?;
     Ok(RuntimeHookConfig {
-        pre_tool_use: optional_hook_commands(hooks, "PreToolUse", "merged settings.hooks")?
+        pre_tool_use: optional_hook_specs(hooks, "PreToolUse", "merged settings.hooks")?
             .unwrap_or_default(),
-        post_tool_use: optional_hook_commands(hooks, "PostToolUse", "merged settings.hooks")?
+        post_tool_use: optional_hook_specs(hooks, "PostToolUse", "merged settings.hooks")?
             .unwrap_or_default(),
     })
 }
@@ -829,11 +864,27 @@ fn optional_string_array(
     }
 }
 
-fn optional_hook_commands(
+/// Parse one hook event array into [`RuntimeHookSpec`]s.
+///
+/// v0.4.17 Phase 2 (SCHEMA-2): the parser no longer flattens object-style
+/// entries into bare command strings — group-level `matcher` plus per-hook
+/// `timeout` / `async` are preserved on each spec. Three pre-existing
+/// behaviors are kept verbatim (locked by Phase 0 characterization tests):
+///   * string-style entries upgrade to a spec with all metadata `None`;
+///   * non-`command` `type` sub-hooks are skipped, an ABSENT `type` is
+///     treated as `command`;
+///   * unknown event keys are never read (caller only asks for
+///     `PreToolUse` / `PostToolUse`), so they stay silently ignored.
+///
+/// `matcher` / `timeout` / `async` are parsed LENIENTLY (wrong JSON type =>
+/// `None`): before Phase 2 these fields were ignored entirely, so a
+/// malformed value in an existing settings.json must not turn a config that
+/// loaded yesterday into a hard load error today.
+fn optional_hook_specs(
     object: &BTreeMap<String, JsonValue>,
     key: &str,
     context: &str,
-) -> Result<Option<Vec<String>>, ConfigError> {
+) -> Result<Option<Vec<RuntimeHookSpec>>, ConfigError> {
     let Some(value) = object.get(key) else {
         return Ok(None);
     };
@@ -843,10 +894,10 @@ fn optional_hook_commands(
         )));
     };
 
-    let mut commands = Vec::new();
+    let mut specs = Vec::new();
     for item in array {
         if let Some(command) = item.as_str() {
-            commands.push(command.to_string());
+            specs.push(RuntimeHookSpec::from_command(command));
             continue;
         }
 
@@ -855,6 +906,11 @@ fn optional_hook_commands(
                 "{context}: field {key} must contain strings or Claude Code hook objects"
             ))
         })?;
+        // Group-level matcher: copied onto every command in this group.
+        let matcher = item_object
+            .get("matcher")
+            .and_then(JsonValue::as_str)
+            .map(ToOwned::to_owned);
         let Some(nested_hooks) = item_object.get("hooks") else {
             return Err(ConfigError::Parse(format!(
                 "{context}: field {key} hook object missing hooks array"
@@ -883,11 +939,21 @@ fn optional_hook_commands(
                     "{context}: field {key} command hook missing command string"
                 )));
             };
-            commands.push(command.to_string());
+            let timeout_secs = nested_object
+                .get("timeout")
+                .and_then(JsonValue::as_i64)
+                .and_then(|number| u64::try_from(number).ok());
+            let async_flag = nested_object.get("async").and_then(JsonValue::as_bool);
+            specs.push(RuntimeHookSpec {
+                matcher: matcher.clone(),
+                command: command.to_string(),
+                timeout_secs,
+                async_flag,
+            });
         }
     }
 
-    Ok(Some(commands))
+    Ok(Some(specs))
 }
 
 fn optional_string_map(
@@ -940,12 +1006,19 @@ fn deep_merge_objects(
 mod tests {
     use super::{
         parse_mcp_server_config, ConfigLoader, ConfigSource, McpServerConfig, McpTransport,
-        ResolvedPermissionMode, CLAUDE_CODE_SETTINGS_SCHEMA_NAME,
+        ResolvedPermissionMode, RuntimeHookSpec, CLAUDE_CODE_SETTINGS_SCHEMA_NAME,
     };
     use crate::json::JsonValue;
     use crate::sandbox::FilesystemIsolationMode;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// Project the command strings out of parsed hook specs — used by tests
+    /// that only care about WHICH commands were extracted (the pre-Phase-2
+    /// flatten semantics, still locked).
+    fn hook_commands(specs: &[RuntimeHookSpec]) -> Vec<&str> {
+        specs.iter().map(|spec| spec.command.as_str()).collect()
+    }
 
     fn temp_dir() -> std::path::PathBuf {
         let nanos = SystemTime::now()
@@ -1042,8 +1115,8 @@ mod tests {
             .and_then(JsonValue::as_object)
             .expect("hooks object")
             .contains_key("PostToolUse"));
-        assert_eq!(loaded.hooks().pre_tool_use(), &["base".to_string()]);
-        assert_eq!(loaded.hooks().post_tool_use(), &["project".to_string()]);
+        assert_eq!(hook_commands(loaded.hooks().pre_tool_use()), ["base"]);
+        assert_eq!(hook_commands(loaded.hooks().post_tool_use()), ["project"]);
         assert!(loaded.mcp().get("home").is_some());
         assert!(loaded.mcp().get("project").is_some());
 
@@ -1284,8 +1357,21 @@ mod tests {
             .load()
             .expect("object-style hooks should load");
 
-        assert_eq!(loaded.hooks().pre_tool_use(), &["echo pre".to_string()]);
-        assert_eq!(loaded.hooks().post_tool_use(), &["echo post".to_string()]);
+        assert_eq!(hook_commands(loaded.hooks().pre_tool_use()), ["echo pre"]);
+        assert_eq!(
+            hook_commands(loaded.hooks().post_tool_use()),
+            ["echo post"]
+        );
+        // v0.4.17 Phase 2 (SCHEMA-1/2): the object-style metadata is now
+        // preserved alongside the command.
+        let pre = loaded.hooks().pre_tool_use();
+        assert_eq!(pre[0].matcher.as_deref(), Some("Bash"));
+        assert_eq!(pre[0].timeout_secs, Some(5));
+        assert_eq!(pre[0].async_flag, Some(true));
+        let post = loaded.hooks().post_tool_use();
+        assert_eq!(post[0].matcher.as_deref(), Some(""));
+        assert_eq!(post[0].timeout_secs, None);
+        assert_eq!(post[0].async_flag, None);
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
@@ -1293,11 +1379,11 @@ mod tests {
     // ---------------------------------------------------------------
     // v0.4.17 Phase 0 — CHARACTERIZATION TESTS (hooks parse truth table)
     //
-    // `optional_hook_commands` flattens both string-style and object-style
-    // hook arrays into a plain `Vec<String>`. Phase 2 (SCHEMA-1/2) replaces
-    // this with a richer struct that retains matcher/timeout/async. These
-    // tests lock the CURRENT (lossy) parse semantics so the migration can be
-    // proven to leave the resulting command lists unchanged.
+    // Phase 2 (SCHEMA-1/2) replaced the flatten-to-`Vec<String>` parse with
+    // `RuntimeHookSpec`, which retains matcher/timeout/async. The command-
+    // extraction semantics locked here are UNCHANGED (string-style verbatim,
+    // non-command type skipped, unknown events ignored); only the
+    // field-dropping test was deliberately flipped (annotated below).
     // ---------------------------------------------------------------
 
     /// String-style hook arrays round-trip verbatim into the command list.
@@ -1320,17 +1406,28 @@ mod tests {
             .expect("string-style hooks should load");
 
         assert_eq!(
-            loaded.hooks().pre_tool_use(),
-            &["echo a".to_string(), "echo b".to_string()]
+            hook_commands(loaded.hooks().pre_tool_use()),
+            ["echo a", "echo b"]
         );
-        assert_eq!(loaded.hooks().post_tool_use(), &["echo c".to_string()]);
+        assert_eq!(hook_commands(loaded.hooks().post_tool_use()), ["echo c"]);
+        // String-style entries carry no metadata: all fields stay None.
+        assert!(loaded
+            .hooks()
+            .pre_tool_use()
+            .iter()
+            .all(|spec| spec.matcher.is_none()
+                && spec.timeout_secs.is_none()
+                && spec.async_flag.is_none()));
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
 
-    /// Object-style flatten DROPS matcher and timeout, keeping only the
-    /// command string. Multiple sub-hooks under one matcher flatten in
-    /// order. This is the exact field-dropping Phase 2 will change.
+    /// deliberately flipped in v0.4.17 Phase 2: schema now preserves
+    /// matcher/timeout. The pre-Phase-2 parser flattened object-style
+    /// entries to bare command strings, DROPPING the group matcher and the
+    /// per-hook timeouts; the same fixture now parses into specs that keep
+    /// the group matcher on every command plus each command's own timeout.
+    /// Command extraction order is unchanged.
     #[test]
     fn char_object_style_hooks_drop_matcher_and_timeout_fields() {
         let root = temp_dir();
@@ -1361,19 +1458,23 @@ mod tests {
             .load()
             .expect("object-style hooks should load");
 
-        // matcher "Bash|Edit" and timeouts 42/7 are GONE — only commands,
-        // in declaration order.
-        assert_eq!(
-            loaded.hooks().pre_tool_use(),
-            &["first".to_string(), "second".to_string()]
-        );
+        // Commands still extract in declaration order...
+        let pre = loaded.hooks().pre_tool_use();
+        assert_eq!(hook_commands(pre), ["first", "second"]);
+        // ...and (flipped) matcher "Bash|Edit" is preserved on BOTH specs
+        // (group-level matcher copied onto every command in the group),
+        // with each spec keeping its own timeout.
+        assert_eq!(pre[0].matcher.as_deref(), Some("Bash|Edit"));
+        assert_eq!(pre[0].timeout_secs, Some(42));
+        assert_eq!(pre[1].matcher.as_deref(), Some("Bash|Edit"));
+        assert_eq!(pre[1].timeout_secs, Some(7));
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
 
     /// Non-`command` `type` sub-hooks are silently skipped; the default
     /// `type` (absent) is treated AS `command`. Locks both branches of
-    /// `optional_hook_commands`'s type handling.
+    /// `optional_hook_specs`'s type handling.
     #[test]
     fn char_non_command_hook_type_skipped_absent_type_kept() {
         let root = temp_dir();
@@ -1408,8 +1509,8 @@ mod tests {
         // The `notification`-type entry is dropped; the type-absent entry is
         // treated as a command and kept.
         assert_eq!(
-            loaded.hooks().post_tool_use(),
-            &["kept-default-type".to_string(), "kept-explicit".to_string()]
+            hook_commands(loaded.hooks().post_tool_use()),
+            ["kept-default-type", "kept-explicit"]
         );
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
@@ -1452,6 +1553,62 @@ mod tests {
         assert!(
             loaded.hooks().post_tool_use().is_empty(),
             "unknown events must not populate PostToolUse"
+        );
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    /// v0.4.17 Phase 2 (SCHEMA-2): matcher/timeout/async are parsed
+    /// LENIENTLY — a wrong JSON type degrades to `None` instead of failing
+    /// the whole config load. Pre-Phase-2 these fields were ignored
+    /// entirely, so a settings.json that loaded yesterday (even with, say,
+    /// `"timeout": "fast"`) must still load today.
+    #[test]
+    fn hook_metadata_with_wrong_json_types_degrades_to_none_not_load_error() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claude");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+
+        fs::write(
+            home.join("settings.json"),
+            r#"{
+              "hooks": {
+                "PreToolUse": [
+                  {
+                    "matcher": 42,
+                    "hooks": [
+                      {
+                        "type": "command",
+                        "command": "echo lenient",
+                        "timeout": "fast",
+                        "async": "yes"
+                      },
+                      { "type": "command", "command": "echo negative", "timeout": -5 }
+                    ]
+                  }
+                ]
+              }
+            }"#,
+        )
+        .expect("write malformed-metadata hooks");
+
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("malformed hook metadata must not fail the config load");
+
+        let pre = loaded.hooks().pre_tool_use();
+        assert_eq!(hook_commands(pre), ["echo lenient", "echo negative"]);
+        assert_eq!(pre[0].matcher, None, "non-string matcher degrades to None");
+        assert_eq!(
+            pre[0].timeout_secs, None,
+            "non-integer timeout degrades to None (default applies)"
+        );
+        assert_eq!(pre[0].async_flag, None, "non-bool async degrades to None");
+        assert_eq!(
+            pre[1].timeout_secs, None,
+            "negative timeout degrades to None (default applies)"
         );
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
