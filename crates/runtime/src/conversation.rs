@@ -80,6 +80,11 @@ impl std::error::Error for ToolError {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeError {
     message: String,
+    /// v0.4.18: set when the failure was specifically "the requested model is
+    /// not available on this account" (Anthropic 404 `not_found_error`). The
+    /// CLI reads this to fall back from the default Opus 4.8 to 4.7. `new()`
+    /// leaves it false, so every existing call site is unchanged.
+    model_unavailable: bool,
 }
 
 impl RuntimeError {
@@ -87,7 +92,25 @@ impl RuntimeError {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            model_unavailable: false,
         }
+    }
+
+    /// v0.4.18: construct an error flagged as "model unavailable" so the CLI can
+    /// drive its default-model fallback (Opus 4.8 → 4.7).
+    #[must_use]
+    pub fn model_unavailable(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            model_unavailable: true,
+        }
+    }
+
+    /// v0.4.18: whether this error is a "model unavailable on this account"
+    /// failure (see [`RuntimeError::model_unavailable`]).
+    #[must_use]
+    pub fn is_model_unavailable(&self) -> bool {
+        self.model_unavailable
     }
 }
 
@@ -566,6 +589,14 @@ mod tests {
     use crate::session::{ContentBlock, MessageRole, Session};
     use crate::usage::TokenUsage;
     use std::path::PathBuf;
+
+    // v0.4.18: the CLI's Opus 4.8 -> 4.7 fallback keys off this flag, so the
+    // `new` (default) vs `model_unavailable` constructors must stay distinct.
+    #[test]
+    fn runtime_error_model_unavailable_flag() {
+        assert!(!RuntimeError::new("boom").is_model_unavailable());
+        assert!(RuntimeError::model_unavailable("model x not found").is_model_unavailable());
+    }
 
     struct ScriptedApiClient {
         call_count: usize,

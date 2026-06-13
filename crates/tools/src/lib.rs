@@ -2015,7 +2015,11 @@ pub fn render_skill_discovery_section() -> Option<String> {
     Some(lines.join("\n"))
 }
 
-const DEFAULT_AGENT_MODEL: &str = "claude-opus-4-7";
+const DEFAULT_AGENT_MODEL: &str = "claude-opus-4-8";
+/// v0.4.18: subagent fallback when `DEFAULT_AGENT_MODEL` is unavailable on the
+/// account (404 `not_found`). Mirrors the main session's `DEFAULT_MODEL_FALLBACK`
+/// so a user without Opus 4.8 access doesn't hit hard subagent failures.
+const DEFAULT_AGENT_MODEL_FALLBACK: &str = "claude-opus-4-7";
 const DEFAULT_AGENT_MAX_ITERATIONS: usize = 32;
 
 /// Subagent system date — use the same dynamic today as the main runtime
@@ -2347,6 +2351,9 @@ struct AnthropicRuntimeClient {
     client: AnthropicClient,
     model: String,
     allowed_tools: BTreeSet<String>,
+    /// v0.4.18: latches the subagent's Opus 4.8 → 4.7 fallback (see `stream`)
+    /// so it warns once and never re-probes on subsequent turns.
+    model_fell_back: bool,
 }
 
 impl AnthropicRuntimeClient {
@@ -2359,6 +2366,7 @@ impl AnthropicRuntimeClient {
             client,
             model,
             allowed_tools,
+            model_fell_back: false,
         })
     }
 }
@@ -2379,7 +2387,7 @@ impl ApiClient for AnthropicRuntimeClient {
                 input_schema: spec.input_schema,
             })
             .collect::<Vec<_>>();
-        let message_request = MessageRequest {
+        let mut message_request = MessageRequest {
             model: self.model.clone(),
             max_tokens: 32_000,
             messages: convert_messages(&request.messages),
@@ -2394,11 +2402,32 @@ impl ApiClient for AnthropicRuntimeClient {
         };
 
         self.runtime.block_on(async {
-            let mut stream = self
-                .client
-                .stream_message(&message_request)
-                .await
-                .map_err(|error| RuntimeError::new(error.to_string()))?;
+            // v0.4.18: subagent default-model fallback. If the default
+            // DEFAULT_AGENT_MODEL (Opus 4.8) is unavailable on this account
+            // (404 not_found from the initial POST, before any stream event),
+            // fall back to 4.7 and retry once so background Agent tasks don't
+            // hard-fail for users without 4.8 access. Latched + warn-once.
+            let mut stream = match self.client.stream_message(&message_request).await {
+                Ok(stream) => stream,
+                Err(error)
+                    if error.is_model_unavailable()
+                        && message_request.model == DEFAULT_AGENT_MODEL
+                        && !self.model_fell_back =>
+                {
+                    self.model_fell_back = true;
+                    self.model = DEFAULT_AGENT_MODEL_FALLBACK.to_string();
+                    message_request.model = DEFAULT_AGENT_MODEL_FALLBACK.to_string();
+                    eprintln!(
+                        "\x1b[33mwarning:\x1b[0m {DEFAULT_AGENT_MODEL} is not available on this \
+                         account; subagent falling back to {DEFAULT_AGENT_MODEL_FALLBACK}."
+                    );
+                    self.client
+                        .stream_message(&message_request)
+                        .await
+                        .map_err(|error| RuntimeError::new(error.to_string()))?
+                }
+                Err(error) => return Err(RuntimeError::new(error.to_string())),
+            };
             let mut events = Vec::new();
             let mut pending_tool: Option<(String, String, String)> = None;
             let mut saw_stop = false;

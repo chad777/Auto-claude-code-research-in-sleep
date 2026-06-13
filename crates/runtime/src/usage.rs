@@ -14,6 +14,13 @@ pub struct ModelPricing {
 }
 
 impl ModelPricing {
+    /// Generic fallback pricing tier for UNKNOWN models (`estimate_cost_usd`).
+    ///
+    /// v0.4.18: this is NO LONGER Sonnet's actual price — Sonnet 4.x is
+    /// $3/$15 (see `pricing_for_model`). The name is retained for the
+    /// fallthrough-contract test; the value ($15/$75 = the deprecated Opus-4
+    /// tier) is kept deliberately as a CONSERVATIVE over-estimate for models
+    /// we don't recognize, rather than silently under-billing them.
     #[must_use]
     pub const fn default_sonnet_tier() -> Self {
         Self {
@@ -87,15 +94,43 @@ pub fn pricing_for_model(model: &str) -> Option<ModelPricing> {
         });
     }
     if m.contains("opus") {
+        // v0.4.18: current Opus (4.5/4.6/4.7/4.8 and later) is $5/$25; the
+        // DEPRECATED Opus 4.0 / 4.1 keep the legacy $15/$75 tier. Verified
+        // against Anthropic's published schedule (2026-06). `has_word` (with
+        // `-_/:` boundaries) is used for the legacy check so a FUTURE minor
+        // like `opus-4-10` is NOT mis-classified as 4.1 — a bare `contains`
+        // would wrongly match `opus-4-1` inside `opus-4-10`.
+        let legacy_opus = has_word(&m, "opus-4-0")    // claude-opus-4-0 alias (4.0)
+            || has_word(&m, "opus-4-1")               // claude-opus-4-1[-date] (4.1)
+            || m.contains("opus-4-2025")              // claude-opus-4-20250514 (dated 4.0)
+            || m.ends_with("opus-4"); // bare claude-opus-4 (4.0)
+        if legacy_opus {
+            return Some(ModelPricing {
+                input_cost_per_million: 15.0,
+                output_cost_per_million: 75.0,
+                cache_creation_cost_per_million: 18.75,
+                cache_read_cost_per_million: 1.5,
+            });
+        }
         return Some(ModelPricing {
-            input_cost_per_million: 15.0,
-            output_cost_per_million: 75.0,
-            cache_creation_cost_per_million: 18.75,
-            cache_read_cost_per_million: 1.5,
+            input_cost_per_million: 5.0,
+            output_cost_per_million: 25.0,
+            cache_creation_cost_per_million: 6.25,
+            cache_read_cost_per_million: 0.5,
         });
     }
     if m.contains("sonnet") {
-        return Some(ModelPricing::default_sonnet_tier());
+        // v0.4.18: Sonnet 4 / 4.5 / 4.6 are all $3/$15 (verified against
+        // Anthropic's published schedule, 2026-06). Previously this returned
+        // `default_sonnet_tier()` = $15/$75 (the deprecated Opus-4 tier), a 5x
+        // over-estimate. `default_sonnet_tier()` is now ONLY the generic
+        // unknown-model fallback (see `estimate_cost_usd`).
+        return Some(ModelPricing {
+            input_cost_per_million: 3.0,
+            output_cost_per_million: 15.0,
+            cache_creation_cost_per_million: 3.75,
+            cache_read_cost_per_million: 0.30,
+        });
     }
 
     // ── OpenAI families ──────────────────────────────────────────
@@ -519,9 +554,14 @@ mod tests {
         assert_eq!(format_usd(cost.input_cost_usd), "$15.0000");
         assert_eq!(format_usd(cost.output_cost_usd), "$37.5000");
         let lines = usage.summary_lines_for_model("usage", Some("claude-sonnet-4-20250514"));
-        assert!(lines[0].contains("estimated_cost=$54.6750"));
+        // v0.4.18 DELIBERATE: Sonnet is now $3/$15/$3.75/$0.30 (was the wrong
+        // $15/$75 deprecated-Opus tier). 1M*$3 + 0.5M*$15 + 0.1M*$3.75 +
+        // 0.2M*$0.30 = 3 + 7.5 + 0.375 + 0.06 = $10.9350; cache_read 0.2M*$0.30
+        // = $0.0600. (Note: the model-less estimate_cost_usd above still uses
+        // the unchanged $15/$75 generic fallback — proving the decoupling.)
+        assert!(lines[0].contains("estimated_cost=$10.9350"));
         assert!(lines[0].contains("model=claude-sonnet-4-20250514"));
-        assert!(lines[1].contains("cache_read=$0.3000"));
+        assert!(lines[1].contains("cache_read=$0.0600"));
     }
 
     #[test]
@@ -538,7 +578,9 @@ mod tests {
         let haiku_cost = usage.estimate_cost_usd_with_pricing(haiku);
         let opus_cost = usage.estimate_cost_usd_with_pricing(opus);
         assert_eq!(format_usd(haiku_cost.total_cost_usd()), "$3.5000");
-        assert_eq!(format_usd(opus_cost.total_cost_usd()), "$52.5000");
+        // v0.4.18 DELIBERATE: opus-4-7 is a CURRENT Opus ($5/$25), not the
+        // deprecated $15/$75 tier. 1M in + 0.5M out = $5 + $12.5 = $17.50.
+        assert_eq!(format_usd(opus_cost.total_cost_usd()), "$17.5000");
     }
 
     #[test]
@@ -647,19 +689,30 @@ mod tests {
         assert_pricing("claude-haiku-4-5", 1.0, 5.0, 1.25, 0.1);
     }
 
-    /// matrix[40] price_opus — `contains("opus")`. Note opus numerics are
-    /// identical to the default sonnet tier (15/75/18.75/1.5); the branch
-    /// still matters because `opus` is checked BEFORE `sonnet`.
+    /// matrix[40] price_opus — `contains("opus")`, CURRENT tier.
+    /// v0.4.18 DELIBERATE: current Opus (4.5–4.8) is $5/$25/$6.25/$0.50, NOT
+    /// the old $15/$75 (which was the deprecated Opus-4 tier).
     #[test]
     fn price_opus() {
-        assert_pricing("claude-opus-4-8", 15.0, 75.0, 18.75, 1.5);
+        assert_pricing("claude-opus-4-8", 5.0, 25.0, 6.25, 0.5);
     }
 
-    /// matrix[41] price_sonnet — `contains("sonnet")` -> default_sonnet_tier.
-    /// Numerically equal to opus by design; locks that they stay aligned.
+    /// v0.4.18 — deprecated Opus 4.0 / 4.1 keep the legacy $15/$75 tier; locks
+    /// the tier-split so a current-minor (4.5+) never falls into legacy and a
+    /// legacy id never falls into current. `has_word` boundary handling means
+    /// `opus-4-1` matches 4.1 but NOT a future `opus-4-10`.
+    #[test]
+    fn price_opus_legacy() {
+        assert_pricing("claude-opus-4-1", 15.0, 75.0, 18.75, 1.5);
+        assert_pricing("claude-opus-4-20250514", 15.0, 75.0, 18.75, 1.5);
+    }
+
+    /// matrix[41] price_sonnet — `contains("sonnet")`.
+    /// v0.4.18 DELIBERATE: Sonnet 4.x is $3/$15/$3.75/$0.30 (was wrongly the
+    /// $15/$75 deprecated-Opus tier). No longer aligned with opus.
     #[test]
     fn price_sonnet() {
-        assert_pricing("claude-sonnet-4-6", 15.0, 75.0, 18.75, 1.5);
+        assert_pricing("claude-sonnet-4-6", 3.0, 15.0, 3.75, 0.30);
     }
 
     // ── OpenAI GPT families (`contains`, ORDER-SENSITIVE) ───────────────

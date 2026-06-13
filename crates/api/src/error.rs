@@ -30,6 +30,25 @@ pub enum ApiError {
 }
 
 impl ApiError {
+    /// v0.4.18: true when the API rejected the request because the *model* is
+    /// not available on this account — Anthropic returns HTTP 404 with
+    /// `error.type == "not_found_error"` for an unknown/unavailable model on the
+    /// messages endpoint. Used to drive the Opus 4.8 → 4.7 fallback (the only
+    /// not-found case for this endpoint). Deliberately NOT matching 400, which
+    /// covers a broad range of unrelated request errors.
+    #[must_use]
+    pub fn is_model_unavailable(&self) -> bool {
+        match self {
+            Self::Api {
+                status,
+                error_type,
+                ..
+            } => status.as_u16() == 404 && error_type.as_deref() == Some("not_found_error"),
+            Self::RetriesExhausted { last_error, .. } => last_error.is_model_unavailable(),
+            _ => false,
+        }
+    }
+
     #[must_use]
     pub fn is_retryable(&self) -> bool {
         match self {
@@ -130,5 +149,45 @@ impl From<serde_json::Error> for ApiError {
 impl From<VarError> for ApiError {
     fn from(value: VarError) -> Self {
         Self::InvalidApiKeyEnv(value)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ApiError;
+
+    fn api(status: reqwest::StatusCode, error_type: Option<&str>) -> ApiError {
+        ApiError::Api {
+            status,
+            error_type: error_type.map(str::to_string),
+            message: Some("model: claude-opus-4-8".to_string()),
+            body: String::new(),
+            retryable: false,
+        }
+    }
+
+    // v0.4.18: is_model_unavailable drives the Opus 4.8 -> 4.7 fallback. It must
+    // fire ONLY on the precise "model not found" signal (404 + not_found_error)
+    // and never on unrelated request errors.
+    #[test]
+    fn model_unavailable_only_on_404_not_found() {
+        assert!(api(reqwest::StatusCode::NOT_FOUND, Some("not_found_error")).is_model_unavailable());
+        // 404 with a different error type is not a model-availability signal.
+        assert!(!api(reqwest::StatusCode::NOT_FOUND, Some("rate_limit_error")).is_model_unavailable());
+        // 400 (and other statuses) cover unrelated request errors — never fall back.
+        assert!(!api(reqwest::StatusCode::BAD_REQUEST, Some("not_found_error")).is_model_unavailable());
+        assert!(!api(reqwest::StatusCode::TOO_MANY_REQUESTS, Some("not_found_error")).is_model_unavailable());
+        // Non-Api variants never match.
+        assert!(!ApiError::MissingApiKey.is_model_unavailable());
+    }
+
+    #[test]
+    fn model_unavailable_unwraps_retries_exhausted() {
+        let inner = api(reqwest::StatusCode::NOT_FOUND, Some("not_found_error"));
+        let exhausted = ApiError::RetriesExhausted {
+            attempts: 3,
+            last_error: Box::new(inner),
+        };
+        assert!(exhausted.is_model_unavailable());
     }
 }
