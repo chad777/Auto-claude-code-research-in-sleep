@@ -401,11 +401,13 @@ impl McpServerManager {
                 Ok(tools) => discovered_tools.extend(tools),
                 Err(error) => {
                     let reason = error.to_string();
-                    // RW6: surface the failure (best-effort stderr line,
-                    // mirroring the existing notification-skip logging)
-                    // and record it structurally so the CLI/doctor can
-                    // report it. Tools already routed for this server are
-                    // dropped so we never dispatch to a broken server.
+                    // RW6: surface the failure (best-effort stderr line).
+                    // Unlike progress-notification tracing (gated behind
+                    // ARIS_MCP_STDERR=inherit), a server-discovery failure is a
+                    // real error the user should always see, so it stays
+                    // unconditional. Also record it structurally so the
+                    // CLI/doctor can report it. Tools already routed for this
+                    // server are dropped so we never dispatch to a broken server.
                     self.clear_routes_for_server(&server_name);
                     eprintln!(
                         "aris mcp: server `{server_name}` failed during tool discovery, skipping: {reason}"
@@ -894,6 +896,16 @@ async fn run_round_trip<TResult: DeserializeOwned>(
     };
 
     let read_fut = async {
+        // v0.4.17 push-gate (BUG A): notification frames are non-fatal — codex's
+        // MCP server emits dozens-to-hundreds of `codex/event` progress
+        // notifications between request and response. Logging one stderr line per
+        // frame spammed the REPL on every review. Trace them only when the
+        // operator opts in via the same `ARIS_MCP_STDERR=inherit` debug escape
+        // hatch used for child stderr (read once per round-trip); otherwise skip
+        // silently.
+        let trace_notifications = std::env::var("ARIS_MCP_STDERR")
+            .map(|value| value.eq_ignore_ascii_case("inherit"))
+            .unwrap_or(false);
         loop {
             let payload = read_frame_from(stdout).await?;
             let value: JsonValue = serde_json::from_slice(&payload)
@@ -901,13 +913,15 @@ async fn run_round_trip<TResult: DeserializeOwned>(
             let frame_id = value.as_object().and_then(|object| object.get("id"));
             match frame_id {
                 None | Some(JsonValue::Null) => {
-                    // Notification frame — log (best-effort) and read on.
-                    let method = value
-                        .as_object()
-                        .and_then(|object| object.get("method"))
-                        .and_then(JsonValue::as_str)
-                        .unwrap_or("?");
-                    eprintln!("aris mcp: notification skipped: method={method}");
+                    // Notification frame — read on. Trace only when opted in.
+                    if trace_notifications {
+                        let method = value
+                            .as_object()
+                            .and_then(|object| object.get("method"))
+                            .and_then(JsonValue::as_str)
+                            .unwrap_or("?");
+                        eprintln!("aris mcp: notification skipped: method={method}");
+                    }
                 }
                 Some(_) => {
                     let response: JsonRpcResponse<TResult> = serde_json::from_value(value)

@@ -3893,9 +3893,12 @@ fn resolve_export_path(
 /// calls are redirected to `LlmReview`, which hits the configured API reviewer
 /// directly without MCP.
 ///
-/// Three states:
-///   - `codex-mcp` + fallback configured → mention `LlmReview` as a fallback.
-///   - `codex-mcp` + no fallback         → emit nothing (pure MCP path).
+/// Three states (both codex-mcp states tell the model NOT to pass a `model`
+/// parameter — Codex uses the account default gpt-5.5+xhigh; v0.4.17 BUG B):
+///   - `codex-mcp` + fallback configured → use the Codex MCP channel (no `model`),
+///     and mention `LlmReview` as a fallback if the MCP channel is unavailable.
+///   - `codex-mcp` + no fallback         → use the Codex MCP channel (no `model`);
+///     no `LlmReview` path is advertised (pure MCP).
 ///   - any other provider                → push the "use `LlmReview` instead" override.
 ///
 /// Extracted as a pure fn (codex R11) so its output across all three states is
@@ -3903,18 +3906,33 @@ fn resolve_export_path(
 fn reviewer_routing_nudge(reviewer_provider: &str, fallback: Option<&str>) -> Vec<String> {
     if reviewer_provider == "codex-mcp" {
         // Codex MCP is the PRIMARY reviewer. Keep using the `mcp__codex__codex`
-        // channel; do NOT push the "use LlmReview instead" override. If a
-        // fallback HTTP reviewer is configured (ARIS_REVIEWER_FALLBACK_PROVIDER),
-        // mention that LlmReview is available as a fallback when the MCP channel
-        // is unavailable.
+        // channel; do NOT push the "use LlmReview instead" override.
+        //
+        // v0.4.17 push-gate (BUG B): the model would sometimes pass an explicit
+        // `model` parameter to mcp__codex__codex (e.g. `gpt-5.2`), which a
+        // ChatGPT-account Codex rejects ("model not supported with ChatGPT
+        // account") — the first call then fails until the model retries without
+        // it. Both codex-mcp states now tell the model NOT to pass a `model`
+        // parameter: Codex uses the account default (gpt-5.5 + xhigh reasoning
+        // from ~/.codex/config.toml). When a fallback HTTP reviewer is configured
+        // (ARIS_REVIEWER_FALLBACK_PROVIDER) we additionally mention that
+        // LlmReview is available if the MCP channel is unavailable.
         match fallback.filter(|s| !s.is_empty()) {
             Some(fallback) => vec![format!(
                 "IMPORTANT: Your external LLM reviewer is Codex MCP — use `mcp__codex__codex` / \
-                 `mcp__codex__codex-reply` as instructed by skills. If that MCP channel is \
-                 unavailable, you may fall back to the `LlmReview` tool, which calls the configured \
-                 HTTP fallback reviewer ({fallback}) directly."
+                 `mcp__codex__codex-reply` as instructed by skills. Do NOT pass a `model` \
+                 parameter: Codex uses your account default (gpt-5.5 with xhigh reasoning). \
+                 If that MCP channel is unavailable, you may fall back to the `LlmReview` tool, \
+                 which calls the configured HTTP fallback reviewer ({fallback}) directly."
             )],
-            None => Vec::new(),
+            None => vec![
+                "IMPORTANT: Your external LLM reviewer is Codex MCP — use the `mcp__codex__codex` / \
+                 `mcp__codex__codex-reply` tools as instructed by skills. Do NOT pass a `model` \
+                 parameter: Codex uses your account default (gpt-5.5 with xhigh reasoning from \
+                 ~/.codex/config.toml). Passing an unsupported model name causes a ChatGPT-account \
+                 rejection."
+                    .to_string(),
+            ],
         }
     } else {
         vec![
@@ -8060,17 +8078,39 @@ mod tests {
     }
 
     #[test]
-    fn reviewer_nudge_codex_mcp_without_fallback_is_silent() {
-        // No fallback configured → pure MCP path → emit nothing so the model
-        // keeps using mcp__codex__codex with no override at all.
-        assert!(
-            reviewer_routing_nudge("codex-mcp", None).is_empty(),
-            "codex-mcp without fallback should push no reviewer nudge"
-        );
-        assert!(
-            reviewer_routing_nudge("codex-mcp", Some("")).is_empty(),
-            "empty fallback string is treated as no fallback"
-        );
+    fn reviewer_nudge_codex_mcp_without_fallback_guides_mcp_no_model() {
+        // v0.4.17 push-gate (BUG B) DELIBERATE FLIP: previously this state was
+        // silent (emitted nothing). Real-machine testing showed the model would
+        // pass `model: gpt-5.2` to mcp__codex__codex and get rejected by the
+        // ChatGPT account. The no-fallback codex-mcp state now emits exactly one
+        // line that (a) directs the model to the Codex MCP channel and (b) tells
+        // it NOT to pass a `model` parameter (account default = gpt-5.5 + xhigh).
+        // An empty fallback string is still treated as "no fallback".
+        for fallback in [None, Some("")] {
+            let out = reviewer_routing_nudge("codex-mcp", fallback);
+            assert_eq!(
+                out.len(),
+                1,
+                "no-fallback codex-mcp emits exactly one guidance line, got: {out:?}"
+            );
+            let line = &out[0];
+            assert!(
+                line.contains("Your external LLM reviewer is Codex MCP")
+                    && line.contains("mcp__codex__codex"),
+                "must direct the model to the Codex MCP channel, got: {line}"
+            );
+            assert!(
+                line.contains("Do NOT pass a `model` parameter"),
+                "must tell the model not to pass a model parameter, got: {line}"
+            );
+            // Must not contradict the chosen reviewer with the LlmReview override,
+            // and (no fallback configured) must not advertise an HTTP fallback.
+            assert!(
+                !line.contains("use the `LlmReview` tool instead")
+                    && !line.contains("fall back to the `LlmReview` tool"),
+                "no-fallback codex-mcp must not mention any LlmReview path, got: {line}"
+            );
+        }
     }
 
     #[test]

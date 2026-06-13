@@ -3743,13 +3743,32 @@ fn run_llm_review(input: LlmReviewInput) -> Result<String, String> {
     // only ever reached as the explicit fallback path. The effective HTTP
     // provider is therefore the configured fallback
     // (ARIS_REVIEWER_FALLBACK_PROVIDER), not "codex-mcp" (which has no HTTP
-    // routing). If no fallback is set, the provider resolves to `None` and we
-    // fall through to the OpenAI-compat path below — whose missing-key error
-    // surfaces the T11 reviewer-setup guidance naturally.
+    // routing).
+    //
+    // v0.4.17 push-gate (BUG C) DELIBERATE FLIP: when no HTTP fallback is set we
+    // previously fell through to the OpenAI-compat path, whose missing-key error
+    // read "OPENAI_API_KEY not set (needed for model 'gpt-5.5')". For a user who
+    // deliberately configured Codex MCP that is actively misleading — it names a
+    // credential and model they never opted into. Return a clear, accurate error
+    // instead: tell them to invoke `mcp__codex__codex` directly (LlmReview only
+    // routes to HTTP API reviewers, and they have no HTTP fallback). The message
+    // must NOT mention OPENAI_API_KEY or gpt-5.5.
     let reviewer_provider = if raw_reviewer_provider.as_deref() == Some("codex-mcp") {
-        std::env::var("ARIS_REVIEWER_FALLBACK_PROVIDER")
+        match std::env::var("ARIS_REVIEWER_FALLBACK_PROVIDER")
             .ok()
             .filter(|s| !s.is_empty())
+        {
+            Some(fallback) => Some(fallback),
+            None => {
+                return Err(
+                    "LlmReview: Codex MCP is your configured reviewer — invoke the \
+                     `mcp__codex__codex` tool directly instead of LlmReview. LlmReview only routes \
+                     to HTTP API reviewers, and no HTTP fallback reviewer is configured. To add an \
+                     HTTP fallback reviewer, run `aris setup`."
+                        .to_string(),
+                );
+            }
+        }
     } else {
         raw_reviewer_provider
     };
@@ -4219,12 +4238,14 @@ mod tests {
         }
     }
 
-    /// v0.4.17 (T10/P1.2): when the PRIMARY reviewer is Codex MCP and NO fallback
-    /// is set, the effective provider resolves to `None`, so LlmReview falls
-    /// through to the OpenAI-compat path — whose missing-key error surfaces the
-    /// T11 reviewer-setup guidance (the natural "no fallback configured" signal).
+    /// v0.4.17 push-gate (BUG C) DELIBERATE FLIP: when the PRIMARY reviewer is
+    /// Codex MCP and NO fallback is set, LlmReview previously fell through to the
+    /// OpenAI-compat path, whose error named OPENAI_API_KEY + gpt-5.5 — actively
+    /// misleading for a user who deliberately configured Codex MCP. It now
+    /// returns a clear error that directs the model to `mcp__codex__codex` and
+    /// must NOT mention OPENAI_API_KEY or gpt-5.5 (no phantom credential / model).
     #[test]
-    fn llm_review_codex_mcp_without_fallback_falls_through_to_openai_compat() {
+    fn llm_review_codex_mcp_without_fallback_directs_to_mcp_not_openai_key() {
         let _guard = env_lock().lock().unwrap_or_else(|p| p.into_inner());
         let vars = [
             "ARIS_REVIEWER_MODEL",
@@ -4246,16 +4267,16 @@ mod tests {
             prompt: "review please".to_string(),
             model: None,
         })
-        .expect_err("no fallback + no creds => Err");
-        // Default model gpt-5.5 routes to the OpenAI-compat path → OPENAI_API_KEY
-        // missing, with the T11 guidance (Codex MCP escape hatch).
+        .expect_err("no fallback + codex-mcp primary => clear Err");
+        // Clear, accurate guidance: use the Codex MCP channel directly.
         assert!(
-            err.contains("OPENAI_API_KEY"),
-            "no-fallback codex-mcp should fall through to OpenAI-compat: {err}"
+            err.contains("mcp__codex__codex"),
+            "no-fallback codex-mcp must direct the user to the Codex MCP tool: {err}"
         );
+        // Must NOT name a credential or model the user never opted into.
         assert!(
-            err.contains("aris setup option 10"),
-            "missing-key error should carry the T11 reviewer-setup guidance: {err}"
+            !err.contains("OPENAI_API_KEY") && !err.contains("gpt-5.5"),
+            "no-fallback codex-mcp error must not mention OPENAI_API_KEY or gpt-5.5: {err}"
         );
 
         for (k, v) in saved {

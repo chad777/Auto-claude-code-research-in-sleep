@@ -10,8 +10,9 @@ robustness fixes. Built with the v0.4.16 zero-regression methodology:
 24 new characterization tests locked current behavior first (commit
 `90c8c91` = rollback anchor) and every deliberate behavior flip is
 annotated in the test that locks it. Reviewed phase-by-phase by Codex MCP
-(gpt-5.5 xhigh) across 16 rounds (R1–R16, 7 NO-GOs all resolved); design
-trail in `idea-stage/v0.4.17/`.
+(gpt-5.5 xhigh) across 17 rounds (R1–R17, 7 NO-GOs all resolved; R17 = the
+real-machine push-gate hardening below); design trail in
+`idea-stage/v0.4.17/`.
 
 ### 🆕 MCP tool dispatch is real now (M1/M2)
 
@@ -76,9 +77,11 @@ config), asks explicit consent before setting `trust: true`, and
 optionally configures an API reviewer as **fallback** — tracked in a new
 `reviewer_fallback_provider` field so MCP stays primary
 (`ARIS_REVIEWER_PROVIDER=codex-mcp` + `ARIS_REVIEWER_FALLBACK_PROVIDER`).
-`LlmReview` resolves the fallback automatically, and every
-missing-credential error now points at both escape hatches (subscription
-via option 10, or an API reviewer). `/setup` inside the REPL now rebuilds
+`LlmReview` resolves the fallback automatically, and an API reviewer's
+missing-credential error points at both escape hatches (subscription via
+option 10, or an API reviewer) — except when Codex MCP is primary with no
+fallback, which now gets a Codex-specific message (see push-gate hardening
+below). `/setup` inside the REPL now rebuilds
 the system prompt and runtime unconditionally, so reviewer changes take
 effect without quitting (new MCP servers still need a restart — ARIS
 tells you when).
@@ -124,6 +127,30 @@ tells you when).
   v0.4.16 convention.
 - The OpenAI-family subagent fail-loud guard now says v0.4.18 (P8 full
   routing moved there so this release stays MCP-focused).
+
+### 🩹 Real-machine push-gate hardening (the zero-API-key reviewer's first run)
+
+Dogfooding the new Codex MCP reviewer end-to-end surfaced three rough
+edges in the *first-impression* path — all UX, no protocol change:
+
+- **No more notification spam.** codex emits dozens-to-hundreds of
+  `codex/event` progress notifications per call; ARIS logged one
+  `aris mcp: notification skipped` stderr line per frame, flooding the
+  REPL on every review. The trace is now gated behind the existing
+  `ARIS_MCP_STDERR=inherit` debug flag (read once per round-trip) and
+  silent by default — control flow is unchanged, notifications are still
+  skipped and the read loop still waits for the id-bearing response.
+- **Don't let the model override Codex's model.** The system prompt for a
+  Codex MCP reviewer now tells the model **not** to pass a `model`
+  parameter — a ChatGPT-subscription Codex rejects arbitrary names (e.g.
+  `gpt-5.2`) and the call fails until retried without it. Codex uses your
+  account default (gpt-5.5 + xhigh from `~/.codex/config.toml`).
+- **Accurate error when Codex MCP is primary with no fallback.** Calling
+  `LlmReview` in this state previously fell through to the OpenAI-compat
+  path and complained that `OPENAI_API_KEY` was unset for `gpt-5.5` —
+  a credential and model the user never opted into. It now returns a
+  clear message directing them to invoke `mcp__codex__codex` directly
+  (and names no phantom credential).
 
 ### Tests
 
