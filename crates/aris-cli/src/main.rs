@@ -216,6 +216,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Load saved ARIS config and apply to env (env vars always take priority)
     let saved_config = config::ArisConfig::load();
     saved_config.apply_to_env();
+    // v0.4.18 (#259): surface a silently-ignored / misplaced ARIS config so the
+    // user isn't left wondering why their settings had no effect. Stderr only,
+    // so `--print` / JSON stdout stays clean; `None` on the normal no-config
+    // first run (never nags new users).
+    if let Some(hint) = config::ArisConfig::diagnose_misconfig() {
+        eprintln!("\x1b[33mwarning:\x1b[0m {hint}");
+    }
     init_aris_tasks_env();
 
     let args: Vec<String> = env::args().skip(1).collect();
@@ -3995,8 +4002,10 @@ fn reviewer_routing_nudge(reviewer_provider: &str, fallback: Option<&str>) -> Ve
         // ChatGPT-account Codex rejects ("model not supported with ChatGPT
         // account") — the first call then fails until the model retries without
         // it. Both codex-mcp states now tell the model NOT to pass a `model`
-        // parameter: Codex uses the account default (gpt-5.5 + xhigh reasoning
-        // from ~/.codex/config.toml). When a fallback HTTP reviewer is configured
+        // parameter: Codex uses the account default model and runs at xhigh
+        // reasoning (v0.4.18 pins the spawned server to xhigh via the
+        // `mcpServers.codex` args for new setups; ARIS skills also pass it
+        // per-call). When a fallback HTTP reviewer is configured
         // (ARIS_REVIEWER_FALLBACK_PROVIDER) we additionally mention that
         // LlmReview is available if the MCP channel is unavailable.
         match fallback.filter(|s| !s.is_empty()) {
@@ -4010,9 +4019,8 @@ fn reviewer_routing_nudge(reviewer_provider: &str, fallback: Option<&str>) -> Ve
             None => vec![
                 "IMPORTANT: Your external LLM reviewer is Codex MCP — use the `mcp__codex__codex` / \
                  `mcp__codex__codex-reply` tools as instructed by skills. Do NOT pass a `model` \
-                 parameter: Codex uses your account default (gpt-5.5 with xhigh reasoning from \
-                 ~/.codex/config.toml). Passing an unsupported model name causes a ChatGPT-account \
-                 rejection."
+                 parameter: Codex uses your account default model and runs at xhigh reasoning. \
+                 Passing an unsupported model name causes a ChatGPT-account rejection."
                     .to_string(),
             ],
         }
@@ -6212,6 +6220,17 @@ fn run_doctor() -> Result<(), Box<dyn std::error::Error>> {
         }
     } else {
         println!("Anthropic (default)");
+    }
+
+    // Check 0b: ARIS config health (#259) — flag a silently-ignored malformed
+    // config or a misplaced/wrong-format stray (YAML / wrong path).
+    print!("  ARIS config:  ");
+    if let Some(hint) = config::ArisConfig::diagnose_misconfig() {
+        println!("PROBLEM");
+        println!("                {hint}");
+        all_ok = false;
+    } else {
+        println!("OK (~/.config/aris/config.json — flat JSON, or defaults)");
     }
 
     // Check 1: API auth

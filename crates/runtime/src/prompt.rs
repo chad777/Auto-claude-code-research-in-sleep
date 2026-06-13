@@ -798,7 +798,19 @@ fn render_hooks_summary(value: &crate::json::JsonValue) -> Vec<String> {
                 }
             }
         }
-        lines.push(format!("    - {event}: {hook_count} hook(s) configured"));
+        // v0.4.18 (event-honesty): only PreToolUse/PostToolUse are dispatched
+        // by this runtime. Other Claude Code events (SessionStart/SessionEnd/
+        // UserPromptSubmit/PostToolUseFailure) can sit in settings.json — `aris
+        // init` even writes some — but are parsed-only and never fired here, so
+        // we must NOT let the model believe a dead hook will run. Mark them.
+        if crate::hooks::runtime_executes_hook_event(event) {
+            lines.push(format!("    - {event}: {hook_count} hook(s) configured"));
+        } else {
+            lines.push(format!(
+                "    - {event}: {hook_count} hook(s) configured — PARSED ONLY, this runtime \
+                 does not fire {event} (the hook will NOT run)"
+            ));
+        }
     }
     lines
 }
@@ -1596,6 +1608,45 @@ mod tests {
         assert!(
             !rendered.contains("Edit|Write"),
             "matcher text must never be rendered: {rendered}"
+        );
+    }
+
+    /// v0.4.18 (event-honesty): events this runtime does NOT dispatch
+    /// (SessionEnd etc. — `aris init` writes some) must be marked PARSED ONLY so
+    /// the model never believes a dead hook will run; a fired event (PreToolUse)
+    /// stays unannotated.
+    #[test]
+    fn hooks_summary_marks_non_dispatched_events_as_parsed_only() {
+        let mut events = std::collections::BTreeMap::new();
+        events.insert(
+            "PreToolUse".to_string(),
+            JsonValue::Array(vec![JsonValue::String("echo pre".to_string())]),
+        );
+        events.insert(
+            "SessionEnd".to_string(),
+            JsonValue::Array(vec![JsonValue::String("echo end".to_string())]),
+        );
+        let rendered = render_hooks_summary(&JsonValue::Object(events)).join("\n");
+
+        // Fired event: plain "configured", no parsed-only marker.
+        let pre_line = rendered
+            .lines()
+            .find(|l| l.contains("PreToolUse"))
+            .expect("PreToolUse line");
+        assert!(
+            pre_line.contains("PreToolUse: 1 hook(s) configured")
+                && !pre_line.contains("PARSED ONLY"),
+            "fired event must not be marked parsed-only: {pre_line}"
+        );
+
+        // Non-dispatched event: must be marked so the model knows it won't run.
+        let end_line = rendered
+            .lines()
+            .find(|l| l.contains("SessionEnd"))
+            .expect("SessionEnd line");
+        assert!(
+            end_line.contains("PARSED ONLY") && end_line.contains("will NOT run"),
+            "non-dispatched event must be marked parsed-only: {end_line}"
         );
     }
 }

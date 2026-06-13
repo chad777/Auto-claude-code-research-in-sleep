@@ -31,6 +31,22 @@ impl HookEvent {
     }
 }
 
+/// v0.4.18 (event-honesty): the single source of truth for which Claude Code
+/// hook events this runtime actually DISPATCHES. Only `PreToolUse` /
+/// `PostToolUse` fire today. Other events (`SessionStart` / `SessionEnd` /
+/// `UserPromptSubmit` / `PostToolUseFailure`) may appear in `settings.json` —
+/// `aris init` even writes some for meta-optimize logging — but they are
+/// PARSED-ONLY and never fired (full event expansion is tracked as a separate
+/// item). The system-prompt hooks summary uses this so it never tells the model
+/// a configured-but-dead hook will run. When event expansion lands, extend the
+/// `HookEvent` enum and this list together.
+#[must_use]
+pub fn runtime_executes_hook_event(event_name: &str) -> bool {
+    [HookEvent::PreToolUse, HookEvent::PostToolUse]
+        .iter()
+        .any(|event| event.as_str() == event_name)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HookRunResult {
     denied: bool,

@@ -83,6 +83,67 @@ impl ArisConfig {
             .unwrap_or_default()
     }
 
+    /// v0.4.18 (#259): detect the two silent-misconfiguration traps and return a
+    /// one-line human hint, or `None` when the config is fine (including the
+    /// normal first-run "no config" case — so this never nags new users).
+    ///
+    /// `load()` swallows a malformed config via `unwrap_or_default()`, and ARIS
+    /// reads only `~/.config/aris/config.json` (flat JSON) — so a user who put
+    /// YAML or nested keys, or used the wrong path, gets "my config is silently
+    /// ignored and I can't tell why". This surfaces that. It is purely
+    /// diagnostic: it never mutates anything and `load()` stays unchanged, so
+    /// callers still get a valid `ArisConfig` on every path.
+    #[must_use]
+    pub fn diagnose_misconfig() -> Option<String> {
+        Self::diagnose_misconfig_in(&runtime::home_dir())
+    }
+
+    /// Home-parameterized core of [`diagnose_misconfig`] so it can be unit-tested
+    /// against a temp directory without mutating the process `$HOME`.
+    fn diagnose_misconfig_in(home: &str) -> Option<String> {
+        let path = PathBuf::from(home).join(CONFIG_DIR).join(CONFIG_FILE);
+        if path.exists() {
+            // File present — is it parseable as our flat JSON shape?
+            let parses = fs::read_to_string(&path)
+                .ok()
+                .and_then(|content| serde_json::from_str::<Self>(&content).ok())
+                .is_some();
+            if parses {
+                return None;
+            }
+            return Some(format!(
+                "found {} but could not parse it as ARIS's flat JSON config — ignoring it. \
+                 Expected top-level keys like executor_provider / executor_api_key / \
+                 executor_model / executor_base_url / reviewer_provider / language. \
+                 Run `aris setup` to rewrite it.",
+                path.display()
+            ));
+        }
+        // Real config absent — look for a misplaced / wrong-format stray so the
+        // user isn't left wondering why their settings are ignored.
+        let strays = [
+            ".aris/config.yaml",
+            ".aris/config.yml",
+            ".aris/config.json",
+            ".config/aris/config.yaml",
+            ".config/aris/config.yml",
+            "aris.yaml",
+            "aris.yml",
+        ];
+        for rel in strays {
+            let candidate = PathBuf::from(home).join(rel);
+            if candidate.exists() {
+                return Some(format!(
+                    "found {} but ARIS reads {} (flat JSON, not YAML or nested keys). \
+                     Run `aris setup` to generate the correct file.",
+                    candidate.display(),
+                    path.display()
+                ));
+            }
+        }
+        None
+    }
+
     pub fn save(&self) -> io::Result<()> {
         let path = Self::config_path();
         if let Some(parent) = path.parent() {
@@ -989,12 +1050,25 @@ fn which_codex() -> bool {
 }
 
 /// v0.4.17 (T10): the JSON object written for `mcpServers.codex`.
+///
+/// v0.4.18: the spawned server is pinned to `model_reasoning_effort="xhigh"`
+/// via `-c` (parsed as TOML by `codex mcp-server`, so the value must be a
+/// quoted TOML string). This makes ARIS's cross-model reviewer run at xhigh
+/// deterministically — independent of the user's `~/.codex/config.toml` — so
+/// even a bare `mcp__codex__codex` call that omits a per-call `config` arg
+/// reviews at full reasoning. Per-call `config` (which ARIS skills pass)
+/// still overrides upward. Only NEW setups get this (the merge is idempotent
+/// and never clobbers an existing `mcpServers.codex`).
 fn codex_mcp_server_entry(trust: bool) -> serde_json::Value {
     let mut obj = serde_json::Map::new();
     obj.insert("command".into(), serde_json::Value::String("codex".into()));
     obj.insert(
         "args".into(),
-        serde_json::Value::Array(vec![serde_json::Value::String("mcp-server".into())]),
+        serde_json::Value::Array(vec![
+            serde_json::Value::String("mcp-server".into()),
+            serde_json::Value::String("-c".into()),
+            serde_json::Value::String("model_reasoning_effort=\"xhigh\"".into()),
+        ]),
     );
     if trust {
         obj.insert("trust".into(), serde_json::Value::Bool(true));
@@ -1795,6 +1869,49 @@ mod tests {
         std::env::temp_dir().join(format!("aris-codex-mcp-test-{pid}-{nanos}"))
     }
 
+    // v0.4.18 (#259): diagnose_misconfig must (a) stay silent on a clean
+    // first-run and a valid config, (b) flag a malformed config at the right
+    // path, and (c) flag a misplaced/wrong-format stray when the real config is
+    // absent. Filesystem-only (passes an explicit home) so it never touches the
+    // process $HOME and is parallel-safe.
+    #[test]
+    fn diagnose_misconfig_detects_malformed_and_misplaced() {
+        let home = codex_mcp_test_root();
+        let home_str = home.to_str().expect("utf8 path");
+        let cfg_dir = home.join(".config/aris");
+        let cfg = cfg_dir.join("config.json");
+
+        // (a) nothing anywhere → first-run, no nag.
+        assert!(ArisConfig::diagnose_misconfig_in(home_str).is_none());
+
+        // (a) valid flat-JSON config → fine.
+        fs::create_dir_all(&cfg_dir).expect("mkdir");
+        fs::write(&cfg, r#"{"language":"en"}"#).expect("write valid");
+        assert!(ArisConfig::diagnose_misconfig_in(home_str).is_none());
+
+        // (b) malformed config AT the right path (e.g. YAML pasted into the
+        // .json file) → parse-failure hint pointing at `aris setup`.
+        fs::write(&cfg, "executor:\n  provider: anthropic\n").expect("write malformed");
+        let hint = ArisConfig::diagnose_misconfig_in(home_str).expect("malformed => hint");
+        assert!(
+            hint.contains("could not parse") && hint.contains("aris setup"),
+            "malformed hint wrong: {hint}"
+        );
+
+        // (c) real config absent + a misplaced YAML stray → misplaced hint.
+        fs::remove_file(&cfg).expect("rm");
+        let stray = home.join(".aris/config.yaml");
+        fs::create_dir_all(stray.parent().unwrap()).expect("mkdir stray");
+        fs::write(&stray, "executor:\n  provider: anthropic\n").expect("write stray");
+        let hint = ArisConfig::diagnose_misconfig_in(home_str).expect("misplaced => hint");
+        assert!(
+            hint.contains("config.yaml") && hint.contains("flat JSON"),
+            "misplaced hint wrong: {hint}"
+        );
+
+        let _ = fs::remove_dir_all(&home);
+    }
+
     /// default_reviewer_choice must round-trip the saved provider back to the
     /// matching menu number — most importantly `codex-mcp -> "10"` so the next
     /// `setup` defaults to the Codex MCP reviewer instead of drifting to Skip.
@@ -1814,7 +1931,11 @@ mod tests {
     fn codex_mcp_server_entry_has_command_args_and_optional_trust() {
         let trusted = codex_mcp_server_entry(true);
         assert_eq!(trusted["command"], "codex");
-        assert_eq!(trusted["args"], serde_json::json!(["mcp-server"]));
+        // v0.4.18: args pin xhigh reasoning on the spawned server.
+        assert_eq!(
+            trusted["args"],
+            serde_json::json!(["mcp-server", "-c", "model_reasoning_effort=\"xhigh\""])
+        );
         assert_eq!(trusted["trust"], serde_json::json!(true));
 
         let untrusted = codex_mcp_server_entry(false);
@@ -1839,7 +1960,7 @@ mod tests {
         assert_eq!(parsed["mcpServers"]["codex"]["command"], "codex");
         assert_eq!(
             parsed["mcpServers"]["codex"]["args"],
-            serde_json::json!(["mcp-server"])
+            serde_json::json!(["mcp-server", "-c", "model_reasoning_effort=\"xhigh\""])
         );
         assert_eq!(parsed["mcpServers"]["codex"]["trust"], serde_json::json!(true));
 
