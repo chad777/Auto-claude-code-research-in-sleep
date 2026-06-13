@@ -74,18 +74,16 @@
 </details>
 
 <details>
-<summary><b>Run ARIS-Monitor in 5 seconds</b></summary>
+<summary><b>几秒跑起来</b> —— ARIS-Monitor（5s）/ Claude Fleet（30s）</summary>
+
+**ARIS-Monitor** —— 就在本仓库，不用 clone / 不装依赖 / 不开浏览器:
 
 ```bash
-# 就在本仓库里 —— 不用另 clone、不装依赖、不开浏览器:
 cd aris-monitor && ./run.sh
 # 右上角冒出一个无边框悬浮窗;点一行直接跳到那个终端
 ```
 
-</details>
-
-<details>
-<summary><b>Run Claude Fleet in 30 seconds</b></summary>
+**Claude Fleet** —— 全功能网页看板:
 
 ```bash
 git clone https://github.com/tianyilt/claude-fleet

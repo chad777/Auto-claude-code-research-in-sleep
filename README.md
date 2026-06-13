@@ -63,18 +63,16 @@
 </details>
 
 <details>
-<summary><b>Run ARIS-Monitor in 5 seconds</b></summary>
+<summary><b>Run either in seconds</b> — ARIS-Monitor (5s) / Claude Fleet (30s)</summary>
+
+**ARIS-Monitor** — built-in, no clone / no pip / no browser:
 
 ```bash
-# part of this repo — no extra clone, no pip install, no browser:
 cd aris-monitor && ./run.sh
 # a borderless panel floats top-right; click a row to jump to that terminal
 ```
 
-</details>
-
-<details>
-<summary><b>Run Claude Fleet in 30 seconds</b></summary>
+**Claude Fleet** — full web dashboard:
 
 ```bash
 git clone https://github.com/tianyilt/claude-fleet
