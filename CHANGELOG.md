@@ -1,5 +1,81 @@
 # ARIS-Code Changelog
 
+## v0.4.18 (2026-06-14)
+
+Default model is now **Claude Opus 4.8** — with correct pricing and a safety
+net so the bump can't regress anyone who lacks 4.8 access. Plus three
+backlog fixes. Built with the same zero-regression discipline (characterization
+tests + annotated deliberate flips); reviewed by Codex MCP (gpt-5.5 xhigh)
+across the design and both implementation batches.
+
+### 🆕 Default model: Claude Opus 4.7 → 4.8
+
+- `DEFAULT_MODEL`, the `opus` alias, the model picker, the `aris setup` default,
+  and the subagent `DEFAULT_AGENT_MODEL` all move to **`claude-opus-4-8`**. The
+  friendly-name map keeps a `claude-opus-4-7` entry, so explicitly pinning 4.7
+  still renders a clean name.
+- **Availability fallback (4.8 → 4.7).** Bumping the default must not break
+  users whose account lacks Opus 4.8. If the initial request returns
+  `404 not_found_error` ("model unavailable"), ARIS automatically falls back to
+  `claude-opus-4-7` for the session, **rebuilds the system-prompt model identity
+  so it stays coherent** (the model is never told it is 4.8 while serving 4.7),
+  warns once, and retries — for the main session (text + JSON) and for
+  subagents. The fallback fires only on that precise 404 signal (never on 400 /
+  rate-limit / auth), latches to avoid loops, and the text path rebuilds from a
+  pre-turn session snapshot so the retry never double-appends the user message.
+  Users *with* 4.8 access are byte-identical to a plain bump (the fallback never
+  fires).
+
+### 💰 Correct Anthropic pricing (was a 3–5× over-estimate)
+
+Verified against Anthropic's published schedule. The registry had been pricing
+both Opus and Sonnet at the **deprecated** Opus-4 tier ($15/$75):
+
+- **Opus 4.5–4.8** → `$5 / $25` input/output (`$6.25` cache write, `$0.50`
+  cache read). The deprecated **Opus 4.0 / 4.1** keep `$15/$75`; the split uses
+  word-boundary matching so a future minor like `opus-4-10` is never
+  mis-classified as 4.1.
+- **Sonnet 4.x** → `$3 / $15` (was `$15/$75`), decoupled from the generic
+  unknown-model fallback (which stays `$15/$75` as a conservative estimate —
+  zero behavior change for unrecognized models). Haiku was already correct.
+
+### 🧹 Backlog
+
+- **Codex MCP reviewer pinned to xhigh.** `aris setup` option 10 now writes
+  `mcpServers.codex` args `["mcp-server", "-c", "model_reasoning_effort=\"xhigh\""]`,
+  so the zero-API-key reviewer runs at xhigh deterministically — independent of
+  `~/.codex/config.toml` — even for an ad-hoc `mcp__codex__codex` call that omits
+  a per-call config. Only new setups are touched (the idempotent merge never
+  clobbers an existing entry); the reviewer system-prompt nudge dropped its
+  stale "xhigh from ~/.codex/config.toml" claim.
+- **Misconfig hint ([#259](https://github.com/wanshuiyin/Auto-claude-code-research-in-sleep/issues/259)).**
+  A malformed `~/.config/aris/config.json`, or a misplaced/wrong-format stray
+  (`~/.aris/config.yaml`, YAML/nested keys, …), was silently swallowed — your
+  settings ignored with no clue why. ARIS now surfaces a one-line hint at
+  startup (stderr only, so `--print`/JSON stdout stays clean) and as an "ARIS
+  config" check in `aris doctor`, naming the correct flat-JSON path + keys.
+  `load()` is unchanged (still degrades to defaults) — the hint is purely
+  additive diagnostics.
+- **Honest hook-events summary.** The runtime only dispatches
+  `PreToolUse`/`PostToolUse`, but `aris init` writes
+  `SessionStart`/`SessionEnd`/`UserPromptSubmit`/`PostToolUseFailure` hooks and
+  the system-prompt summary listed them all — telling the model dead hooks
+  exist. The summary now marks non-dispatched events **"PARSED ONLY … will NOT
+  run"**. Pure prompt text; no hook execution change. Actually firing those
+  events (full event expansion) is deferred to a separate issue (needs lifecycle
+  dispatch + a behavior change for everyone who ran `aris init` + payload-contract
+  validation).
+
+### Tests
+
+CI mode (`--test-threads=1`): **api 32 / runtime 202 / tools 67 / aris-cli 166 /
+commands 5** — all green. New: model-availability detection (`ApiError` /
+`RuntimeError`), `price_opus_legacy` tier-split lock, `diagnose_misconfig`
+matrix, hook-summary parsed-only marking — plus the deliberate flips
+(pricing values, `opus` alias) annotated in place. Live smoke: a one-shot turn
+on the new default returns `model=claude-opus-4-8` end-to-end. Reviewed by Codex
+MCP (gpt-5.5 xhigh): design REWORK→GO, impl NO-GO (duplicate-message)→GO, batch-2 GO.
+
 ## v0.4.17 (2026-06-10)
 
 The **MCP release**: user-configured `mcpServers` finally drive real tool
