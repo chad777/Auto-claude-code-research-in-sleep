@@ -793,7 +793,31 @@ fn render_hooks_summary(value: &crate::json::JsonValue) -> Vec<String> {
                     if let Some(hook_list) =
                         matcher_obj.get("hooks").and_then(JsonValue::as_array)
                     {
-                        hook_count += hook_list.len();
+                        // v0.4.19: count only EXECUTABLE command hooks, matching
+                        // the parser (config.rs::parse_hook_event_array) EXACTLY:
+                        // a nested entry is executed iff its `type` is absent or
+                        // "command" AND it has a `command` STRING (the parser
+                        // hard-errors on a command hook missing `command`, so it
+                        // never executes). The old `hook_list.len()` over-counted
+                        // non-command / malformed entries, inflating the number
+                        // the model sees vs. what the runtime actually runs.
+                        hook_count += hook_list
+                            .iter()
+                            .filter(|hook| {
+                                hook.as_object().is_some_and(|obj| {
+                                    let is_command = obj
+                                        .get("type")
+                                        .and_then(JsonValue::as_str)
+                                        .unwrap_or("command")
+                                        == "command";
+                                    is_command
+                                        && obj
+                                            .get("command")
+                                            .and_then(JsonValue::as_str)
+                                            .is_some()
+                                })
+                            })
+                            .count();
                     }
                 }
             }
@@ -1608,6 +1632,45 @@ mod tests {
         assert!(
             !rendered.contains("Edit|Write"),
             "matcher text must never be rendered: {rendered}"
+        );
+    }
+
+    /// v0.4.19: the summary counts only EXECUTABLE command hooks — a nested
+    /// entry whose `type` is present and != "command" is skipped by the parser,
+    /// so it must not inflate the count the model sees.
+    #[test]
+    fn hooks_summary_counts_only_command_hooks() {
+        let mut cmd = std::collections::BTreeMap::new();
+        cmd.insert("type".to_string(), JsonValue::String("command".to_string()));
+        cmd.insert("command".to_string(), JsonValue::String("echo hi".to_string()));
+        // A non-command entry (e.g. some future/unknown hook type) — the parser
+        // skips it, so the summary must not count it.
+        let mut noncmd = std::collections::BTreeMap::new();
+        noncmd.insert("type".to_string(), JsonValue::String("notification".to_string()));
+        // A command-typed entry MISSING its `command` string — the parser
+        // hard-errors on this (never executes), so the summary must not count it.
+        let mut malformed = std::collections::BTreeMap::new();
+        malformed.insert("type".to_string(), JsonValue::String("command".to_string()));
+
+        let mut group = std::collections::BTreeMap::new();
+        group.insert(
+            "hooks".to_string(),
+            JsonValue::Array(vec![
+                JsonValue::Object(cmd),
+                JsonValue::Object(noncmd),
+                JsonValue::Object(malformed),
+            ]),
+        );
+        let mut events = std::collections::BTreeMap::new();
+        events.insert(
+            "PreToolUse".to_string(),
+            JsonValue::Array(vec![JsonValue::Object(group)]),
+        );
+
+        let rendered = render_hooks_summary(&JsonValue::Object(events)).join("\n");
+        assert!(
+            rendered.contains("PreToolUse: 1 hook(s)"),
+            "only the 1 command hook should be counted, not the notification entry: {rendered}"
         );
     }
 

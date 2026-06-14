@@ -2160,13 +2160,15 @@ fn build_agent_runtime(
     // `resolve_openai_executor_config`, so the detection set is exactly the
     // routing set and never misfires on anthropic / anthropic-compat
     // (Category A/B), whose EXECUTOR_PROVIDER is unset/cleared. Full
-    // OpenAI-family subagent routing lands in v0.4.18 (P8 was split out of
-    // v0.4.17 — see idea-stage/v0.4.17/plan.md §0). The message carries no
-    // credential names by design.
+    // OpenAI-family subagent routing (P8 — design in
+    // idea-stage/v0.4.16/p8_design.json) is on the roadmap but not yet
+    // shipped; this message is intentionally version-agnostic (it must not
+    // promise a specific release) and carries no credential names.
     if std::env::var("EXECUTOR_PROVIDER").as_deref() == Ok("openai") {
         return Err("subagents currently require an Anthropic-family executor; \
-                    OpenAI-family subagent dispatch lands in v0.4.18. \
-                    Your main session is unaffected."
+                    dispatching a subagent from an OpenAI-family session is not yet \
+                    supported. Your main session is unaffected — to use subagents, run \
+                    with an Anthropic-family executor."
             .to_string());
     }
 
@@ -6571,8 +6573,8 @@ printf 'pwsh:%s' "$1"
     // For OpenAI-family executors (C: EXECUTOR_PROVIDER=="openai") the P8
     // v0.4.16 minimal guard now FAILS LOUD (was: silently built an Anthropic
     // client and billed the user's Anthropic credential). The C tests assert
-    // that fail-loud contract; full OpenAI subagent routing lands in v0.4.18
-    // (P8 was split out of v0.4.17 — plan.md §0).
+    // that fail-loud contract; full OpenAI subagent routing (P8) is on the
+    // roadmap but unshipped (design in idea-stage/v0.4.16/p8_design.json).
     //
     // The auth BRANCH (x-api-key vs Bearer) is not observable through the
     // built `ConversationRuntime` (its inner api_client is private with no
@@ -6684,9 +6686,10 @@ printf 'pwsh:%s' "$1"
     // P8 v0.4.16 (minimal error-guard): build_agent_runtime now FAILS LOUD for
     // an OpenAI-family executor instead of silently building an Anthropic
     // client (which would bill the user's Anthropic credential). The baseline
-    // (anthropic) path is unchanged. Full OpenAI subagent routing lands in
-    // v0.4.18 (P8 was split out of v0.4.17 — plan.md §0), at which point the
-    // openai run should build an OpenAI runtime instead of erroring.
+    // (anthropic) path is unchanged. Full OpenAI subagent routing (P8 — design
+    // in idea-stage/v0.4.16/p8_design.json) is on the roadmap but unshipped, at
+    // which point the openai run should build an OpenAI runtime instead of
+    // erroring.
     #[test]
     fn char_build_agent_runtime_rejects_openai_provider() {
         let _g = env_lock_reviewer().lock().unwrap();
@@ -6719,13 +6722,22 @@ printf 'pwsh:%s' "$1"
         let Err(err) = openai else {
             panic!("EXECUTOR_PROVIDER=openai must fail loud, not build an Anthropic client");
         };
-        // deliberately flipped in v0.4.17 (T9): the guard message's version
-        // marker moved from "v0.4.17" to "v0.4.18" because P8 (OpenAI-family
-        // subagent routing) was split out of v0.4.17 into v0.4.18 (plan.md §0).
-        // The fail-loud contract itself is unchanged.
+        // v0.4.19 (T2): the guard message is now VERSION-AGNOSTIC. The old
+        // "lands in v0.4.18" marker went stale the moment v0.4.18 shipped
+        // without P8, misleading OpenAI-family users into thinking the build
+        // was broken. The fail-loud contract is unchanged; only the wording is.
         assert!(
-            err.contains("Anthropic-family") && err.contains("v0.4.18"),
-            "openai subagent must fail with the v0.4.16 guard message (v0.4.18 marker). got: {err}"
+            err.contains("Anthropic-family") && err.contains("not yet supported"),
+            "openai subagent must fail loud with the version-agnostic guard message. got: {err}"
+        );
+        assert!(
+            !err.contains("v0.4.1") && !err.contains("lands in"),
+            "guard message must NOT promise a specific release (stays version-agnostic): {err}"
+        );
+        // The message must never leak the executor credential.
+        assert!(
+            !err.contains("sk-openai-exec"),
+            "guard message must not leak credentials: {err}"
         );
     }
 
@@ -6749,12 +6761,16 @@ printf 'pwsh:%s' "$1"
         let Err(msg) = result else {
             panic!("EXECUTOR_PROVIDER=openai subagent must fail loud");
         };
-        // deliberately flipped in v0.4.17 (T9): version marker moved
-        // "v0.4.17" -> "v0.4.18" (P8 split out of v0.4.17, plan.md §0). The
-        // fail-loud + credential-free contract is otherwise unchanged.
+        // v0.4.19 (T2): the guard message is now version-agnostic (the old
+        // "lands in v0.4.18" marker went stale once v0.4.18 shipped without P8).
+        // The fail-loud + credential-free contract is otherwise unchanged.
         assert!(
-            msg.contains("Anthropic-family") && msg.contains("v0.4.18"),
-            "must be the v0.4.16 guard message (v0.4.18 marker): {msg}"
+            msg.contains("Anthropic-family") && msg.contains("not yet supported"),
+            "must be the version-agnostic fail-loud guard message: {msg}"
+        );
+        assert!(
+            !msg.contains("v0.4.1") && !msg.contains("lands in"),
+            "guard message must not promise a specific release: {msg}"
         );
         // Anti-leak: the guard message must never echo a credential env NAME
         // nor the actual key VALUE (the sentinel set above).

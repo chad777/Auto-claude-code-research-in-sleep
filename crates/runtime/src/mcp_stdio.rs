@@ -642,11 +642,41 @@ impl McpServerManager {
                 });
             }
 
-            if response.result.is_none() {
+            let Some(result) = response.result.as_ref() else {
                 return Err(McpServerManagerError::InvalidResponse {
                     server_name: server_name.to_string(),
                     method: "initialize",
                     details: "missing result payload".to_string(),
+                });
+            };
+
+            // v0.4.19: protocol-version negotiation guard. ARIS requested
+            // REQUESTED_PROTOCOL_VERSION; a spec-compliant server echoes that,
+            // or (if it doesn't support it) returns a version IT supports. If
+            // the negotiated version is one ARIS does NOT speak, we must not
+            // silently proceed — `tools/list` / `tools/call` would then run on
+            // an incompatible protocol with opaque failures. The MCP lifecycle
+            // spec says the client must terminate the connection in this case,
+            // so tear the child down and clear the slot (per-server degrade;
+            // `aris doctor` surfaces the reason). Healthy servers are unaffected
+            // — 2025-03-26 (what we request) is in SUPPORTED_PROTOCOL_VERSIONS.
+            let negotiated = result.protocol_version.clone();
+            if !SUPPORTED_PROTOCOL_VERSIONS.contains(&negotiated.as_str()) {
+                let server = self.server_mut(server_name)?;
+                if let Some(process) = server.process.as_mut() {
+                    let _ = process.terminate().await;
+                }
+                let server = self.server_mut(server_name)?;
+                server.process = None;
+                server.initialized = false;
+                return Err(McpServerManagerError::InvalidResponse {
+                    server_name: server_name.to_string(),
+                    method: "initialize",
+                    details: format!(
+                        "server negotiated unsupported MCP protocol version '{negotiated}' \
+                         (ARIS supports {}; requested '{REQUESTED_PROTOCOL_VERSION}')",
+                        SUPPORTED_PROTOCOL_VERSIONS.join(", ")
+                    ),
                 });
             }
 
@@ -1571,9 +1601,28 @@ fn mcp_request_timeout(override_secs: Option<u64>) -> std::time::Duration {
     std::time::Duration::from_secs(secs)
 }
 
+/// v0.4.19: MCP protocol revisions ARIS can speak. The stdio transport framing
+/// (newline-delimited JSON-RPC) is identical across these published revisions,
+/// so ARIS accepts whichever one the server negotiates back — but ONLY these.
+/// Per the MCP lifecycle spec, a client that cannot agree on a version with the
+/// server must terminate the connection rather than proceed on an incompatible
+/// protocol; `ensure_server_ready` enforces that. When a new revision is
+/// adopted, add it here.
+const SUPPORTED_PROTOCOL_VERSIONS: &[&str] =
+    &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
+
+/// The protocol version ARIS advertises in `initialize`. Kept at 2025-03-26 —
+/// proven against `codex mcp-server` (v0.4.17 e2e) and within
+/// `SUPPORTED_PROTOCOL_VERSIONS`. A spec-compliant server that prefers a newer
+/// revision responds with a version it shares; `ensure_server_ready` validates
+/// that response. (Bumping the *request* to the current revision is a separate,
+/// riskier change — a strict server could reject an unknown newer request —
+/// and is intentionally out of scope here; the negotiation guard is the fix.)
+const REQUESTED_PROTOCOL_VERSION: &str = "2025-03-26";
+
 fn default_initialize_params() -> McpInitializeParams {
     McpInitializeParams {
-        protocol_version: "2025-03-26".to_string(),
+        protocol_version: REQUESTED_PROTOCOL_VERSION.to_string(),
         capabilities: JsonValue::Object(serde_json::Map::new()),
         client_info: McpInitializeClientInfo {
             name: "runtime".to_string(),
@@ -3267,6 +3316,91 @@ mod tests {
             manager.shutdown().await.expect("shutdown");
             cleanup_script(&healthy_script);
             let _ = fs::remove_file(&broken_script);
+        });
+    }
+
+    // v0.4.19 — protocol-version negotiation guard. A server that negotiates a
+    // version ARIS does not support must be REJECTED (per-server degrade with a
+    // clear reason), not silently used on an incompatible protocol.
+    fn write_bad_protocol_version_script() -> PathBuf {
+        let root = temp_dir();
+        fs::create_dir_all(&root).expect("temp dir");
+        let script_path = root.join("bad-protocol-mcp.py");
+        let script = [
+            "#!/usr/bin/env python3",
+            "import json, sys",
+            "line = sys.stdin.readline()",
+            "if not line:",
+            "    raise SystemExit(1)",
+            "request = json.loads(line)",
+            "# Respond with a protocolVersion ARIS does NOT support (correct id,",
+            "# so this exercises the negotiation guard, not the id-mismatch path).",
+            r"response = json.dumps({",
+            r"    'jsonrpc': '2.0',",
+            r"    'id': request['id'],",
+            r"    'result': {",
+            r"        'protocolVersion': '1999-01-01',",
+            r"        'capabilities': {},",
+            r"        'serverInfo': {'name': 'bad-protocol', 'version': '0.1.0'}",
+            r"    }",
+            r"})",
+            r"sys.stdout.write(response + '\n')",
+            "sys.stdout.flush()",
+            "import time; time.sleep(30)",
+            "",
+        ]
+        .join("\n");
+        fs::write(&script_path, script).expect("write script");
+        script_path
+    }
+
+    #[test]
+    fn discover_tools_rejects_unsupported_protocol_version() {
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let script = write_bad_protocol_version_script();
+            let servers = BTreeMap::from([(
+                "badproto".to_string(),
+                ScopedMcpServerConfig {
+                    scope: ConfigSource::Local,
+                    config: McpServerConfig::Stdio(McpStdioServerConfig {
+                        command: "python3".to_string(),
+                        args: vec![script.to_string_lossy().into_owned()],
+                        env: BTreeMap::new(),
+                        request_timeout_secs: Some(2),
+                        trust: None,
+                    }),
+                },
+            )]);
+            let mut manager = McpServerManager::from_servers(&servers);
+
+            // Soft-degrade: the server negotiated an unsupported protocol
+            // version, so it contributes no tools and is recorded as a failure
+            // (rather than silently proceeding on an incompatible protocol).
+            let tools = manager
+                .discover_tools()
+                .await
+                .expect("discovery soft-degrades around the bad server");
+            assert!(
+                tools.is_empty(),
+                "unsupported-protocol server must contribute no tools, got {tools:?}"
+            );
+
+            let failures = manager.discovery_failures();
+            assert_eq!(failures.len(), 1);
+            assert_eq!(failures[0].server_name, "badproto");
+            assert!(
+                failures[0].reason.contains("unsupported MCP protocol version")
+                    && failures[0].reason.contains("1999-01-01"),
+                "failure reason must name the unsupported version: {}",
+                failures[0].reason
+            );
+
+            manager.shutdown().await.expect("shutdown");
+            let _ = fs::remove_file(&script);
         });
     }
 

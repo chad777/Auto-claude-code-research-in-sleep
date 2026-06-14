@@ -49,6 +49,72 @@ fn supports_reasoning_effort(model: &str) -> bool {
         || m.contains("thinking")
 }
 
+/// v0.4.19: sanitize an upstream error body before surfacing it in a
+/// `RuntimeError`. Two risks with splatting the raw body verbatim: a
+/// misbehaving proxy can return a huge body (floods the terminal), and it can
+/// reflect request content — including an `Authorization: Bearer …` header or
+/// an `sk-…` key — straight back into the error. So we (1) truncate to a cap
+/// and (2) lightly redact the two unambiguous credential shapes. Diagnostic
+/// value is preserved (status + the leading error text survive).
+fn sanitize_error_body(body: &str) -> String {
+    const MAX_CHARS: usize = 500;
+    let redacted = redact_secret_shapes(body);
+    if redacted.chars().count() > MAX_CHARS {
+        let head: String = redacted.chars().take(MAX_CHARS).collect();
+        format!("{head}… [truncated]")
+    } else {
+        redacted
+    }
+}
+
+/// Substring scanner (NOT token-based — API error bodies are usually compact
+/// JSON like `{"error":{"message":"... sk-… ..."}}`, where the secret has no
+/// surrounding whitespace). Redacts at ANY position: `sk-<key>` → `sk-***`, and
+/// a `Bearer`/`bearer` immediately followed by a short delimiter run then a
+/// token → `Bearer ***` (covers `Authorization: Bearer x`, `"Bearer x"`,
+/// `Bearer:x`). All slicing is char-boundary-safe (`get`, `find` offsets, and
+/// `len_utf8`), so no UTF-8 panic on a multibyte body.
+fn redact_secret_shapes(body: &str) -> String {
+    let key_char = |c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_';
+    let mut out = String::with_capacity(body.len() + 16);
+    let mut rest = body;
+    while !rest.is_empty() {
+        // `sk-<key>` anywhere.
+        if let Some(after) = rest.strip_prefix("sk-") {
+            let klen = after.find(|c: char| !key_char(c)).unwrap_or(after.len());
+            if klen >= 4 {
+                out.push_str("sk-***");
+                rest = &after[klen..];
+                continue;
+            }
+        }
+        // `Bearer` (case-insensitive) + a short non-token delimiter run + token.
+        if rest.get(..6).is_some_and(|p| p.eq_ignore_ascii_case("bearer")) {
+            let after = &rest[6..];
+            let delim_len = after.find(key_char).unwrap_or(0);
+            if (1..=3).contains(&delim_len) {
+                let token = &after[delim_len..];
+                let tlen = token
+                    .find(|c: char| !(key_char(c) || c == '.'))
+                    .unwrap_or(token.len());
+                if tlen >= 4 {
+                    out.push_str(&rest[..6]); // preserve original "Bearer" casing
+                    out.push_str(&after[..delim_len]); // preserve the delimiter(s)
+                    out.push_str("***");
+                    rest = &token[tlen..];
+                    continue;
+                }
+            }
+        }
+        // Default: copy exactly one char (keeps byte indices on boundaries).
+        let ch = rest.chars().next().expect("rest non-empty");
+        let n = ch.len_utf8();
+        out.push_str(&rest[..n]);
+        rest = &rest[n..];
+    }
+    out
+}
+
 /// v0.4.12 P1.C — detect a 400 response whose error body actually fingers
 /// `stream_options` as an unknown/extra/unsupported field. Used by the
 /// streaming chat completion call to decide whether to retry once without
@@ -689,7 +755,8 @@ on a compatible third-party proxy, or use Claude/another provider as executor an
                         }
 
                         return Err(RuntimeError::new(format!(
-                            "OpenAI API error {status}: {body_text}"
+                            "OpenAI API error {status}: {}",
+                            sanitize_error_body(&body_text)
                         )));
                     }
                     Err(e) => {
@@ -1282,6 +1349,46 @@ fn convert_runtime_tool_spec_openai(spec: &RuntimeToolSpec) -> Value {
 mod tests {
     use super::*;
     use runtime::{ContentBlock, ConversationMessage, MessageRole};
+
+    // v0.4.19: error bodies surfaced from an OpenAI-compatible upstream are
+    // truncated + credential-redacted before reaching the user-visible error.
+    #[test]
+    fn sanitize_error_body_redacts_and_truncates() {
+        // sk- key with surrounding whitespace → redacted, diagnostic text kept.
+        let spaced = r#"{"error":{"message":"bad key sk-ABCDEF1234567890 used"}}"#;
+        let s = sanitize_error_body(spaced);
+        assert!(s.contains("sk-***") && !s.contains("sk-ABCDEF1234567890"), "{s}");
+        assert!(s.contains("error") && s.contains("bad key"), "diagnostic text kept: {s}");
+
+        // COMPACT JSON (the common API-error shape) — secret has no surrounding
+        // whitespace. A token-based scanner would miss these; the substring
+        // scanner must catch them (codex NO-GO #e).
+        let compact_json = r#"{"api_key":"sk-ABCDEF1234567890"}"#;
+        let cj = sanitize_error_body(compact_json);
+        assert!(cj.contains("sk-***") && !cj.contains("ABCDEF1234567890"), "{cj}");
+
+        let kv = "OPENAI_API_KEY=sk-ABCDEF1234567890";
+        let k = sanitize_error_body(kv);
+        assert!(k.contains("sk-***") && !k.contains("ABCDEF1234567890"), "{k}");
+
+        // Bearer token, both spaced and compact-JSON forms.
+        let bearer_spaced = "rejected: Authorization: Bearer SECRETTOKEN99x";
+        let bs = sanitize_error_body(bearer_spaced);
+        assert!(bs.contains("Bearer ***") && !bs.contains("SECRETTOKEN99x"), "{bs}");
+
+        let bearer_json = r#"{"Authorization":"Bearer SECRETTOKEN99x"}"#;
+        let bj = sanitize_error_body(bearer_json);
+        assert!(bj.contains("Bearer ***") && !bj.contains("SECRETTOKEN99x"), "{bj}");
+
+        // Short, clean body is passed through unchanged.
+        let clean = r#"{"error":{"type":"invalid_request_error"}}"#;
+        assert_eq!(sanitize_error_body(clean), clean);
+
+        // A huge reflected body is capped (no terminal flood).
+        let huge = "x".repeat(5000);
+        let t = sanitize_error_body(&huge);
+        assert!(t.ends_with("… [truncated]") && t.chars().count() < 600, "len={}", t.chars().count());
+    }
 
     // Env-mutating tests below serialize via the crate-wide
     // `crate::env_test_guard()` (codex Phase-0 gap #1) so they cannot race the
