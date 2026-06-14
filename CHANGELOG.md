@@ -1,5 +1,57 @@
 # ARIS-Code Changelog
 
+## v0.4.19 (2026-06-14)
+
+A **honesty / guardrails** patch release — fix a real MCP latent bug and a few
+papercuts, no behavior change for healthy setups. Theme + shortlist proposed by
+Codex MCP (gpt-5.5 xhigh) in a fresh-eyes audit; every change cross-model
+reviewed. (Architecture work — sandbox, rustls, provider trait, Responses API —
+remains deferred to v0.5.0.)
+
+### 🔴 MCP protocol-version negotiation guard (the real bug)
+
+The stdio handshake requested protocol version `2025-03-26` but **never read the
+version the server negotiated back** (a parsed-but-dead field). A server that
+agreed on a version ARIS can't speak was silently accepted, and the subsequent
+`tools/list` / `tools/call` then ran on an incompatible protocol with opaque
+failures. Now ARIS validates the negotiated version against a supported set
+(`2025-11-25` / `2025-06-18` / `2025-03-26` / `2024-11-05` — the stdio framing is
+identical across these); an unsupported version terminates the child, clears the
+slot, and surfaces a clear per-server error (soft-degrade; `aris doctor` shows
+the reason) — exactly the "terminate when versions can't be agreed" behavior the
+MCP lifecycle spec requires. The requested version stays `2025-03-26` (proven
+against `codex mcp-server`; bumping the *request* is a separate, riskier change),
+so **healthy servers are unaffected** — verified end-to-end: the real Codex MCP
+server still spawns + initializes + advertises its tools.
+
+### 🧹 Papercuts
+
+- **Stale subagent-guard message.** An OpenAI-family session that spawns a
+  subagent fails loud (it would otherwise bill the wrong credential); the message
+  said *"lands in v0.4.18"*, which went stale the moment v0.4.18 shipped without
+  P8 — making it read like a broken build. It's now version-agnostic and
+  actionable ("use an Anthropic-family executor"), still credential-free.
+- **OpenAI error-body hygiene.** A non-retryable upstream error splatted the raw
+  response body verbatim into the error. It's now truncated (500 chars) and
+  credential-redacted — `sk-…` keys and `Bearer …` tokens are scrubbed by a
+  substring scanner that also catches the compact-JSON shape (`{"api_key":"sk-…"}`)
+  a misconfigured proxy can reflect back. Diagnostic text survives.
+- **Honest hook-events summary count.** The system-prompt hooks summary counted
+  the whole `hooks` array; it now counts only the hooks the runtime actually
+  executes (a `command` hook with a `command` string), matching the parser — so
+  the number the model sees equals what really runs.
+
+### Tests
+
+CI mode (`--test-threads=1`): **api 32 / runtime 204 / tools 67 / aris-cli 167 /
+commands 5** — all green. New: protocol-version rejection (fake server returns an
+unsupported version → per-server degrade), error-body redaction incl. compact
+JSON, command-only hook count, and the version-agnostic guard-message assertions.
+Live smoke: `aris doctor` shows the real Codex MCP server still initializes under
+the new guard; a one-shot turn returns `model=claude-opus-4-8`. Codex MCP
+(gpt-5.5 xhigh): design GO → impl NO-GO (compact-secret miss + command-string
+strictness) → GO after fixes.
+
 ## v0.4.18 (2026-06-14)
 
 Default model is now **Claude Opus 4.8** — with correct pricing and a safety
