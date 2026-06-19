@@ -172,16 +172,35 @@ impl LineEditor {
         let mut sel: usize = 0; // dropdown selection index
         let mut history_idx: Option<usize> = None;
         let mut saved_buf: Option<Vec<char>> = None;
+        // v0.4.20 (#8): after Esc dismisses the completion dropdown, suppress it
+        // while the buffer is unchanged. Snapshotting `buf` means any edit (which
+        // changes `buf`) auto-clears the suppression and the dropdown returns —
+        // no need to reset a flag in every edit branch.
+        let mut suppressed_for: Option<Vec<char>> = None;
         let mut render = RenderState::default();
 
-        self.redraw(&mut stdout, &mut render, &buf, cursor_pos, sel)?;
+        self.redraw(
+            &mut stdout,
+            &mut render,
+            &buf,
+            cursor_pos,
+            sel,
+            suppressed_for.as_deref() == Some(buf.as_slice()),
+        )?;
 
         loop {
             let ev = event::read()?;
 
             // Handle terminal resize
             if let Event::Resize(..) = ev {
-                self.redraw(&mut stdout, &mut render, &buf, cursor_pos, sel)?;
+                self.redraw(
+            &mut stdout,
+            &mut render,
+            &buf,
+            cursor_pos,
+            sel,
+            suppressed_for.as_deref() == Some(buf.as_slice()),
+        )?;
                 continue;
             }
 
@@ -197,7 +216,14 @@ impl LineEditor {
                     sel = 0;
                     history_idx = None;
                     saved_buf = None;
-                    self.redraw(&mut stdout, &mut render, &buf, cursor_pos, sel)?;
+                    self.redraw(
+            &mut stdout,
+            &mut render,
+            &buf,
+            cursor_pos,
+            sel,
+            suppressed_for.as_deref() == Some(buf.as_slice()),
+        )?;
                 }
                 continue;
             }
@@ -216,7 +242,15 @@ impl LineEditor {
             }
 
             let line: String = buf.iter().collect();
-            let matches = self.compute_matches(&line);
+            // v0.4.20 (#8): honor an Esc-suppression only while the buffer is
+            // exactly what it was when Esc was pressed; any edit changes `buf`
+            // and brings completions back.
+            let matches = if suppressed_for.as_deref() == Some(buf.as_slice()) {
+                Vec::new()
+            } else {
+                suppressed_for = None;
+                self.compute_matches(&line)
+            };
 
             match (code, modifiers) {
                 // ── Exit / Cancel ──────────────────────────────────────────
@@ -258,7 +292,11 @@ impl LineEditor {
                 // ── ESC: close dropdown ─────────────────────────────────────
                 (KeyCode::Esc, _) => {
                     sel = 0;
-                    // Fall through to redraw with empty matches
+                    // v0.4.20 (#8): actually dismiss the dropdown. Snapshot the
+                    // current buffer; `matches` stays empty until the buffer
+                    // changes (previously Esc was a no-op — `matches` was
+                    // recomputed from the unchanged buffer, so it reappeared).
+                    suppressed_for = Some(buf.clone());
                 }
 
                 // ── Down: next dropdown item or history forward ─────────────
@@ -420,7 +458,14 @@ impl LineEditor {
                 _ => continue,
             }
 
-            self.redraw(&mut stdout, &mut render, &buf, cursor_pos, sel)?;
+            self.redraw(
+            &mut stdout,
+            &mut render,
+            &buf,
+            cursor_pos,
+            sel,
+            suppressed_for.as_deref() == Some(buf.as_slice()),
+        )?;
         }
     }
 
@@ -594,9 +639,17 @@ impl LineEditor {
         buf: &[char],
         cursor_pos: usize,
         sel: usize,
+        suppressed: bool,
     ) -> io::Result<()> {
         let line: String = buf.iter().collect();
-        let matches = self.compute_matches(&line);
+        // v0.4.20 (#8): honor Esc-suppression here too — previously `redraw`
+        // unconditionally recomputed matches, so it painted the dismissed
+        // dropdown right back after Esc.
+        let matches = if suppressed {
+            Vec::new()
+        } else {
+            self.compute_matches(&line)
+        };
         let prompt_len = visible_len(&self.prompt);
         let term_w = terminal_width();
         let input_rows = layout_rows(prompt_len, buf, term_w);
@@ -1081,7 +1134,9 @@ fn visible_len(s: &str) -> usize {
 }
 
 /// Display width of a character in terminal columns.
-fn char_width(ch: char) -> usize {
+// v0.4.20 (#6): pub(crate) so the markdown table renderer (render.rs) can use
+// the same CJK/fullwidth display-cell width for column alignment.
+pub(crate) fn char_width(ch: char) -> usize {
     let cp = ch as u32;
     // CJK Unified Ideographs and common wide ranges
     if (0x1100..=0x115F).contains(&cp)    // Hangul Jamo

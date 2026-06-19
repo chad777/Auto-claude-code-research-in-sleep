@@ -266,6 +266,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         // v0.4.17 (T5): one-shot `--print`/prompt is non-interactive, so MCP
         // approval may NOT prompt (untrusted MCP calls are denied here).
         {
+            // v0.4.20 (#1): honor the saved executor model here too — previously
+            // ONLY the REPL applied it, so `aris "prompt"` / `aris --print` with a
+            // configured OpenAI/custom executor sent the Anthropic default model
+            // to that endpoint (→ model-not-found).
+            let model = effective_model(model, &saved_config);
             LiveCli::new(model, true, allowed_tools, permission_mode, false)?
                 .run_turn_with_output(&prompt, output_format)?
         }
@@ -278,14 +283,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             permission_mode,
         } => {
             // Use saved model from config if user didn't specify --model
-            let model = if model == DEFAULT_MODEL {
-                saved_config
-                    .executor_model()
-                    .map(|m| resolve_model_alias(m).to_string())
-                    .unwrap_or(model)
-            } else {
-                model
-            };
+            // (v0.4.20 #1: shared with the one-shot Prompt path via effective_model).
+            let model = effective_model(model, &saved_config);
             run_repl(model, allowed_tools, permission_mode)?;
         }
         CliAction::Help => print_help(),
@@ -493,6 +492,23 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             permission_mode,
         }),
         other => Err(format!("unknown subcommand: {other}")),
+    }
+}
+
+/// v0.4.20 (#1): resolve the model the session should actually run. When the
+/// user did NOT pass `--model` (so `requested` is still `DEFAULT_MODEL`), honor
+/// the executor model persisted by `aris setup` (`saved_config.executor_model`).
+/// Applied by BOTH the REPL and the one-shot prompt path so they can't diverge;
+/// previously only the REPL did this, leaving `aris "prompt"` on the Anthropic
+/// default even when the user had configured an OpenAI/custom executor.
+fn effective_model(requested: String, saved_config: &config::ArisConfig) -> String {
+    if requested == DEFAULT_MODEL {
+        saved_config
+            .executor_model()
+            .map(|m| resolve_model_alias(m).to_string())
+            .unwrap_or(requested)
+    } else {
+        requested
     }
 }
 
@@ -1600,11 +1616,25 @@ impl LiveCli {
             let result = self.runtime.run_turn(input, Some(&mut permission_prompter));
             match result {
                 Ok(summary) => {
-                    spinner.finish(
-                        "\x1b[38;5;74m●\x1b[0m \x1b[2mDone\x1b[0m",
-                        TerminalRenderer::new().color_theme(),
-                        &mut stdout,
-                    )?;
+                    let done_label = "\x1b[38;5;74m●\x1b[0m \x1b[2mDone\x1b[0m";
+                    // v0.4.20 (#299): when the turn printed visible assistant
+                    // text, finish WITHOUT clearing the current line (the reply
+                    // lives there — `Clear(CurrentLine)` would erase a short
+                    // single-line reply, leaving only "✔ Done"). Tool-only /
+                    // empty turns still clear the leftover "Thinking…" line.
+                    if turn_has_visible_assistant_text(&summary) {
+                        spinner.finish_after_output(
+                            done_label,
+                            TerminalRenderer::new().color_theme(),
+                            &mut stdout,
+                        )?;
+                    } else {
+                        spinner.finish(
+                            done_label,
+                            TerminalRenderer::new().color_theme(),
+                            &mut stdout,
+                        )?;
+                    }
                     println!();
                     if let Some(event) = summary.auto_compaction {
                         println!(
@@ -1898,12 +1928,29 @@ impl LiveCli {
                     config::ArisConfig::load().executor_provider.as_deref() == Some("custom");
 
                 let items: Vec<input::SelectItem> = if is_custom {
-                    // Custom provider: try dynamic /models fetch
+                    // Custom provider: try dynamic /models fetch.
+                    // v0.4.20 (#3): read the EFFECTIVE executor endpoint — the
+                    // env vars the executor actually uses (set by apply_to_env;
+                    // a shell override wins) — falling back to on-disk config.
+                    // Previously this read ONLY the disk config, so an env
+                    // override left the menu fetching from a stale endpoint (or
+                    // showing "not configured") while requests went elsewhere.
+                    // Mirrors resolve_openai_executor_config's resolution.
                     let cfg = config::ArisConfig::load();
-                    let api_key = cfg.executor_api_key.as_deref().unwrap_or("");
-                    let base_url = cfg.executor_base_url.as_deref().unwrap_or("");
+                    let api_key = std::env::var("EXECUTOR_API_KEY")
+                        .or_else(|_| std::env::var("OPENAI_API_KEY"))
+                        .ok()
+                        .filter(|s| !s.is_empty())
+                        .or_else(|| cfg.executor_api_key.clone().filter(|s| !s.is_empty()))
+                        .unwrap_or_default();
+                    let base_url = std::env::var("EXECUTOR_BASE_URL")
+                        .ok()
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .or_else(|| cfg.executor_base_url.clone().filter(|s| !s.is_empty()))
+                        .unwrap_or_default();
                     if !api_key.is_empty() && !base_url.is_empty() {
-                        match openai_compat::fetch_openai_models(base_url, api_key) {
+                        match openai_compat::fetch_openai_models(&base_url, &api_key) {
                             Ok(models) => openai_compat::model_select_items(&models, &self.model),
                             Err(err) => {
                                 println!("\x1b[33m⚠ Could not fetch models: {err}\x1b[0m");
@@ -4886,6 +4933,20 @@ impl ApiClient for AnthropicRuntimeClient {
     }
 }
 
+/// v0.4.20 (#299): did this turn print visible assistant TEXT (vs only tool
+/// calls / thinking / nothing)? Drives whether `run_turn` finishes the spinner
+/// with the non-clearing `finish_after_output` (keep the reply on screen) or the
+/// clearing `finish` (wipe the leftover "Thinking…" line on a tool-only/empty
+/// turn).
+fn turn_has_visible_assistant_text(summary: &runtime::TurnSummary) -> bool {
+    summary.assistant_messages.iter().any(|message| {
+        message
+            .blocks
+            .iter()
+            .any(|block| matches!(block, ContentBlock::Text { text } if !text.trim().is_empty()))
+    })
+}
+
 fn final_assistant_text(summary: &runtime::TurnSummary) -> String {
     summary
         .assistant_messages
@@ -6511,19 +6572,79 @@ fn discover_all_skills() -> Vec<(String, String, &'static str)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        deploy_meta_opt_hooks_to, filter_tool_specs, format_compact_report, format_cost_report,
-        format_model_report, format_model_switch_report, format_permissions_report,
-        format_permissions_switch_report, format_resume_report, format_status_report,
-        format_tool_call_start, format_tool_result, normalize_permission_mode, parse_args,
-        parse_git_status_metadata, print_help_to, push_output_block, render_config_report,
-        render_memory_report, render_repl_help, resolve_model_alias, response_to_events,
-        resume_supported_slash_commands, reviewer_routing_nudge, status_context, CliAction,
-        CliOutputFormat, SlashCommand, StatusUsage, DEFAULT_MODEL,
+        deploy_meta_opt_hooks_to, effective_model, filter_tool_specs, format_compact_report,
+        format_cost_report, format_model_report, format_model_switch_report,
+        format_permissions_report, format_permissions_switch_report, format_resume_report,
+        format_status_report, format_tool_call_start, format_tool_result, normalize_permission_mode,
+        parse_args, parse_git_status_metadata, print_help_to, push_output_block,
+        render_config_report, render_memory_report, render_repl_help, resolve_model_alias,
+        response_to_events, resume_supported_slash_commands, reviewer_routing_nudge, status_context,
+        turn_has_visible_assistant_text, CliAction, CliOutputFormat, SlashCommand, StatusUsage,
+        DEFAULT_MODEL,
     };
     use api::{MessageResponse, OutputContentBlock, Usage};
-    use runtime::{AssistantEvent, ContentBlock, ConversationMessage, MessageRole, PermissionMode};
+    use runtime::{
+        AssistantEvent, ContentBlock, ConversationMessage, MessageRole, PermissionMode, TokenUsage,
+        TurnSummary,
+    };
     use serde_json::json;
     use std::path::PathBuf;
+
+    // v0.4.20 (#1): the one-shot prompt path and the REPL share effective_model,
+    // which applies the saved executor model ONLY when the user didn't pass
+    // --model (i.e. it's still DEFAULT_MODEL).
+    #[test]
+    fn effective_model_applies_saved_model_only_for_the_default() {
+        let cfg = crate::config::ArisConfig {
+            executor_model: Some("gpt-5.5".to_string()),
+            ..Default::default()
+        };
+        // No --model (still DEFAULT_MODEL) → use the saved executor model.
+        assert_eq!(effective_model(DEFAULT_MODEL.to_string(), &cfg), "gpt-5.5");
+        // Explicit --model is respected, never overridden by the saved model.
+        assert_eq!(
+            effective_model("claude-sonnet-4-6".to_string(), &cfg),
+            "claude-sonnet-4-6"
+        );
+        // No saved model → keep the requested default.
+        let empty = crate::config::ArisConfig::default();
+        assert_eq!(effective_model(DEFAULT_MODEL.to_string(), &empty), DEFAULT_MODEL);
+    }
+
+    // v0.4.20 (#299): the spinner-finish choice keys off whether the turn
+    // printed visible assistant text.
+    #[test]
+    fn turn_has_visible_assistant_text_distinguishes_text_from_tool_only() {
+        let summary = |blocks| TurnSummary {
+            assistant_messages: vec![ConversationMessage::assistant(blocks)],
+            tool_results: vec![],
+            iterations: 1,
+            usage: TokenUsage::default(),
+            auto_compaction: None,
+        };
+        // Non-empty text → true.
+        assert!(turn_has_visible_assistant_text(&summary(vec![ContentBlock::Text {
+            text: "你好".to_string()
+        }])));
+        // Whitespace-only text → false (nothing visible on screen).
+        assert!(!turn_has_visible_assistant_text(&summary(vec![ContentBlock::Text {
+            text: "  \n ".to_string()
+        }])));
+        // Tool-only turn → false (keep clearing the "Thinking…" line).
+        assert!(!turn_has_visible_assistant_text(&summary(vec![ContentBlock::ToolUse {
+            id: "t1".to_string(),
+            name: "read_file".to_string(),
+            input: "{}".to_string(),
+        }])));
+        // Empty turn → false.
+        assert!(!turn_has_visible_assistant_text(&TurnSummary {
+            assistant_messages: vec![],
+            tool_results: vec![],
+            iterations: 0,
+            usage: TokenUsage::default(),
+            auto_compaction: None,
+        }));
+    }
 
     #[test]
     fn defaults_to_repl_when_no_args() {

@@ -245,7 +245,8 @@ pub fn glob_search(pattern: &str, path: Option<&str>) -> io::Result<GlobSearchOu
             .map(Reverse)
     });
 
-    let truncated = matches.len() > 100;
+    let total = matches.len();
+    let truncated = total > 100;
     let filenames = matches
         .into_iter()
         .take(100)
@@ -254,7 +255,11 @@ pub fn glob_search(pattern: &str, path: Option<&str>) -> io::Result<GlobSearchOu
 
     Ok(GlobSearchOutput {
         duration_ms: started.elapsed().as_millis(),
-        num_files: filenames.len(),
+        // v0.4.20: report the TOTAL number of matched files, not the (capped)
+        // number returned. Previously `filenames.len()` meant a 1000-match glob
+        // reported `num_files: 100, truncated: true`, so the model believed only
+        // 100 files matched. `filenames` still holds at most 100 entries.
+        num_files: total,
         filenames,
         truncated,
     })
@@ -511,6 +516,27 @@ mod tests {
         let output = edit_file(path.to_string_lossy().as_ref(), "alpha", "omega", true)
             .expect("edit should succeed");
         assert!(output.replace_all);
+    }
+
+    // v0.4.20 (#7): when a glob matches more than the 100-file cap, `num_files`
+    // must report the TOTAL matched, not the (capped) number returned — the
+    // model would otherwise believe only 100 files matched.
+    #[test]
+    fn glob_search_reports_total_match_count_when_truncated() {
+        let dir = temp_path("glob-truncate-dir");
+        std::fs::create_dir_all(&dir).expect("directory should be created");
+        for i in 0..150 {
+            write_file(
+                dir.join(format!("f{i:03}.rs")).to_string_lossy().as_ref(),
+                "x",
+            )
+            .expect("file write should succeed");
+        }
+        let out = glob_search("**/*.rs", Some(dir.to_string_lossy().as_ref()))
+            .expect("glob should succeed");
+        assert_eq!(out.num_files, 150, "num_files must be the TOTAL matched");
+        assert_eq!(out.filenames.len(), 100, "returned list is still capped at 100");
+        assert!(out.truncated);
     }
 
     #[test]

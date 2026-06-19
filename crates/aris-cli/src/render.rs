@@ -96,6 +96,37 @@ impl Spinner {
         out.flush()
     }
 
+    /// v0.4.20 (#299): finish variant for turns that PRINTED visible assistant
+    /// text. `tick` uses Save/RestorePosition so streamed output overwrites the
+    /// spinner on its line; for a short single-line reply the cursor ends on
+    /// that line, and `finish`'s `Clear(CurrentLine)` would ERASE the reply
+    /// (user sees only "✔ Done"). This variant emits a newline FIRST (moving
+    /// below the reply) and does NOT clear, so the reply survives. Use only when
+    /// the turn produced visible text; tool-only / empty turns still use
+    /// `finish` to wipe the leftover "Thinking…" line.
+    pub fn finish_after_output(
+        &mut self,
+        label: &str,
+        theme: &ColorTheme,
+        out: &mut impl Write,
+    ) -> io::Result<()> {
+        self.frame_index = 0;
+        execute!(
+            out,
+            // Clear from the cursor to end of line (NOT the whole line) so a
+            // reply SHORTER than "⠋ Thinking…" doesn't leave the spinner's tail
+            // dangling after it — while the reply itself (before the cursor) is
+            // preserved.
+            Clear(ClearType::UntilNewLine),
+            Print("\n"),
+            MoveToColumn(0),
+            SetForegroundColor(theme.spinner_done),
+            Print(format!("✔ {label}\n")),
+            ResetColor
+        )?;
+        out.flush()
+    }
+
     pub fn fail(
         &mut self,
         label: &str,
@@ -249,6 +280,11 @@ impl TerminalRenderer {
 
     #[must_use]
     pub fn render_markdown(&self, markdown: &str) -> String {
+        self.render_markdown_raw(markdown).trim_end().to_string()
+    }
+
+    /// Render markdown to ANSI WITHOUT trimming trailing whitespace.
+    fn render_markdown_raw(&self, markdown: &str) -> String {
         let mut output = String::new();
         let mut state = RenderState::default();
         let mut code_language = String::new();
@@ -265,13 +301,22 @@ impl TerminalRenderer {
                 &mut in_code_block,
             );
         }
-
-        output.trim_end().to_string()
+        output
     }
 
     #[must_use]
     pub fn markdown_to_ansi(&self, markdown: &str) -> String {
         self.render_markdown(markdown)
+    }
+
+    /// v0.4.20 (#2): streaming render that PRESERVES the chunk's trailing
+    /// newlines. `markdown_to_ansi` trims them (right for a one-shot render),
+    /// but in the streaming path each chunk is rendered separately, so trimming
+    /// drops the paragraph/heading separator (`\n\n`) at a stream-safe boundary
+    /// and glues consecutive paragraphs together ("para1para2").
+    #[must_use]
+    pub fn markdown_to_ansi_streaming(&self, markdown: &str) -> String {
+        self.render_markdown_raw(markdown)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -599,6 +644,14 @@ impl TerminalRenderer {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct MarkdownStreamState {
     pending: String,
+    /// v0.4.20 (#2): the trailing newlines of the previously emitted chunk,
+    /// HELD back and prepended to the next chunk's body instead of being emitted
+    /// immediately. This keeps the paragraph/heading separator BETWEEN streamed
+    /// chunks (fixes the "para1para2" glue) while guaranteeing the LAST emitted
+    /// content carries no dangling blank line — when the stream ends, any held
+    /// trailing newlines are simply dropped. Net result: the concatenation of
+    /// streamed chunks equals a single full (trimmed) render.
+    held: String,
 }
 
 impl MarkdownStreamState {
@@ -608,17 +661,37 @@ impl MarkdownStreamState {
         let split = find_stream_safe_boundary(&self.pending)?;
         let ready = self.pending[..split].to_string();
         self.pending.drain(..split);
-        Some(renderer.markdown_to_ansi(&ready))
+        // Render WITHOUT trimming so the boundary separator survives, then split
+        // the rendered chunk into body + trailing newlines: emit (held separator
+        // from the previous chunk)+(this body), and HOLD this chunk's trailing
+        // newlines for the next emit. Trailing newlines at the very end of the
+        // stream are never flushed, so the message ends cleanly.
+        let ansi = renderer.markdown_to_ansi_streaming(&ready);
+        let body_len = ansi.trim_end_matches('\n').len();
+        if body_len == 0 {
+            // Blank-only boundary (an extra blank line renders to nothing): there
+            // is no body to attach the held separator before. KEEP the held
+            // separator and emit nothing now — otherwise we'd release a trailing
+            // blank that the stream can never take back (one-shot render trims
+            // it / collapses repeated blank lines). It's dropped at `flush` or
+            // reused before the next real body.
+            return None;
+        }
+        let separator = std::mem::replace(&mut self.held, ansi[body_len..].to_string());
+        Some(format!("{separator}{}", &ansi[..body_len]))
     }
 
     #[must_use]
     pub fn flush(&mut self, renderer: &TerminalRenderer) -> Option<String> {
+        // The held separator joins the last push chunk to this final content;
+        // if there's no final content it's a trailing separator → drop it.
+        let separator = std::mem::take(&mut self.held);
         if self.pending.trim().is_empty() {
             self.pending.clear();
             None
         } else {
             let pending = std::mem::take(&mut self.pending);
-            Some(renderer.markdown_to_ansi(&pending))
+            Some(format!("{separator}{}", renderer.markdown_to_ansi(&pending)))
         }
     }
 }
@@ -665,7 +738,13 @@ fn find_stream_safe_boundary(markdown: &str) -> Option<usize> {
 }
 
 fn visible_width(input: &str) -> usize {
-    strip_ansi(input).chars().count()
+    // v0.4.20 (#6): count display CELLS, not chars — CJK ideographs / kana /
+    // Hangul / fullwidth forms occupy 2 columns, so a `chars().count()` width
+    // under-measures them and misaligns markdown table padding for CJK content.
+    strip_ansi(input)
+        .chars()
+        .map(crate::input::char_width)
+        .sum()
 }
 
 fn strip_ansi(input: &str) -> String {
@@ -692,7 +771,76 @@ fn strip_ansi(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{strip_ansi, MarkdownStreamState, Spinner, TerminalRenderer};
+    use super::{strip_ansi, visible_width, MarkdownStreamState, Spinner, TerminalRenderer};
+
+    // v0.4.20 (#2): streamed paragraphs must NOT render glued together. The old
+    // path trimmed each chunk's trailing newlines at the stream-safe boundary,
+    // so "para1\n\n" + "para2\n\n" rendered as "para1para2".
+    #[test]
+    fn markdown_stream_preserves_paragraph_separators() {
+        let renderer = TerminalRenderer::new();
+        let mut stream = MarkdownStreamState::default();
+        let mut out = String::new();
+        for chunk in ["第一段ALPHA\n\n", "第二段BETA\n\n"] {
+            if let Some(rendered) = stream.push(&renderer, chunk) {
+                out.push_str(&rendered);
+            }
+        }
+        if let Some(rendered) = stream.flush(&renderer) {
+            out.push_str(&rendered);
+        }
+        let clean = strip_ansi(&out);
+        let a = clean.find("ALPHA").expect("first paragraph present");
+        let b = clean.find("第二段").expect("second paragraph present");
+        assert!(
+            a < b && clean[a..b].contains('\n'),
+            "paragraphs must be newline-separated, not glued: {clean:?}"
+        );
+    }
+
+    // v0.4.20 (#2, codex round-2): streaming delta-by-delta must EXACTLY equal a
+    // single full render — including NO dangling blank line at the end, even
+    // when the last chunk ends on a stream-safe boundary (`\n\n` / closed fence).
+    #[test]
+    fn markdown_stream_concat_equals_full_render() {
+        let renderer = TerminalRenderer::new();
+        for full_md in [
+            "段落A\n\n段落B\n\n```\ncode line\n```\n\n段落C\n\n", // ends on a boundary
+            "段落A\n\n段落B\n\n段落C-no-trailing",                 // ends mid-paragraph
+            "# 标题\n\n正文一\n\n正文二\n\n",
+            "段A\n\n\n段B\n\n\n\n",     // codex round-2: extra/blank-only boundaries
+            "段A\n\n\n",                // trailing extra blank lines only
+        ] {
+            let mut stream = MarkdownStreamState::default();
+            let mut streamed = String::new();
+            for ch in full_md.chars() {
+                if let Some(rendered) = stream.push(&renderer, &ch.to_string()) {
+                    streamed.push_str(&rendered);
+                }
+            }
+            if let Some(rendered) = stream.flush(&renderer) {
+                streamed.push_str(&rendered);
+            }
+            let one_shot = renderer.markdown_to_ansi(full_md);
+            assert_eq!(
+                streamed, one_shot,
+                "streamed concat must equal a single full render for {full_md:?}"
+            );
+            assert!(
+                !streamed.ends_with("\n\n"),
+                "no dangling blank line at message end for {full_md:?}"
+            );
+        }
+    }
+
+    // v0.4.20 (#6): table/width math must count display CELLS — CJK = 2.
+    #[test]
+    fn visible_width_counts_cjk_as_two_cells() {
+        assert_eq!(visible_width("ab"), 2);
+        assert_eq!(visible_width("中文"), 4); // two wide chars → 4 cells
+        assert_eq!(visible_width("a中b"), 4); // 1 + 2 + 1
+        assert_eq!(visible_width("\x1b[1m中\x1b[0m"), 2); // ANSI stripped first
+    }
 
     #[test]
     fn renders_markdown_with_styling_and_lists() {
