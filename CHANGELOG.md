@@ -1,5 +1,57 @@
 # ARIS-Code Changelog
 
+## v0.4.20 (2026-06-19)
+
+A **bug-fix patch** — seven user-facing bugs, surfaced by a Codex adversarial
+hunt and each cross-model reviewed across three rounds (the reviewer caught a
+redraw gap, a trailing-blank, a spinner tail, and a blank-line edge before GO).
+The headline fix closes [#299](https://github.com/wanshuiyin/Auto-claude-code-research-in-sleep/issues/299).
+
+### 🐛 REPL output
+
+- **[#299] Short replies showed only "✔ Done."** The spinner draws "⠋ Thinking…"
+  with Save/RestorePosition so streamed output overwrites it on the same line —
+  but then `finish` cleared that whole line, **erasing a short single-line
+  reply**. The REPL now finishes with a non-clearing path when the turn printed
+  visible text (`Clear(UntilNewLine)` wipes only the spinner tail after the
+  reply, then a newline + "✔ Done"); tool-only/empty turns still clear the
+  leftover "Thinking…" line.
+- **Streamed multi-paragraph replies rendered glued together** ("para1para2").
+  Each streamed chunk's paragraph separator was trimmed at the stream-safe
+  boundary. The markdown streamer now preserves boundaries via a held-separator
+  (emit a chunk's trailing newlines just before the *next* body, drop them at
+  stream end) so streamed output now equals a single full render — with no
+  dangling blank line.
+- **Markdown tables with CJK / fullwidth content misaligned** — column width
+  counted characters, not display cells. It now counts cells (CJK = 2).
+
+### 🐛 CLI / tools
+
+- **`aris "prompt"` / `--print` ignored the executor model saved by `aris
+  setup`** — only the REPL applied it, so a configured OpenAI/custom executor
+  got the Anthropic default model sent to its endpoint (→ model-not-found). The
+  one-shot and REPL paths now share one `effective_model` resolver.
+- **Esc didn't close the completion dropdown** — `redraw` recomputed matches and
+  painted it right back. Esc now snapshots the buffer; completions stay hidden
+  until an edit changes it.
+- **`glob_search` reported the wrong file count when truncated** — `num_files`
+  was the capped-100 returned count, so the model believed a 1000-match glob had
+  only 100 files. It now reports the total matched (`filenames` stays ≤100).
+- **`/model`'s custom-provider menu read stale on-disk config** instead of the
+  effective env the executor actually uses — it now mirrors the executor's own
+  resolution (env first, config fallback).
+
+### Tests
+
+CI mode (`--test-threads=1`): **api 32 / runtime 205 / tools 67 / aris-cli 172 /
+commands 5** — all green; +7 new (markdown stream separator + concat==full-render
+incl. blank-line edges, CJK cell width, effective_model, visible-text detection,
+glob total count). Real-machine verified: a short reply now renders followed by
+"✔ Done", and multi-paragraph replies keep their blank lines. Codex MCP (gpt-5.5
+xhigh) hunt → 3 review rounds (NO-GO → NO-GO → GO). Two further candidates
+(Anthropic block-`index` routing, OpenAI multi-line SSE frames) are latent-only
+with no current trigger and deferred to a hardening pass.
+
 ## v0.4.19 (2026-06-14)
 
 A **honesty / guardrails** patch release — fix a real MCP latent bug and a few
