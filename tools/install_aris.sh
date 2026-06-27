@@ -24,6 +24,7 @@
 #                          the correct upstream target (repeatable)
 #   --replace-link NAME    replace an upstream-internal symlink that points to
 #                          a DIFFERENT entry than expected (repeatable)
+#   --platform PLATFORM    force platform: codex or claude (default: auto-detect)
 #   --from-old             trigger migration from legacy nested install
 #                          (.claude/skills/aris/)
 #   --migrate-copy STRAT   for legacy COPY install: STRAT = keep-user | prefer-upstream
@@ -82,23 +83,58 @@ REPLACE_LINK_NAMES=()
 
 usage() { sed -n '2,40p' "$0" | sed 's/^# \?//'; }
 
+FORWARDED_ARGS=()
+PLATFORM_OVERRIDE=""
+DETECTED_PLATFORM=""
+CLAUDE_ONLY_FLAGS_USED=()
+CODEX_ONLY_FLAGS_SEEN=()
+
+# ─── Platform auto-detection for Codex CLI (#180) ──────────────────────────────
+# If the project has Codex markers (.agents/, AGENTS.md, .codex/config.toml)
+# and NO Claude markers (.claude/, CLAUDE.md), delegate to install_aris_codex.sh.
+auto_detect_platform() {
+    local proj="$1"
+    local has_strong_codex_markers=false
+    local has_codex_hint=false
+    local has_claude_markers=false
+
+    # Strong Codex markers. AGENTS.md by itself is only a hint because many Claude
+    # projects may carry repo-level agent instructions before .claude/ exists.
+    [[ -d "$proj/.agents" || -f "$proj/.codex/config.toml" ]] && has_strong_codex_markers=true
+    [[ -f "$proj/AGENTS.md" ]] && has_codex_hint=true
+
+    # Claude markers
+    [[ -d "$proj/.claude" || -f "$proj/CLAUDE.md" || -f "$proj/.claude/settings.json" ]] && has_claude_markers=true
+
+    if $has_strong_codex_markers && $has_claude_markers; then
+        warn "Both Claude and Codex markers found in $proj"
+        warn "  Defaulting to claude; use --platform codex to override."
+        DETECTED_PLATFORM="claude"
+    elif $has_strong_codex_markers && ! $has_claude_markers; then
+        DETECTED_PLATFORM="codex"
+    elif $has_claude_markers; then
+        DETECTED_PLATFORM="claude"
+    elif $has_codex_hint; then
+        warn "AGENTS.md found without .agents/ or .codex/config.toml; defaulting to claude."
+        warn "  Use --platform codex to delegate to install_aris_codex.sh."
+    fi
+}
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --reconcile)         ACTION="reconcile"; shift ;;
-        --uninstall)         ACTION="uninstall"; shift ;;
-        --aris-repo)         ARIS_REPO_OVERRIDE="${2:?--aris-repo requires path}"; shift 2 ;;
-        --dry-run)           DRY_RUN=true; shift ;;
-        --quiet)             QUIET=true; shift ;;
-        --no-doc)            NO_DOC=true; shift ;;
-        --from-old)          FROM_OLD=true; shift ;;
-        --migrate-copy)      MIGRATE_COPY="${2:?--migrate-copy requires keep-user|prefer-upstream}"; shift 2 ;;
-        --clear-stale-lock)  CLEAR_STALE_LOCK=true; shift ;;
-        --adopt-existing)    ADOPT_NAMES+=("${2:?--adopt-existing requires NAME}"); shift 2 ;;
-        --replace-link)      REPLACE_LINK_NAMES+=("${2:?--replace-link requires NAME}"); shift 2 ;;
+        --reconcile)         FORWARDED_ARGS+=("$1"); ACTION="reconcile"; shift ;;
+        --uninstall)         FORWARDED_ARGS+=("$1"); ACTION="uninstall"; shift ;;
+        --aris-repo)         FORWARDED_ARGS+=("$1" "${2:?--aris-repo requires path}"); ARIS_REPO_OVERRIDE="$2"; shift 2 ;;
+        --dry-run)           FORWARDED_ARGS+=("$1"); DRY_RUN=true; shift ;;
+        --quiet)             FORWARDED_ARGS+=("$1"); QUIET=true; shift ;;
+        --no-doc)            FORWARDED_ARGS+=("$1"); NO_DOC=true; shift ;;
+        --from-old)          FORWARDED_ARGS+=("$1"); FROM_OLD=true; CLAUDE_ONLY_FLAGS_USED+=("--from-old"); shift ;;
+        --migrate-copy)      FORWARDED_ARGS+=("$1" "${2:?--migrate-copy requires keep-user|prefer-upstream}"); MIGRATE_COPY="$2"; CLAUDE_ONLY_FLAGS_USED+=("--migrate-copy"); shift 2 ;;
+        --clear-stale-lock)  FORWARDED_ARGS+=("$1"); CLEAR_STALE_LOCK=true; shift ;;
+        --adopt-existing)    FORWARDED_ARGS+=("$1" "${2:?--adopt-existing requires NAME}"); ADOPT_NAMES+=("$2"); CLAUDE_ONLY_FLAGS_USED+=("--adopt-existing"); shift 2 ;;
+        --replace-link)      FORWARDED_ARGS+=("$1" "${2:?--replace-link requires NAME}"); REPLACE_LINK_NAMES+=("$2"); shift 2 ;;
         --platform)
-            echo "Error: --platform is removed. ARIS now only supports Claude Code (.claude/skills/)." >&2
-            echo "       Codex CLI users: see docs for the manual codex setup." >&2
-            exit 2 ;;
+            PLATFORM_OVERRIDE="${2:?--platform requires codex|claude}"; shift 2 ;;
         --force)
             echo "Error: --force is removed. Use the granular flags:" >&2
             echo "       --adopt-existing NAME (for non-managed symlinks pointing to correct upstream)" >&2
@@ -106,16 +142,22 @@ while [[ $# -gt 0 ]]; do
             echo "       Real files/directories are never overwritten — back up and remove them yourself." >&2
             exit 2 ;;
         -h|--help)           usage; exit 0 ;;
+        # Codex-only flags: recognized by parent, forwarded during delegation
+        --with-claude-review-overlay) FORWARDED_ARGS+=("$1"); CODEX_ONLY_FLAGS_SEEN+=("$1"); shift ;;
+        --with-gemini-review-overlay) FORWARDED_ARGS+=("$1"); CODEX_ONLY_FLAGS_SEEN+=("$1"); shift ;;
         --*)                 echo "Unknown option: $1" >&2; exit 2 ;;
         *)
             if [[ -z "$PROJECT_PATH" ]]; then PROJECT_PATH="$1"
             else echo "Error: unexpected positional: $1" >&2; exit 2; fi
-            shift ;;
+            FORWARDED_ARGS+=("$1"); shift ;;
     esac
 done
 
 if [[ -n "$MIGRATE_COPY" && "$MIGRATE_COPY" != "keep-user" && "$MIGRATE_COPY" != "prefer-upstream" ]]; then
     echo "Error: --migrate-copy must be keep-user or prefer-upstream (got: $MIGRATE_COPY)" >&2; exit 2
+fi
+if [[ -n "$PLATFORM_OVERRIDE" && "$PLATFORM_OVERRIDE" != "codex" && "$PLATFORM_OVERRIDE" != "claude" ]]; then
+    echo "Error: --platform must be codex or claude (got: $PLATFORM_OVERRIDE)" >&2; exit 2
 fi
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -241,6 +283,40 @@ manifest_kind_of() {
 PROJECT_PATH="${PROJECT_PATH:-$(pwd)}"
 [[ -d "$PROJECT_PATH" ]] || die "project path does not exist: $PROJECT_PATH"
 PROJECT_PATH="$(abs_path "$PROJECT_PATH")"
+
+# ─── Platform auto-detect + delegation (before resolve_aris_repo) ─────────────
+# Must happen before resolve_aris_repo because the Codex installer resolves its
+# own repo path (looking for skills/skills-codex instead of just skills/).
+# Skip auto-detect (and its marker warnings) when --platform is explicit — the
+# override wins anyway, so detecting would only print a misleading "defaulting to …".
+[[ -n "$PLATFORM_OVERRIDE" ]] || auto_detect_platform "$PROJECT_PATH"
+PLATFORM="${PLATFORM_OVERRIDE:-$DETECTED_PLATFORM}"
+if [[ "$PLATFORM" == "codex" ]]; then
+    # Validate: claude-only flags are incompatible with codex platform
+    if [[ ${#CLAUDE_ONLY_FLAGS_USED[@]} -gt 0 ]]; then
+        die "Claude-only flags incompatible with codex platform: ${CLAUDE_ONLY_FLAGS_USED[*]}"
+    fi
+    SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+    CODEX_INSTALLER="$SCRIPT_DIR/install_aris_codex.sh"
+    [[ -f "$CODEX_INSTALLER" ]] || die "Codex installer not found: $CODEX_INSTALLER"
+    log ""
+    if [[ -n "$PLATFORM_OVERRIDE" ]]; then
+        log "Codex CLI platform selected — delegating to install_aris_codex.sh"
+    else
+        log "Codex CLI platform detected — delegating to install_aris_codex.sh"
+        log "  (override with --platform claude)"
+    fi
+    log ""
+    if [[ ${#FORWARDED_ARGS[@]} -gt 0 ]]; then
+        exec bash "$CODEX_INSTALLER" "${FORWARDED_ARGS[@]}"
+    fi
+    exec bash "$CODEX_INSTALLER"
+fi
+# Validate: codex-only flags are incompatible with claude platform
+if [[ ${#CODEX_ONLY_FLAGS_SEEN[@]} -gt 0 ]]; then
+    die "Codex-only flags incompatible with claude platform: ${CODEX_ONLY_FLAGS_SEEN[*]}"
+fi
+
 ARIS_REPO="$(resolve_aris_repo)"
 SKILLS_DIR_ABS="$ARIS_REPO/skills"
 PROJECT_SKILLS_DIR="$PROJECT_PATH/$SKILLS_REL"
